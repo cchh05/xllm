@@ -78,6 +78,19 @@ class ModelContext {
 
   ModelContext with_parallel_args(const ParallelArgs& parallel_args) const;
 
+  // Optional dual-mode source. Set by the engine (after worker startup)
+  // when options.enable_runtime_cp_dp_switch is on. Layers that support
+  // dual ATB graph init (currently DeepSeek V32) consult this in their
+  // ctor; if non-null they build CP and DP node pairs from
+  // dual_parallel_args_->cp_args() / dp_args(), otherwise they fall
+  // through to the legacy single-mapping path using parallel_args_.
+  void set_dual_parallel_args(const DualParallelArgs* dual_args) {
+    dual_parallel_args_ = dual_args;
+  }
+  const DualParallelArgs* get_dual_parallel_args() const {
+    return dual_parallel_args_;
+  }
+
 #if defined(USE_NPU)
   const atb::Context* get_atb_context() const { return context_; }
   std::shared_ptr<AtbWorkspace> get_atb_workspace() const {
@@ -103,6 +116,9 @@ class ModelContext {
   ParallelArgs parallel_args_;
   torch::TensorOptions tensor_options_;
   OptimizationConfig optimization_config_;
+
+  // Non-owning, optional. Lifetime guaranteed by WorkerServer.
+  const DualParallelArgs* dual_parallel_args_ = nullptr;
 
 #if defined(USE_NPU)
   // used for npu atb
