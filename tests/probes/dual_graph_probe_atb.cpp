@@ -88,6 +88,12 @@ DEFINE_int32(forward_numel,
 DEFINE_int32(mem_growth_threshold_mb,
              300,
              "Fail if NPU free-memory drop after all rounds exceeds this.");
+DEFINE_bool(single_mapping_only,
+            false,
+            "Diagnostic mode: build only the CP communicator and skip DP. "
+            "Used to isolate ATB single-mapping setup failures from dual-"
+            "mapping interference. If single-mapping fails on a given rank "
+            "the issue is in ATB rendezvous, not dual-graph.");
 
 namespace {
 
@@ -285,6 +291,40 @@ int main(int32_t argc, char** argv) {
                   "CP communicator. ATB never created HCCL for this "
                   "group; check Mapping::InitGlobalCommDomain output.";
     return 4;
+  }
+
+  // ATB rendezvous on the global HCCL comm (built inside
+  // Mapping::InitGlobalCommDomain) is asynchronous on some CANN versions:
+  // a fast rank can return from build_communicator() before slower ranks
+  // have finished HCCL handshake. Issuing a tiny HcclAllReduce here forces
+  // a real collective that requires every rank to be ready, otherwise the
+  // call hangs (good signal -- we time it out via torchrun) or surfaces a
+  // clear ATB error rather than the silent "domain='0', hccl=null" we saw
+  // when one rank kept walking while others were still rendezvousing.
+  {
+    auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    torch::Tensor sync_tensor = torch::ones({1}, opts);
+    auto stream = c10_npu::getCurrentNPUStream(device.index());
+    HcclResult sync_r = HcclAllReduce(sync_tensor.data_ptr(),
+                                      sync_tensor.data_ptr(),
+                                      1, HCCL_DATA_TYPE_FP32,
+                                      HCCL_REDUCE_SUM, cp_attn.hccl,
+                                      stream.stream());
+    CHECK_EQ(sync_r, HCCL_SUCCESS)
+        << "post-CP-build sync HcclAllReduce failed; rendezvous not "
+           "complete on at least one rank";
+    c10_npu::npuSynchronizeDevice();
+    LOG(INFO) << "[probe3v2] CP rendezvous synced via barrier allreduce";
+  }
+
+  if (FLAGS_single_mapping_only) {
+    LOG(INFO) << "[probe3v2] single_mapping_only=true -- skipping DP comm "
+                 "build; this run measures whether the CP single-mapping "
+                 "setup is reproducible on all ranks (no dual interference).";
+    LOG(INFO) << "[probe3v2] PASS (single-mapping mode): rank=" << global_rank
+              << " attn_cp ready, hccl=" << cp_attn.hccl;
+    comm_cp.reset();
+    return 0;
   }
 
   // ---- Phase 2: build DP comm, resolve ATTN_DP commDomain ----
