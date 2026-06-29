@@ -151,6 +151,8 @@ class Worker {
   // enable_runtime_cp_dp_switch flag).
   bool switch_mode(DualParallelArgs::Mode target);
 
+  folly::SemiFuture<bool> switch_mode_async(int32_t target_mode);
+
   [[nodiscard]] DualParallelArgs::Mode current_mode() const;
 
  private:

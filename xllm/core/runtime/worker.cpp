@@ -273,4 +273,24 @@ folly::SemiFuture<bool> Worker::stop_profile_async() {
   });
   return future;
 }
+
+folly::SemiFuture<bool> Worker::switch_mode_async(int32_t target_mode) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule(
+      [this, target_mode, promise = std::move(promise)]() mutable {
+        if (target_mode != static_cast<int32_t>(
+                               DualParallelArgs::Mode::CP_PREFILL) &&
+            target_mode !=
+                static_cast<int32_t>(DualParallelArgs::Mode::DP_DECODE)) {
+          LOG(WARNING) << "switch_mode_async invalid target_mode="
+                       << target_mode;
+          promise.setValue(false);
+          return;
+        }
+        promise.setValue(this->switch_mode(
+            static_cast<DualParallelArgs::Mode>(target_mode)));
+      });
+  return future;
+}
 }  // namespace xllm
