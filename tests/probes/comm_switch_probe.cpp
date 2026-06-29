@@ -72,11 +72,25 @@ DEFINE_string(master_addr,
               "Each iteration shifts the port by iter * port_stride to avoid "
               "TIME_WAIT collisions and stale TCPStore reuse across rebuilds.");
 DEFINE_int32(port_stride,
-             64,
+             256,
              "Port shift between iterations. Must be larger than the inner "
              "fanout used by CollectiveCommunicator::create_process_groups "
-             "(world_size + dp_size + tp_size + single-rank-per-rank). The "
-             "default 64 covers world_size up to 8 comfortably.");
+             "AND big enough that previously-used ports have left TIME_WAIT "
+             "before they get reused later in the run. CollectiveCommunicator "
+             "consumes ~1 + dp + tp + world_size ports per phase; on a 4-card "
+             "single host the safe minimum is ~64, but TIME_WAIT defaults to "
+             "60 seconds and our iter cadence is ~2 s, so 50 iters need "
+             "~50*2*64=6400 ports of fresh space. 256 keeps the math simple "
+             "and tolerates iter durations as low as ~250 ms without reuse.");
+DEFINE_int32(addr_in_use_retries,
+             8,
+             "Number of times to retry the SAME iter when TCPStore listen "
+             "fails with EADDRINUSE. The OS sometimes hands one of our "
+             "stride-walked base ports to a transient client socket "
+             "(ip_local_port_range default is 1024-65535 which overlaps the "
+             "probe's port window). Each retry shifts further into the "
+             "stride window; the retry is NOT counted as a probe failure "
+             "since EADDRINUSE means OS contention, not a HCCL/ATB defect.");
 DEFINE_int32(world_size,
              4,
              "World size for the probe; matches mpirun -n N. Both CP=N and "
@@ -224,6 +238,59 @@ std::unique_ptr<xllm::CollectiveCommunicator> build_communicator(
   return comm;
 }
 
+// Returns true iff the exception text indicates a transient EADDRINUSE
+// from the TCPStore listen step. The probe walks linearly through ports,
+// but ip_local_port_range overlaps that window so a transient client
+// connection can claim one of the upcoming probe base ports between
+// iterations. We retry rather than failing because this is an OS-level
+// contention, not a HCCL/ATB defect.
+bool is_addr_in_use_error(const std::string& what) {
+  return what.find("EADDRINUSE") != std::string::npos ||
+         what.find("address already in use") != std::string::npos ||
+         what.find("Address already in use") != std::string::npos;
+}
+
+// Build a CollectiveCommunicator at `master_addr`, retrying with a fresh
+// port if the OS hands the requested base port to another socket between
+// iterations. Walks the port window in steps of FLAGS_port_stride; gives
+// up after FLAGS_addr_in_use_retries attempts (a deeper failure than
+// transient contention).
+std::unique_ptr<xllm::CollectiveCommunicator> build_communicator_with_retry(
+    int32_t global_rank,
+    int32_t world_size,
+    int32_t dp_size,
+    int32_t cp_size,
+    const std::string& base_host,
+    int32_t starting_port,
+    const torch::Device& device,
+    const std::string& tag,
+    int32_t* attempts_out) {
+  int32_t attempt = 0;
+  std::string last_err;
+  for (; attempt < FLAGS_addr_in_use_retries; ++attempt) {
+    const int32_t port = starting_port + attempt * FLAGS_port_stride;
+    const std::string addr = make_addr(base_host, port);
+    try {
+      auto comm = build_communicator(
+          global_rank, world_size, dp_size, cp_size, addr, device);
+      *attempts_out = attempt + 1;
+      return comm;
+    } catch (const std::exception& e) {
+      last_err = e.what();
+      if (!is_addr_in_use_error(last_err)) {
+        throw;
+      }
+      LOG(WARNING) << tag << " addr-in-use on port " << port
+                   << " (attempt " << (attempt + 1) << "/"
+                   << FLAGS_addr_in_use_retries << "), retrying";
+    }
+  }
+  *attempts_out = attempt;
+  throw std::runtime_error(tag + " gave up after " +
+                           std::to_string(FLAGS_addr_in_use_retries) +
+                           " EADDRINUSE retries; last error: " + last_err);
+}
+
 }  // namespace
 
 int main(int32_t argc, char** argv) {
@@ -280,24 +347,28 @@ int main(int32_t argc, char** argv) {
   int64_t worst_setup_ms = 0;
   int64_t worst_destroy_ms = 0;
   int32_t failures = 0;
+  int32_t total_addr_retries = 0;
 
   for (int32_t i = 0; i < FLAGS_iters; ++i) {
     // Each iteration uses two non-overlapping port windows (one for the CP
     // phase, one for the DP phase) so a TIME_WAIT TCPStore from the previous
     // iter cannot collide with the next. The window size FLAGS_port_stride
     // must exceed the max inner port fanout in
-    // CollectiveCommunicator::create_process_groups.
+    // CollectiveCommunicator::create_process_groups, AND build_communicator
+    // _with_retry walks within stride steps when the OS hands the chosen
+    // base to a transient client socket.
     const int32_t cp_port = base_port + (2 * i) * FLAGS_port_stride;
     const int32_t dp_port = base_port + (2 * i + 1) * FLAGS_port_stride;
-    const std::string cp_addr = make_addr(base_host, cp_port);
-    const std::string dp_addr = make_addr(base_host, dp_port);
 
+    int32_t cp_attempts = 0;
+    int32_t dp_attempts = 0;
     try {
       // ---------- Phase A: CP=world_size, dp_size=1 ----------
       const int64_t a0 = now_ms();
-      auto comm_cp = build_communicator(
+      auto comm_cp = build_communicator_with_retry(
           global_rank, world_size, /*dp_size=*/1,
-          /*cp_size=*/world_size, cp_addr, device);
+          /*cp_size=*/world_size, base_host, cp_port, device,
+          /*tag=*/"CP", &cp_attempts);
       const int64_t a1 = now_ms();
       run_smoke_forward(comm_cp->parallel_args(),
                         device,
@@ -311,9 +382,10 @@ int main(int32_t argc, char** argv) {
 
       // ---------- Phase B: DP=world_size, cp_size=1 ----------
       const int64_t b0 = now_ms();
-      auto comm_dp = build_communicator(
+      auto comm_dp = build_communicator_with_retry(
           global_rank, world_size, /*dp_size=*/world_size,
-          /*cp_size=*/1, dp_addr, device);
+          /*cp_size=*/1, base_host, dp_port, device,
+          /*tag=*/"DP", &dp_attempts);
       const int64_t b1 = now_ms();
       run_smoke_forward(comm_dp->parallel_args(),
                         device,
@@ -340,6 +412,7 @@ int main(int32_t argc, char** argv) {
 
       const int64_t free_now_mb = dev.free_memory() / (1024 * 1024);
       const int64_t mem_drop_mb = baseline_free_mb - free_now_mb;
+      total_addr_retries += (cp_attempts - 1) + (dp_attempts - 1);
 
       LOG(INFO) << "[probe] iter=" << i
                 << " cp_setup=" << cp_setup << "ms"
@@ -348,6 +421,8 @@ int main(int32_t argc, char** argv) {
                 << " dp_setup=" << dp_setup << "ms"
                 << " dp_forward=" << dp_forward << "ms"
                 << " dp_destroy=" << dp_destroy << "ms"
+                << " cp_attempts=" << cp_attempts
+                << " dp_attempts=" << dp_attempts
                 << " free_mb=" << free_now_mb
                 << " mem_drop_mb=" << mem_drop_mb;
     } catch (const std::exception& e) {
@@ -363,6 +438,7 @@ int main(int32_t argc, char** argv) {
   LOG(INFO) << "[probe] summary"
             << " iters=" << FLAGS_iters
             << " failures=" << failures
+            << " addr_retries=" << total_addr_retries
             << " avg_setup_ms="
             << (FLAGS_iters > 0 ? total_setup_ms / (2 * FLAGS_iters) : 0)
             << " avg_destroy_ms="

@@ -49,7 +49,13 @@ fi
 WORLD_SIZE="${WORLD_SIZE:-4}"
 DEVICES="${DEVICES:-0,1,2,3}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
-MASTER_PORT="${MASTER_PORT:-29500}"
+# torchrun uses --standalone with its own auto-allocated rendezvous port,
+# but the probe creates its own TCPStores for each rebuilt CollectiveCom-
+# municator, so we want a *separate* port range for the probe to avoid
+# colliding with torchrun's rendezvous store. PROBE_BASE_PORT seeds that
+# range; per-iter strides (port_stride * 2 * iters) move further away.
+TORCHRUN_RDZV_PORT="${TORCHRUN_RDZV_PORT:-29500}"
+PROBE_BASE_PORT="${PROBE_BASE_PORT:-40000}"
 RANK_TABLEFILE="${RANK_TABLEFILE:-}"
 ITERS="${ITERS:-50}"
 
@@ -78,7 +84,8 @@ echo "[run_comm_switch_probe] launching"
 echo "    binary       : ${PROBE_BIN}"
 echo "    world_size   : ${WORLD_SIZE}"
 echo "    devices      : ${DEVICES}"
-echo "    master       : ${MASTER_ADDR}:${MASTER_PORT}"
+echo "    torchrun rdzv: ${MASTER_ADDR}:${TORCHRUN_RDZV_PORT}"
+echo "    probe base   : ${MASTER_ADDR}:${PROBE_BASE_PORT}"
 echo "    iters        : ${ITERS}"
 echo "    rank_table   : ${RANK_TABLEFILE:-<unset, single-node fallback>}"
 echo "    NPU_HOME     : ${NPU_HOME_PATH}"
@@ -88,15 +95,26 @@ echo "    ATB_HOME     : ${ATB_HOME_PATH:-<unset>}"
 # --standalone to avoid running an external rendezvous backend, since this
 # launcher targets single-host runs only. Cross-host probes will need a
 # different launcher.
+#
+# IMPORTANT: torchrun exports MASTER_ADDR / MASTER_PORT to children pointing
+# at its own rendezvous TCPStore. The probe code's get_master_addr() reads
+# that env first -- which would make the probe pile its TCPStores on top of
+# torchrun's rendezvous port and collide. We `unset MASTER_PORT` inside the
+# child shell so the probe falls back to the --master_addr flag we pass,
+# which uses PROBE_BASE_PORT in a disjoint range.
 exec torchrun \
   --standalone \
   --nproc_per_node="${WORLD_SIZE}" \
   --master_addr="${MASTER_ADDR}" \
-  --master_port="${MASTER_PORT}" \
+  --master_port="${TORCHRUN_RDZV_PORT}" \
   --no_python \
+  bash -c '
+    unset MASTER_ADDR MASTER_PORT
+    exec "$0" "$@"
+  ' \
   "${PROBE_BIN}" \
   --npu_kernel_backend=TORCH \
-  --master_addr="${MASTER_ADDR}:${MASTER_PORT}" \
+  --master_addr="${MASTER_ADDR}:${PROBE_BASE_PORT}" \
   --world_size="${WORLD_SIZE}" \
   --iters="${ITERS}" \
   ${RANK_TABLE_FLAG} \
