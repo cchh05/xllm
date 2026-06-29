@@ -1414,6 +1414,12 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   auto tensor_options = torch::dtype(dtype_).device(device_);
   context_ = ModelContext(parallel_args_, args, quant_args, tensor_options);
   context_.set_model_id(options_.model_id());
+  // Plumb the optional DualParallelArgs through to ModelContext so
+  // dual-aware layers (DeepSeek V32) can see the OTHER mode's args
+  // and build the second pair of ATB graphs at init_layer time.
+  // dual_parallel_args_ is null in legacy single-mode and the layer
+  // ctor short-circuits accordingly.
+  context_.set_dual_parallel_args(dual_parallel_args_);
 
   // init model, create model executor
   bool status = this->init_model(context_);
