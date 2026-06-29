@@ -58,6 +58,8 @@ limitations under the License.
 #include <memory>
 #include <string>
 
+#include "core/framework/config/kernel_config.h"
+#include "core/framework/config/parallel_config.h"
 #include "core/framework/parallel_state/collective_communicator.h"
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/parallel_state/process_group.h"
@@ -231,6 +233,17 @@ int main(int32_t argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
   FLAGS_logtostderr = true;
   google::ParseCommandLineFlags(&argc, &argv, /*remove_flags=*/true);
+
+  // The CollectiveCommunicator constructor reads ParallelConfig::kv_split_size
+  // and KernelConfig::npu_kernel_backend straight off the singletons. Without
+  // these initialize() calls, the singletons keep their default values from
+  // the in-class PROPERTY initialisers (kv_split_size=0, npu_kernel_backend
+  // ="AUTO") which would steer the constructor through the ATB code path,
+  // skipping ProcessGroup creation. The probe needs the TORCH path to be
+  // active (we test xllm-owned HCCL groups), so a user override via
+  // --npu_kernel_backend=TORCH must actually take effect.
+  xllm::KernelConfig::get_instance().from_flags();
+  xllm::ParallelConfig::get_instance().from_flags();
 
   // RANK / WORLD_SIZE must come from the launcher. A default-zero rank
   // silently deadlocks TCPStore because every process tries to be rank 0.

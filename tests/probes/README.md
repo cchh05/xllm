@@ -41,29 +41,35 @@ HCCL `ProcessGroup` objects directly. Under the **ATB** backend
 live inside `atb_speed::ExternalCommManager` — that path needs a separate
 probe and is intentionally out of scope here.
 
+The xllm-ai container does not bundle OpenMPI, so the launcher uses
+**torchrun** (ships with torch 2.7+) to spawn one process per NPU. torchrun
+exports `RANK` / `LOCAL_RANK` / `WORLD_SIZE` / `MASTER_ADDR` / `MASTER_PORT`
+the way the probe expects.
+
 ```bash
-# Use mpirun to spawn one process per NPU. The probe reads RANK / LOCAL_RANK
-# / WORLD_SIZE from the environment (mpirun and torchrun both set these).
-mpirun -n 4 \
-    -x ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
-    -x RANK=0 -x LOCAL_RANK=0 -x WORLD_SIZE=4 \
-    ./build/tests/probes/comm_switch_probe \
+# Recommended: use the launcher script (sources NPU/ATB env, sets
+# ASCEND_RT_VISIBLE_DEVICES, picks a sane port, etc.).
+bash tests/probes/run_comm_switch_probe.sh --iters=50
+
+# Or invoke torchrun directly if you need finer control.
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export NPU_HOME_PATH="${ASCEND_HOME_PATH}"
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+torchrun --standalone --nproc_per_node=4 --no_python \
+    ./build/lib.linux-aarch64-cpython-311/xllm/comm_switch_probe \
     --npu_kernel_backend=TORCH \
-    --rank_tablefile=/path/to/82_4card.json \
     --master_addr=127.0.0.1:29500 \
+    --world_size=4 \
     --iters=50
 ```
 
-(mpirun rewrites `RANK` / `LOCAL_RANK` per slot if you let it manage them
-through `OMPI_COMM_WORLD_RANK` etc. — your launcher script should map those
-to `RANK` / `LOCAL_RANK` before the probe runs. The probe **fails fast** if
-`RANK` is unset, since a default-zero rank silently deadlocks at TCPStore
-rendezvous.)
-
-If you do not have a `rank_tablefile`, the same flag also reads from
+`rank_tablefile` is **not required** for single-node runs: when empty,
+`MappingNPU::get_num_nodes()` falls back to `1`, which is what we want for
+a 4-card single-host probe. Multi-host probes will need a real rank table.
 `EPLB_CONFIG`; see `xllm/core/framework/config/eplb_config.cpp` for the
-exact lookup chain. For a quick smoke test on 2 cards, drop `-n 4` to
-`-n 2` and pass `--world_size=2`.
+exact lookup chain. For a quick smoke test on 2 cards, override the env
+with `WORLD_SIZE=2 DEVICES=0,1 bash tests/probes/run_comm_switch_probe.sh`.
 
 ### Output to look for
 
