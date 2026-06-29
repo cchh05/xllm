@@ -273,7 +273,64 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
 #endif
 }
 
+WorkerImpl::WorkerImpl(DualParallelArgs* dual_args,
+                       const torch::Device& device,
+                       const runtime::Options& options)
+    : WorkerImpl(dual_args->active(), device, options) {
+  // The single-arg ctor above already snapshotted the active() ParallelArgs
+  // into parallel_args_; we just retain the pointer so switch_mode() can
+  // refresh the snapshot after a flip.
+  dual_parallel_args_ = dual_args;
+}
+
 WorkerImpl::~WorkerImpl() = default;
+
+bool WorkerImpl::switch_mode(DualParallelArgs::Mode target) {
+  if (dual_parallel_args_ == nullptr) {
+    LOG(WARNING) << "Worker rank=" << parallel_args_.rank()
+                 << " switch_mode requested but the worker was constructed "
+                    "in single-mode; ignoring.";
+    return false;
+  }
+  if (dual_parallel_args_->mode() == target) {
+    return true;
+  }
+  dual_parallel_args_->set_mode(target);
+  // Refresh the snapshot so legacy parallel_args_ readers (rank/world_size
+  // are mode-invariant; cp_size/dp_size and the ProcessGroup pointers do
+  // change) see the post-flip configuration. This is safe to do without
+  // holding a lock because the scheduler's drain protocol guarantees no
+  // forward is in flight on this worker when switch_mode runs.
+  parallel_args_ = dual_parallel_args_->active();
+  // dp_driver_ depends on cp_size/dp_size and must be recomputed.
+  const int32_t tp_size =
+      parallel_args_.world_size() /
+      (parallel_args_.dp_size() * parallel_args_.cp_size());
+  dp_driver_ = parallel_args_.dp_size() > 1 &&
+               parallel_args_.rank() %
+                       (tp_size * parallel_args_.cp_size()) ==
+                   0;
+  return true;
+}
+
+DualParallelArgs::Mode WorkerImpl::current_mode() const {
+  if (dual_parallel_args_ == nullptr) {
+    return DualParallelArgs::Mode::CP_PREFILL;
+  }
+  return dual_parallel_args_->mode();
+}
+
+void WorkerImpl::attach_dual_parallel_args(DualParallelArgs* dual_args) {
+  if (dual_parallel_args_ == dual_args) {
+    return;
+  }
+  dual_parallel_args_ = dual_args;
+  if (dual_args != nullptr) {
+    // Refresh the singular snapshot from the dual source so subsequent
+    // reads are consistent with whatever mode the dual is currently in.
+    parallel_args_ = dual_args->active();
+  }
+}
 
 bool WorkerImpl::allocate_kv_cache_storage(const KVCacheShape& kv_cache_shape,
                                            bool use_huge_page_allocator,
