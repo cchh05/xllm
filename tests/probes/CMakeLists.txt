@@ -120,3 +120,6 @@ xllm_probe_configure(comm_switch_probe)
 
 add_executable(dual_graph_probe dual_graph_probe.cpp)
 xllm_probe_configure(dual_graph_probe)
+
+add_executable(dual_graph_probe_atb dual_graph_probe_atb.cpp)
+xllm_probe_configure(dual_graph_probe_atb)
