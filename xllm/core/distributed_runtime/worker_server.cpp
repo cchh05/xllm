@@ -187,6 +187,18 @@ void WorkerServer::create_server(const runtime::Options& options,
     // master_addr port windows, snapshot both ParallelArgs into a
     // DualParallelArgs, and let WorkerImpl pick active() at runtime.
     //
+    // Mode mapping. The user-supplied (cp_size, dp_size, tp_size) is
+    // taken as ONE side of the dual; the OTHER side is its swap with
+    // cp_size <-> dp_size and tp_size held constant. This keeps
+    // world_size = cp * dp * tp invariant so the two ParallelArgs
+    // share the same world geometry, which is what HCCL ECM caches and
+    // what the dual_graph_probe_atb run-with-barrier relied on.
+    //
+    // Initial active is whichever side matches the user's input cp/dp.
+    // If the user passed cp_size > 1 we boot into CP_PREFILL mode; if
+    // they passed dp_size > 1 we boot into DP_DECODE mode. (Both > 1
+    // is rejected by MappingNPU::validate already.)
+    //
     // CRITICAL invariants captured by the v3 probe (see
     // tests/probes/dual_graph_probe_atb.cpp + DESIGN_DOC_v0.2.md):
     //   * port stride MUST exceed inner fanout in
@@ -212,26 +224,29 @@ void WorkerServer::create_server(const runtime::Options& options,
 
     LOG(INFO) << "Worker rank=" << worker_global_rank
               << " dual-mode comm setup: cp_master=" << cp_addr
-              << " dp_master=" << dp_addr;
+              << " dp_master=" << dp_addr
+              << " (user cp=" << cp_size << " dp=" << dp_size
+              << " => CP-side cp=" << std::max(cp_size, dp_size)
+              << " dp=1, DP-side cp=1 dp="
+              << std::max(cp_size, dp_size) << ")";
 
-    // The CP comm uses cp_size = world_size, dp_size = 1.
+    // The "CP" side: cp_size = max(cp, dp), dp_size = 1.
+    // The "DP" side: cp_size = 1,           dp_size = max(cp, dp).
+    // tp_size and ep_size carry over implicitly through world_size.
+    const int32_t paired = std::max(cp_size, dp_size);
     auto cp_comm = std::make_unique<CollectiveCommunicator>(
         worker_global_rank, world_size, /*dp_size=*/1, ep_size,
-        /*cp_size=*/world_size);
+        /*cp_size=*/paired);
     cp_comm->create_process_groups(cp_addr, device);
 
-    // The DP comm uses cp_size = 1, dp_size = world_size.
     auto dp_comm = std::make_unique<CollectiveCommunicator>(
-        worker_global_rank, world_size, /*dp_size=*/world_size, ep_size,
+        worker_global_rank, world_size, /*dp_size=*/paired, ep_size,
         /*cp_size=*/1);
     dp_comm->create_process_groups(dp_addr, device);
 
     dual_args_local = std::make_unique<DualParallelArgs>(
         *cp_comm->parallel_args(),
         *dp_comm->parallel_args(),
-        // Initial mode: pick the one matching the user-supplied
-        // (dp_size, cp_size) so the worker boots into the same
-        // configuration legacy mode would have produced.
         cp_size > 1 ? DualParallelArgs::Mode::CP_PREFILL
                     : DualParallelArgs::Mode::DP_DECODE);
 
