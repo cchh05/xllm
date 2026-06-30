@@ -324,7 +324,15 @@ message ForwardOutput {
   DiTForwardOutput dit_forward_output = 8;
 }
 
-// SwitchModeRequest is defined in disagg_pd.proto and imported above.
+// SwitchModeRequest -- runtime CP<->DP feature.
+// `target_mode` mirrors xllm::DualParallelArgs::Mode:
+//     0 = CP_PREFILL (cp_size = world, dp_size = 1)
+//     1 = DP_DECODE  (cp_size = 1, dp_size = world)
+// Caller (engine / scheduler) is responsible for draining inflight
+// forwards on the target worker before issuing the RPC.
+message SwitchModeRequest {
+  int32 target_mode = 1;
+}
 
 // master create Collective service
 // to sync all workers.

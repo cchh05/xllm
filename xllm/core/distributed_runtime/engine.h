@@ -166,15 +166,6 @@ class Engine {
     return false;
   };
 
-  // Runtime CP<->DP switch. Engine fans out to its WorkerClients via
-  // switch_mode_async; returns false on any worker failure or when the
-  // engine was not built with dual-mode enabled. target_mode mirrors
-  // xllm::DualParallelArgs::Mode (0 = CP_PREFILL, 1 = DP_DECODE).
-  virtual bool switch_mode(int32_t target_mode) {
-    LOG(ERROR) << "switch_mode is not implemented for this engine!";
-    return false;
-  };
-
   // XTensor mode: get GlobalXTensor offsets for allocated blocks
   // Returns per-layer K/V offsets for each block
   // Output: offsets[layer_id] = {k_offsets, v_offsets}

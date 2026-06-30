@@ -80,13 +80,4 @@ void DisaggPDService::UnlinkInstance(
   disagg_pd_service_impl_->unlink_instance(request, response);
 }
 
-void DisaggPDService::SwitchMode(
-    ::google::protobuf::RpcController* /*controller*/,
-    const proto::SwitchModeRequest* request,
-    proto::Status* response,
-    ::google::protobuf::Closure* done) {
-  brpc::ClosureGuard done_guard(done);
-  disagg_pd_service_impl_->switch_mode(request, response);
-}
-
 }  // namespace xllm

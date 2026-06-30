@@ -246,15 +246,6 @@ message InstanceClusterInfo {
   int32 kv_split_size = 7;
 }
 
-// SwitchModeRequest -- runtime CP<->DP feature, master-level entry.
-// Mirrors the worker-level SwitchModeRequest in worker.proto verbatim;
-// kept as a separate message here to avoid an import cycle between
-// worker.proto and disagg_pd.proto. target_mode encodes
-// xllm::DualParallelArgs::Mode (0 = CP_PREFILL, 1 = DP_DECODE).
-message SwitchModeRequest {
-  int32 target_mode = 1;
-}
-
 service DisaggPDService {
   rpc AddNewRequests(DisaggRequests) returns (DisaggResponses) {}
   rpc FirstGeneration(DisaggGenerationsRequests) returns (Status) {}
@@ -262,13 +253,4 @@ service DisaggPDService {
   rpc SendPullSignal(PullSignal) returns (Status) {}
   rpc LinkInstance(InstanceClusterInfo) returns (Status) {}
   rpc UnlinkInstance(InstanceClusterInfo) returns (Status) {}
-
-  // Runtime CP<->DP switch entry from xllm_service to engine master.
-  // Engine master then fans out to its workers via the worker-level
-  // SwitchMode RPC defined in worker.proto. target_mode mirrors
-  // xllm::DualParallelArgs::Mode (0 = CP_PREFILL, 1 = DP_DECODE).
-  // Returns Status.ok=false when the engine is not built with dual
-  // mode enabled (enable_runtime_cp_dp_switch flag is off) or when
-  // the target_mode is invalid.
-  rpc SwitchMode(SwitchModeRequest) returns (Status) {}
 }

@@ -60,15 +60,6 @@ class DisaggPDService : public proto::DisaggPDService {
                               proto::Status* response,
                               ::google::protobuf::Closure* done) override;
 
-  // Master-level entry from xllm_service for runtime CP<->DP switch.
-  // Forwards to every worker via the worker-level SwitchMode RPC; the
-  // engine reports failure if dual-mode support is not compiled in or
-  // any individual worker rejects the flip.
-  virtual void SwitchMode(::google::protobuf::RpcController* controller,
-                          const proto::SwitchModeRequest* request,
-                          proto::Status* response,
-                          ::google::protobuf::Closure* done) override;
-
  protected:
   std::unique_ptr<DisaggPDServiceImpl> disagg_pd_service_impl_;
 

@@ -43,13 +43,6 @@ class DisaggPDServiceImpl {
   virtual void unlink_instance(const proto::InstanceClusterInfo* request,
                                proto::Status* response);
 
-  // Master-level switch_mode handler. Iterates the engine's worker
-  // clients, calls switch_mode_async on each, and aggregates the
-  // result. Returns Status.ok=false if dual-mode is not enabled or
-  // any worker rejects the flip.
-  virtual void switch_mode(const proto::SwitchModeRequest* request,
-                           proto::Status* response);
-
  protected:
   std::shared_ptr<Request> generate_request(const proto::DisaggRequest& req);
 
