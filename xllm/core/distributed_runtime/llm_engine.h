@@ -127,6 +127,8 @@ class LLMEngine : public Engine {
 
   bool stop_profile() override;
 
+  bool switch_mode(int32_t target_mode) override;
+
   // XTensor mode: get GlobalXTensor offsets for allocated blocks via RPC
   // Calls worker in the specified DP group to compute offsets
   bool get_xtensor_offsets_for_blocks(

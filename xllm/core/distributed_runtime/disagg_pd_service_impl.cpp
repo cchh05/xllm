@@ -331,4 +331,22 @@ void DisaggPDServiceImpl::unlink_instance(
   response->set_ok(true);
 }
 
+void DisaggPDServiceImpl::switch_mode(const proto::SwitchModeRequest* request,
+                                      proto::Status* response) {
+  const int32_t target_mode = request->target_mode();
+  if (engine_ == nullptr) {
+    LOG(WARNING) << "switch_mode RPC: engine is null; cannot dispatch.";
+    response->set_ok(false);
+    return;
+  }
+  const bool ok = engine_->switch_mode(target_mode);
+  if (!ok) {
+    LOG(WARNING) << "switch_mode RPC failed for target_mode=" << target_mode;
+  } else {
+    LOG(INFO) << "switch_mode RPC succeeded; engine now in mode="
+              << target_mode;
+  }
+  response->set_ok(ok);
+}
+
 }  // namespace xllm

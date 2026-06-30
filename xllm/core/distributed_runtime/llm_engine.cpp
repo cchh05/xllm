@@ -1242,6 +1242,41 @@ bool LLMEngine::stop_profile() {
   return true;
 }
 
+bool LLMEngine::switch_mode(int32_t target_mode) {
+  LOG(INFO) << "Engine forwarding switch_mode(target=" << target_mode
+            << ") to " << worker_clients_num_ << " worker(s).";
+  if (worker_clients_.empty()) {
+    LOG(ERROR) << "No worker clients available for switch_mode.";
+    return false;
+  }
+  if (!options_.enable_runtime_cp_dp_switch()) {
+    LOG(WARNING)
+        << "switch_mode invoked but engine was not built with "
+           "--enable_runtime_cp_dp_switch; the workers will reject the flip.";
+    return false;
+  }
+
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(worker_clients_num_);
+  for (auto& worker : worker_clients_) {
+    futures.push_back(worker->switch_mode_async(target_mode));
+  }
+
+  auto results = folly::collectAll(futures).get();
+  for (const auto& result : results) {
+    if (!result.value()) {
+      LOG(ERROR) << "switch_mode failed on a worker; engine returns false. "
+                    "The cluster may now be in a mixed state and require "
+                    "manual recovery.";
+      return false;
+    }
+  }
+  LOG(INFO) << "Engine switch_mode completed: all "
+            << worker_clients_num_ << " worker(s) flipped to mode="
+            << target_mode;
+  return true;
+}
+
 bool LLMEngine::wakeup(const WakeupOptions& options) {
   // sleep/wakeup/fork_master requires
   // ::xllm::KVCacheConfig::get_instance().enable_xtensor()
