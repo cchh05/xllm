@@ -239,10 +239,21 @@ TransferKVInfo BatchInputBuilder::build_step_transfer_info(
   const size_t remote_stride =
       static_cast<size_t>(util::kv_split_size_effective());
   const size_t remote_end = map_end * remote_stride;
-  CHECK_GE(util::align_up(remote_size, remote_stride), remote_end)
-      << "remote block coverage shortage, request_id=" << full_info.request_id
-      << ", remote_size=" << remote_size << ", remote_end=" << remote_end
-      << ", remote_stride=" << remote_stride;
+  // === HOTPATCH: log-and-degrade instead of FATAL ===
+  if (util::align_up(remote_size, remote_stride) < remote_end) {
+    LOG_EVERY_N(ERROR, 1)
+        << "[PCACHE_MISMATCH] request_id=" << full_info.request_id
+        << ", local_size=" << local_size
+        << ", remote_size=" << remote_size
+        << ", win_begin=" << win_begin
+        << ", win_end=" << win_end
+        << ", map_end=" << map_end
+        << ", remote_end=" << remote_end
+        << ", remote_stride=" << remote_stride
+        << ", seq_len=" << seq_len
+        << ", block_size=" << block_size;
+    return info;  // skip transfer for this step, do not crash
+  }
 
   const size_t stable_end = static_cast<size_t>(seq_len / block_size);
   *advanced_transfer_block_idx =
