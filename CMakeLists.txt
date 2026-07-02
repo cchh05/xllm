@@ -7,6 +7,7 @@ option(USE_ILU "Enable ILU support" OFF)
 option(USE_CUDA "Enable CUDA support" OFF)
 option(USE_MUSA "Enable MUSA support" OFF)
 option(USE_DCU "Enable DCU support" OFF)
+option(USE_MACA "Enable MACA support" OFF)
 add_compile_definitions(YLT_ENABLE_IBV)
 add_definitions(-DYLT_ENABLE_IBV)
 set(YLT_ENABLE_IBV ON)
@@ -14,6 +15,22 @@ set(YLT_ENABLE_IBV ON)
 if(DEVICE_ARCH STREQUAL "ARM")
     set(CMAKE_SYSTEM_PROCESSOR aarch64)
     set(RUST_TARGET aarch64-unknown-linux-gnu)
+endif()
+
+if(USE_MACA)
+    Set(Python_EXECUTABLE $ENV{PYTHON_EXECUTABLE})
+    add_definitions(-DUSE_MACA)
+    include_directories(
+      $ENV{CUDA_PATH}/include
+    )
+    include_directories(SYSTEM
+      $ENV{PYTORCH_INSTALL_PATH}/../tvm_ffi/include
+    )
+    link_directories(
+      $ENV{CUDA_PATH}/lib
+      $ENV{MACA_PATH}/lib
+      $ENV{PYTORCH_INSTALL_PATH}/../tvm_ffi/lib
+    )
 endif()
 
 if(USE_NPU)
@@ -64,7 +81,9 @@ if(USE_NPU)
     endif()
 
     ## Adapt to the modification in DeekSeekV4 where the installation path of xllm_ops has been changed to custom_xllm_math
-    if(EXISTS "$ENV{NPU_HOME_PATH}/opp/vendors/custom_xllm_math/op_api/include/aclnnop")
+    ## Probe under ASCEND_OPP_PATH (the same root the marker is written to, and the
+    ## one scripts/build_support/utils.py reads) so the read and write paths cannot diverge.
+    if(EXISTS "$ENV{ASCEND_OPP_PATH}/vendors/custom_xllm_math/op_api/include/aclnnop")
       set(XLLM_OPS_MARKER_PATH "$ENV{ASCEND_OPP_PATH}/vendors/custom_xllm_math/.xllm_ops_git_head")
     endif()
     message(STATUS "XLLM_OPS_MARKER_PATH: ${XLLM_OPS_MARKER_PATH}")
@@ -288,7 +307,6 @@ endif()
 
 # setup CMake module path, defines path for include() and find_package()
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
-enable_language(Rust)
 find_package(Rust REQUIRED)
 
 if(UNIX)

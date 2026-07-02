@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/batch/batch.h"
 #include "core/framework/block/block.h"
 #include "core/framework/block/block_manager_impl.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/kv_cache/kv_cache.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_output.h"
@@ -363,7 +364,7 @@ class AclGraphExecutorTest : public ::testing::Test {
 
   void reset() {
     for (auto& sequence : sequences_) {
-      auto blocks = sequence.kv_state().kv_blocks();
+      auto blocks = sequence.kv_state().blocks(BlockType::KV);
       if (!blocks.empty()) {
         block_manager_->deallocate(blocks);
       }
@@ -381,7 +382,7 @@ class AclGraphExecutorTest : public ::testing::Test {
     auto& sequence = sequences_.back();
 
     // Allocate blocks and configure sequence
-    sequence.add_kv_blocks(block_manager_->allocate(3));
+    sequence.add_blocks(BlockType::KV, block_manager_->allocate(3));
     // Set kv_cache_tokens_num to be >= num_prompt_tokens to move to decode
     // stage
     sequence.kv_state().incr_kv_cache_tokens_num(
@@ -527,7 +528,7 @@ TEST_F(AclGraphExecutorTest, DifferentBatchSizes) {
                               fake_decoder_,
                               seq_params_);
       auto& sequence = sequences_.back();
-      sequence.add_kv_blocks(block_manager_->allocate(2));
+      sequence.add_blocks(BlockType::KV, block_manager_->allocate(2));
       std::cout << "batch_size: " << batch_size << " i: " << i
                 << " sequence.kv_state().current_max_tokens_capacity(): "
                 << sequence.kv_state().current_max_tokens_capacity()
@@ -583,7 +584,7 @@ TEST_F(AclGraphExecutorTest, DecodeBatchSizeThresholdFallsBackToEager) {
                             fake_decoder_,
                             seq_params_);
     auto& sequence = sequences_.back();
-    sequence.add_kv_blocks(block_manager_->allocate(2));
+    sequence.add_blocks(BlockType::KV, block_manager_->allocate(2));
     sequence.kv_state().incr_kv_cache_tokens_num(/*size=*/4);
     sequence.append_token(100 + i);
     batch->add(&sequence);
@@ -735,7 +736,7 @@ TEST_F(AclGraphExecutorTest, BatchInputCarriesLinearStateIds) {
   auto linear_state_block = block_manager_->allocate(1);
   ASSERT_EQ(linear_state_block.size(), 1);
   const int32_t expected_linear_state_id = linear_state_block[0].id();
-  seq.set_single_block(std::move(linear_state_block[0]));
+  seq.add_blocks(BlockType::SINGLE, linear_state_block);
 
   auto forward_input = batch->prepare_forward_input(
       options_.num_decoding_tokens(), 0, model_args_);
@@ -746,6 +747,27 @@ TEST_F(AclGraphExecutorTest, BatchInputCarriesLinearStateIds) {
   ASSERT_EQ(forward_input.input_params.embedding.embedding_ids.size(), 1);
   EXPECT_EQ(forward_input.input_params.embedding.embedding_ids[0],
             expected_linear_state_id);
+}
+
+TEST_F(AclGraphExecutorTest, GraphDoubleBufferFlagControlsSlotCount) {
+  ExecutionConfig& execution_config = ExecutionConfig::get_instance();
+  const bool original_enable_graph_double_buffer =
+      execution_config.enable_graph_double_buffer();
+
+  execution_config.enable_graph_double_buffer(true);
+  std::unique_ptr<::xllm::npu::AclGraphExecutorImpl> double_buffer_executor =
+      std::make_unique<::xllm::npu::AclGraphExecutorImpl>(
+          model_.get(), model_args_, *device_, options_);
+  EXPECT_EQ(double_buffer_executor->graph_slot_count_for_test(), 2);
+
+  execution_config.enable_graph_double_buffer(false);
+  std::unique_ptr<::xllm::npu::AclGraphExecutorImpl> single_buffer_executor =
+      std::make_unique<::xllm::npu::AclGraphExecutorImpl>(
+          model_.get(), model_args_, *device_, options_);
+  EXPECT_EQ(single_buffer_executor->graph_slot_count_for_test(), 1);
+
+  execution_config.enable_graph_double_buffer(
+      original_enable_graph_double_buffer);
 }
 
 TEST(AclGraphExecutorHybridTest, KvCacheSupportsLinearOnlyLayers) {

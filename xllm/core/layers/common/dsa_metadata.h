@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -168,6 +168,7 @@ struct DSAMetadata {
 
   // MLU-only canonical query sequence lengths consumed by DSA operators.
   // q_cu_seq_lens: (batch_size+1,) with leading 0.
+  // (kv_cu_seq_lens is declared above in the general sequence-length section.)
   torch::Tensor q_cu_seq_lens;
   // kv_seq_lens / q_seq_lens: (batch_size,) per-sequence lengths.
   torch::Tensor kv_seq_lens;

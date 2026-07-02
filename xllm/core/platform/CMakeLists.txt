@@ -10,12 +10,16 @@ cc_library(
   HDRS
     stream.h
     device.h
+    platform.h
     device_name_utils.h
     vmm_api.h
     shared_vmm_allocator.h
     vmm_torch_allocator.h
+    sleepable_allocator.h
     $<$<BOOL:${USE_MLU}>:mlu/mlu_layer_synchronizer.h>
     $<$<BOOL:${USE_MLU}>:mlu/mlu_tensor_alloc.h>
+    $<$<BOOL:${USE_DCU}>:dcu/dcu_layer_synchronizer.h>
+    $<$<BOOL:${USE_DCU}>:dcu/dcu_tensor_alloc.h>
     $<$<BOOL:${USE_CUDA}>:cuda/cuda_utils.h>
     $<$<BOOL:${USE_CUDA}>:cuda_profiler.h>
     $<$<BOOL:${USE_CUDA}>:torch_profiler.h>
@@ -23,13 +27,17 @@ cc_library(
   SRCS
     stream.cpp
     device.cpp
+    platform.cpp
     device_name_utils.cpp
     vmm_api.cpp
     shared_vmm_allocator.cpp
+    sleepable_allocator.cpp
     $<$<BOOL:${USE_MLU}>:mlu/mlu_layer_synchronizer.cpp>
     $<$<BOOL:${USE_MLU}>:mlu/mlu_tensor_alloc.cpp>
     $<$<BOOL:${USE_CUDA}>:cuda_profiler.cpp>
     $<$<BOOL:${USE_CUDA}>:torch_profiler.cpp>
+    $<$<BOOL:${USE_DCU}>:dcu/dcu_layer_synchronizer.cpp>
+    $<$<BOOL:${USE_DCU}>:dcu/dcu_tensor_alloc.cpp>
     $<$<OR:$<BOOL:${USE_CUDA}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_DCU}>>:numa_utils.cpp>
   DEPS
     :config

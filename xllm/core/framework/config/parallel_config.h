@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -47,6 +47,7 @@ class ParallelConfig final {
          "tp_size",
          "sp_size",
          "cfg_size",
+         "vae_size",
          "communication_backend",
          "enable_prefill_sp",
          "enable_mm_encoder_dp",
@@ -70,6 +71,8 @@ class ParallelConfig final {
   PROPERTY(int64_t, sp_size) = 1;
 
   PROPERTY(int64_t, cfg_size) = 1;
+
+  PROPERTY(int64_t, vae_size) = 1;
 
   PROPERTY(std::string, communication_backend) = "hccl";
 

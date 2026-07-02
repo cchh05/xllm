@@ -50,6 +50,7 @@ namespace cub = hipcub;
 
 #include "moe/moe_topk.cuh"
 #include "platform/device.h"
+#include "platform/platform.h"
 // #include "topk_last_dim.h"
 
 using SizeType32 = int32_t;
@@ -1279,7 +1280,9 @@ template <typename T>
 __device__ __forceinline__ T negativeInfinity() {
   return -INFINITY;
 }
-
+#if defined(USE_MACA) && !defined(CUDART_INF_FP16)
+#define CUDART_INF_FP16 __float2half_rn(INFINITY)
+#endif
 template <>
 __device__ __forceinline__ half negativeInfinity<half>() {
 #if !defined(USE_DCU)
@@ -1288,6 +1291,10 @@ __device__ __forceinline__ half negativeInfinity<half>() {
   return static_cast<half>(-INFINITY);
 #endif
 }
+
+#if defined(USE_MACA) && !defined(CUDART_INF_BF16)
+#define CUDART_INF_BF16 __ushort_as_bfloat16(0x7F80)
+#endif
 
 #if !defined(USE_DCU)
 template <>
@@ -1800,7 +1807,7 @@ void standalone_stable_radix_11bits(void* buf,
         stream,
         sorted);
   } else {
-    int32_t sm_cnt = xllm::Device::sm_count();
+    int32_t sm_cnt = xllm::Platform::sm_count();
     unsigned grid_dim = air_topk_stable::calc_grid_dim<T, IdxT, 11, kBlockDim>(
         batch_size, len, sm_cnt);
 
@@ -1999,7 +2006,7 @@ size_t invokeComputeTopkLastDimWorkspaceSize(SizeType32 batchSize,
 
   constexpr int kBlockDim = 512;
   constexpr bool kFusedLastFilter = false;
-  int32_t sm_cnt = xllm::Device::sm_count();
+  int32_t sm_cnt = xllm::Platform::sm_count();
   unsigned grid_dim = air_topk_stable::calc_grid_dim<T, IdxT, 11, kBlockDim>(
       batchSize, inputLength, sm_cnt);
 

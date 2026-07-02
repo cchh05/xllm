@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -75,6 +75,12 @@ DEFINE_bool(enable_return_mm_full_embeddings,
             false,
             "return vit and sequence embeddings for vlm models");
 
+DEFINE_string(mm_download_headers,
+              "",
+              "Service-level default HTTP headers for multimodal downloads, "
+              "as a JSON object. Per-request headers take precedence. "
+              "Example: '{\"Authorization\":\"Bearer xxx\"}'");
+
 DEFINE_bool(
     use_audio_in_video,
     false,
@@ -121,6 +127,7 @@ void ModelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(tool_call_parser);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_qwen3_reranker);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_return_mm_full_embeddings);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(mm_download_headers);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(flashinfer_workspace_buffer_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(use_audio_in_video);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(use_cpp_chat_template);
@@ -154,6 +161,7 @@ void ModelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(tool_call_parser);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_qwen3_reranker);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_return_mm_full_embeddings);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(mm_download_headers);
   XLLM_CONFIG_ASSIGN_FROM_JSON(flashinfer_workspace_buffer_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(use_audio_in_video);
   XLLM_CONFIG_ASSIGN_FROM_JSON(use_cpp_chat_template);
@@ -184,6 +192,8 @@ void ModelConfig::append_config_json(
       config_json, default_config, enable_qwen3_reranker);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_return_mm_full_embeddings);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, mm_download_headers);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, flashinfer_workspace_buffer_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

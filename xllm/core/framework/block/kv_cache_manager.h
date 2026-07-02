@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -55,12 +55,20 @@ class KVCacheManager {
 
   virtual void allocate_shared(Sequence* sequence) = 0;
   virtual void cache(Sequence* sequence) = 0;
+  // Cache only the full blocks covered by the first `num_tokens` tokens. Used
+  // by in-batch prefix cache to publish admitted prefill blocks before they are
+  // deallocated, so later requests in the same batch can share them.
+  virtual void cache(Sequence* sequence, size_t num_tokens) = 0;
 
   virtual std::vector<std::vector<BlockTransferInfo>>*
   get_swap_block_transfer_infos() = 0;
 
   virtual uint32_t num_blocks() const = 0;
   virtual int32_t block_size() const = 0;
+  // Drop all prefix-cache entries (RL sleep/wakeup: discarded KV would make
+  // cached prefixes point to garbage). Default no-op for managers without a
+  // prefix cache.
+  virtual void reset_prefix_cache() {}
   virtual std::vector<size_t> num_blocks_in_prefix_cache() const = 0;
   virtual std::vector<size_t> num_free_blocks() const = 0;
   virtual std::vector<size_t> num_used_blocks() const = 0;

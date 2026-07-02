@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -53,9 +53,9 @@ DEFINE_int64(dit_cache_end_blocks,
              5,
              "The number of blocks to skip at the end.");
 
-DEFINE_int64(dit_sp_communication_overlap,
-             1,
-             "Communication & Computation overlap for sequence parallel");
+DEFINE_bool(dit_sp_communication_overlap,
+            true,
+            "Communication & Computation overlap for sequence parallel");
 
 DEFINE_bool(dit_debug_print,
             false,
@@ -65,6 +65,17 @@ DEFINE_int64(dit_generation_image_area_max,
              0,
              "Maximum allowed image area (width * height) for image generation "
              "requests. If set to 0, there is no limit.");
+// --- dit vae tiling ---
+
+DEFINE_bool(
+    dit_enable_vae_tiling,
+    false,
+    "whether enable vae tiling, currently only support qwen-image-edit-plus");
+
+DEFINE_int64(
+    dit_vae_image_size,
+    1048576,
+    "Qwen Image Edit Plus VAE image size used to calculate dimensions.");
 
 namespace xllm {
 
@@ -82,6 +93,8 @@ void DiTConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_sp_communication_overlap);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_debug_print);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_generation_image_area_max);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_vae_image_size);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(dit_enable_vae_tiling);
 }
 
 void DiTConfig::from_json(const JsonReader& json) {
@@ -98,6 +111,8 @@ void DiTConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_sp_communication_overlap);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_debug_print);
   XLLM_CONFIG_ASSIGN_FROM_JSON(dit_generation_image_area_max);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(dit_vae_image_size);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(dit_enable_vae_tiling);
 }
 
 void DiTConfig::append_config_json(nlohmann::ordered_json& config_json) const {
@@ -128,6 +143,10 @@ void DiTConfig::append_config_json(nlohmann::ordered_json& config_json) const {
       config_json, default_config, dit_debug_print);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, dit_generation_image_area_max);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, dit_vae_image_size);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, dit_enable_vae_tiling);
 }
 
 DiTConfig& DiTConfig::get_instance() {

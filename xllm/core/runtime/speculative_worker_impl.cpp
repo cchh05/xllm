@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -106,11 +106,10 @@ std::optional<ForwardOutput> SpeculativeWorkerImpl::step(
     return step_empty(input);
   }
 
-  if (!input.input_params.meta.batch_forward_type.is_decode()) {
-    return step_prefill(input);
-  } else {
+  if (input.input_params.meta.batch_forward_type.is_decode()) {
     return step_decode(input);
   }
+  return step_prefill(input);
 }
 
 ForwardInput SpeculativeWorkerImpl::update_input_by_last_step_output(

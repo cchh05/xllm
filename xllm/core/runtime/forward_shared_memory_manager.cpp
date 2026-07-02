@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/model_config.h"
 #include "platform/stream.h"
 #if defined(USE_CUDA)
 #include <cuda_runtime_api.h>
@@ -137,15 +138,6 @@ inline size_t get_tensor_size(const torch::Tensor& tensor) {
   size += type_size<int8_t>;                       // dtype
   size += type_size<uint64_t>;                     // databytes
   size += tensor.numel() * tensor.element_size();  // data
-  return size;
-}
-
-inline size_t get_vector_tensor_size(
-    const std::vector<torch::Tensor>& tensor_vec) {
-  size_t size = type_size<int32_t>;  // tensor_num
-  for (const auto& tensor : tensor_vec) {
-    size += get_tensor_size(tensor);
-  }
   return size;
 }
 
@@ -325,6 +317,15 @@ inline size_t get_mm_batch_data_size(const MMBatchData& mm_data) {
   return total;
 }
 
+inline size_t get_vector_tensor_size(
+    const std::vector<torch::Tensor>& tensor_vec) {
+  size_t size = type_size<int32_t>;  // vector size
+  for (const auto& tensor : tensor_vec) {
+    size += get_tensor_size(tensor);
+  }
+  return size;
+}
+
 // calculate dit input size
 inline size_t get_dit_generation_params_size(
     const DiTGenerationParams& params) {
@@ -365,7 +366,6 @@ inline size_t get_dit_forward_input_size(const DiTForwardInput& input) {
   size += get_tensor_size(input.negative_pooled_prompt_embeds);
   size += get_tensor_size(input.latents);
   size += get_tensor_size(input.last_images);
-  size += get_tensor_size(input.image_embeds);
 
   // Generation params
   size += get_dit_generation_params_size(input.generation_params);
@@ -1044,7 +1044,6 @@ inline void write_dit_forward_input(char*& buffer,
   write_tensor(buffer, input.negative_pooled_prompt_embeds);
   write_tensor(buffer, input.latents);
   write_tensor(buffer, input.last_images);
-  write_tensor(buffer, input.image_embeds);
 
   write_dit_generation_params(buffer, input.generation_params);
 }
@@ -1955,7 +1954,6 @@ inline void read_dit_forward_input(const char*& buffer,
   read_tensor(buffer, input.negative_pooled_prompt_embeds);
   read_tensor(buffer, input.latents);
   read_tensor(buffer, input.last_images);
-  read_tensor(buffer, input.image_embeds);
 
   read_dit_generation_params(buffer, input.generation_params);
 }
@@ -2270,7 +2268,9 @@ inline void deserialize_forward_input_payload(
     input_params.multi_block_tables.emplace_back(manager_table.clone());
   }
 
-  read_dit_forward_input(context, input_params.dit_forward_input);
+  if (::xllm::ModelConfig::get_instance().backend() == "dit") {
+    read_dit_forward_input(context, input_params.dit_forward_input);
+  }
 
   finalize_device_buffer_session(device_session, stream);
   forward_input.input_host_buffer_has_layout = true;
@@ -2346,8 +2346,12 @@ size_t calculate_raw_forward_output_size(const RawForwardOutput& output) {
   size += get_vector_size(output.out_tokens);
   size += get_vector_size(output.out_logprobs);
   size += type_size<int32_t>;  // prepared_layer_id
+  // mm_embedding_data
+  size += get_vector_tensor_size(output.mm_embeddings);
   // dit output data
-  size += get_dit_forward_output_size(output.dit_forward_output);
+  if (::xllm::ModelConfig::get_instance().backend() == "dit") {
+    size += get_dit_forward_output_size(output.dit_forward_output);
+  }
 
   return size;
 }
@@ -2413,8 +2417,11 @@ void deserialize_raw_forward_output(const char* buffer,
   read_data(buffer, output.prepared_layer_id);
 
   read_vector_tensor(buffer, output.mm_embeddings);
+
   // read dit output
-  read_dit_forward_output(buffer, output.dit_forward_output);
+  if (::xllm::ModelConfig::get_instance().backend() == "dit") {
+    read_dit_forward_output(buffer, output.dit_forward_output);
+  }
 }
 
 void serialize_raw_forward_output(const RawForwardOutput& output,
@@ -2430,7 +2437,9 @@ void serialize_raw_forward_output(const RawForwardOutput& output,
 
   write_vector_tensor(buffer, output.mm_embeddings);
   // write dit output
-  write_dit_forward_output(buffer, output.dit_forward_output);
+  if (::xllm::ModelConfig::get_instance().backend() == "dit") {
+    write_dit_forward_output(buffer, output.dit_forward_output);
+  }
 }
 
 template <typename T>
@@ -2586,7 +2595,9 @@ inline void serialize_forward_input_sections(
     write_tensor(context, manager_table);
   }
 
-  write_dit_forward_input(context, input_params.dit_forward_input);
+  if (::xllm::ModelConfig::get_instance().backend() == "dit") {
+    write_dit_forward_input(context, input_params.dit_forward_input);
+  }
 }
 
 inline RawInputLayoutHeader calculate_forward_input_layout(

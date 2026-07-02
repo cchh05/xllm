@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@ std::string Options::to_string() const {
      << ", max_memory_utilization: " << max_memory_utilization()
      << ", enable_prefix_cache: " << enable_prefix_cache()
      << ", max_encoder_cache_size: " << max_encoder_cache_size()
+     << ", max_linear_state_cache_slots: " << max_linear_state_cache_slots()
      << ", max_tokens_per_batch: " << max_tokens_per_batch()
      << ", max_seqs_per_batch: " << max_seqs_per_batch()
      << ", max_tokens_per_chunk_for_prefill: "
@@ -62,12 +63,12 @@ std::string Options::to_string() const {
      << ", enable_schedule_overlap: " << enable_schedule_overlap()
      << ", enable_disagg_pd: " << enable_disagg_pd()
      << ", enable_pd_ooc: " << enable_pd_ooc()
+     << ", disable_log_stats: " << disable_log_stats()
      << ", kv_cache_dtype: " << kv_cache_dtype()
      << ", kv_cache_transfer_mode: " << kv_cache_transfer_mode()
      << ", etcd_addr: " << etcd_addr().value_or("null")
      << ", etcd_namespace: " << etcd_namespace().value_or("null")
      << ", enable_service_routing: " << enable_service_routing()
-     << ", enable_cache_upload: " << enable_cache_upload()
      << ", enable_kvcache_store: " << enable_kvcache_store()
      << ", prefetch_timeout: " << prefetch_timeout()
      << ", prefetch_batch_size: " << prefetch_batch_size()

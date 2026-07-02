@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -132,6 +132,7 @@ struct ModelArgs {
   PROPERTY(int32_t, n_group) = 0;
   PROPERTY(int32_t, topk_group) = 0;
   PROPERTY(std::string, scoring_func);
+  PROPERTY(float, swiglu_limit) = 0.0f;
   // deepseek v2/v3 MLA
   PROPERTY(bool, enable_mla) = false;
   PROPERTY(int32_t, qk_nope_head_dim) = 0;
@@ -418,6 +419,7 @@ struct ModelArgs {
 
   PROPERTY(int32_t, query_num) = 0;
   PROPERTY(bool, encoder_embedding_mode) = false;
+  PROPERTY(bool, embedding_mode) = false;
 
   // number of speculative decoding tokens
   PROPERTY(int64_t, num_speculative_tokens) = 0;
@@ -446,20 +448,11 @@ struct ModelArgs {
   PROPERTY(bool, use_quant_conv) = false;
   PROPERTY(bool, use_post_quant_conv) = false;
 
-  // Wan_2.2_ VAE related args
-  PROPERTY(int64_t, vae_in_channels) = -1;
-  PROPERTY(int64_t, vae_out_channels) = -1;
-  PROPERTY(int64_t, vae_base_dim) = 0;
-  PROPERTY(int64_t, vae_z_dim) = 0;
+  // Wan_2.2_ VAE related args (base_dim, dim_mult, latents_mean, latents_std,
+  // num_res_blocks, attn_scales, temporal_downsample, dropout are reused from
+  // qwen_image_edit_2509 vae args above)
   PROPERTY(int64_t, vae_scale_factor_temporal) = 0;
   PROPERTY(int64_t, vae_scale_factor_spatial) = 0;
-  PROPERTY(std::vector<int64_t>, vae_dim_mult) = {};
-  PROPERTY(int64_t, vae_num_res_blocks) = 0;
-  PROPERTY(std::vector<double>, vae_attn_scales) = {};
-  PROPERTY(std::vector<bool>, vae_temporal_downsample) = {};
-  PROPERTY(std::vector<double>, vae_latents_mean) = {};
-  PROPERTY(std::vector<double>, vae_latents_std) = {};
-  PROPERTY(double, vae_dropout) = 0.0;
   PROPERTY(bool, vae_is_residual) = false;
 
   // dit related args
@@ -469,10 +462,10 @@ struct ModelArgs {
   PROPERTY(std::vector<int64_t>, axes_dims_rope) = {};
   PROPERTY(int64_t, num_single_layers) = 0;
   PROPERTY(int, timestep_guidance_channels) = 256;
-  PROPERTY(double, eps) = 1e-6;
   PROPERTY(int64_t, patch_size) = 1;
   PROPERTY(std::vector<int64_t>, wan_patch_size) = { 1, 2, 2 };
   PROPERTY(bool, cross_attn_norm) = true;
+  PROPERTY(double, eps) = 1e-6;
   PROPERTY(int64_t, ffn_dim) = 13824;
   PROPERTY(int64_t, time_freq_dim) = 256;
   PROPERTY(int64_t, dit_in_channels) = 36;
@@ -526,8 +519,6 @@ struct ModelArgs {
   PROPERTY(std::string, final_sigmas_type) = "zero";
   PROPERTY(bool, rescale_betas_zero_snr) = false;
   PROPERTY(std::string, time_shift_type) = "exponential";
-  PROPERTY(float, sigma_min) = 0.0f;
-  PROPERTY(float, sigma_max) = 0.0f;
 
   // qwen_image_edit_2509 vae related args
   PROPERTY(int64_t, base_dim) = 0;
@@ -579,6 +570,7 @@ inline bool has_linear_attention_layers(const ModelArgs& args) {
 inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {
   os << "ModelArgs: [model_type: " << args.model_type();
   os << ", encoder_embedding_mode: " << args.encoder_embedding_mode();
+  os << ", embedding_mode: " << args.embedding_mode();
   os << ", dtype: " << args.dtype();
   os << ", hidden_size: " << args.hidden_size();
   os << ", hidden_act: " << args.hidden_act();

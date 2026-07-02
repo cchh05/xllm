@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -54,6 +54,7 @@ class ModelConfig final {
          "tool_call_parser",
          "enable_qwen3_reranker",
          "enable_return_mm_full_embeddings",
+         "mm_download_headers",
          "flashinfer_workspace_buffer_size",
          "use_audio_in_video",
          "use_cpp_chat_template"}};
@@ -83,6 +84,8 @@ class ModelConfig final {
   PROPERTY(bool, enable_qwen3_reranker) = false;
 
   PROPERTY(bool, enable_return_mm_full_embeddings) = false;
+
+  PROPERTY(std::string, mm_download_headers) = "";
 
   PROPERTY(int32_t, flashinfer_workspace_buffer_size) = 128 * 1024 * 1024;
 

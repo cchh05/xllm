@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,6 +25,9 @@ limitations under the License.
 #if defined(USE_MLU)
 #include "platform/mlu/mlu_layer_synchronizer.h"
 #endif
+#if defined(USE_DCU)
+#include "platform/dcu/dcu_layer_synchronizer.h"
+#endif
 #include "framework/parallel_state/parallel_args.h"
 #include "platform/device.h"
 #include "util/threadpool.h"
@@ -35,6 +38,8 @@ namespace xllm {
 using KVPushSynchronizerImpl = NPULayerSynchronizerImpl;
 #elif defined(USE_MLU)
 using KVPushSynchronizerImpl = MLULayerSynchronizerImpl;
+#elif defined(USE_DCU)
+using KVPushSynchronizerImpl = DCULayerSynchronizerImpl;
 #endif
 
 // In KV-split mode, filters and remaps remote_blocks_ids so that each KV-split
@@ -137,7 +142,7 @@ class KVCacheTransfer {
       const std::vector<uint64_t>& src_linear_state_ids,
       const std::vector<uint64_t>& dst_linear_state_ids);
 
-#if defined(USE_NPU) || defined(USE_MLU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
   virtual folly::SemiFuture<bool> push_kv_blocks_async(
       const std::vector<TransferKVInfo>& transfer_kv_infos,
       const ParallelArgs& parallel_args,
@@ -150,7 +155,7 @@ class KVCacheTransfer {
       const std::vector<TransferKVInfo>& transfer_kv_infos,
       const ParallelArgs& parallel_args);
 
-#if defined(USE_NPU) || defined(USE_MLU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
   virtual bool push_kv_blocks(
       std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
       std::shared_ptr<KVPushSynchronizerImpl>& layer_synchronizer,

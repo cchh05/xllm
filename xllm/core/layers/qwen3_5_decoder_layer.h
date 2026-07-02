@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,5 +18,5 @@ limitations under the License.
 #if defined(USE_NPU)
 #include "layers/npu_torch/qwen3_5_decoder_layer_impl.h"
 #elif defined(USE_MLU)
-#include "layers/mlu/qwen3_5_decoder_layer.h"
+#include "layers/mlu/qwen3_5/qwen3_5_decoder_layer.h"
 #endif

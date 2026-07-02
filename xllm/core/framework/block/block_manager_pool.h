@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,7 +33,6 @@ class BlockManagerPool : public KVCacheManager {
     PROPERTY(bool, enable_linear_state) = false;
     PROPERTY(bool, enable_prefix_cache) = true;
     PROPERTY(bool, enable_disagg_pd) = false;
-    PROPERTY(bool, enable_cache_upload) = false;
     PROPERTY(bool, enable_kvcache_store) = false;
     PROPERTY(bool, enable_xtensor) = false;
     PROPERTY(int64_t, num_layers) = 0;  // Required when enable_xtensor is true
@@ -81,15 +80,16 @@ class BlockManagerPool : public KVCacheManager {
 
   virtual void allocate_shared(Sequence* sequence) override;
   virtual void cache(Sequence* sequence) override;
+  virtual void cache(Sequence* sequence, size_t num_tokens) override;
 
   virtual std::vector<std::vector<BlockTransferInfo>>*
   get_swap_block_transfer_infos() override;
 
-  virtual void get_merged_kvcache_event(KvCacheEvent* event) const;
   virtual float get_gpu_cache_usage_perc() const;
 
   virtual uint32_t num_blocks() const override;
   virtual int32_t block_size() const override;
+  void reset_prefix_cache() override;
   virtual std::vector<size_t> num_blocks_in_prefix_cache() const override;
   virtual std::vector<size_t> num_free_blocks() const override;
   virtual std::vector<size_t> num_used_blocks() const override;
@@ -107,12 +107,9 @@ class BlockManagerPool : public KVCacheManager {
   int32_t get_dp_rank(Sequence* sequence) const;
 
   bool process_beam_search(Sequence* sequence, bool need_swap = false);
-  bool allocate_single_block(Sequence* sequence, int32_t dp_rank);
-  void deallocate_single_block(Sequence* sequence, int32_t dp_rank);
 
  private:
   std::vector<std::vector<BlockTransferInfo>> swap_block_transfer_infos_;
-  std::vector<std::unique_ptr<SingleBlockManager>> single_block_managers_;
 
  protected:
   // the options for the block manager

@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -182,18 +182,23 @@ DEFINE_COUNTER(prepare_input_latency_seconds,
                "Latency of preparing input in seconds");
 
 // rec engine metrics
-DEFINE_COUNTER(prepare_input_latency_microseconds,
-               "Latency of preparing input in microseconds");
-DEFINE_COUNTER(rec_first_token_latency_microseconds,
-               "Latency of rec first token generation in microseconds");
-DEFINE_COUNTER(rec_second_token_latency_microseconds,
-               "Latency of rec second token generation in microseconds");
-DEFINE_COUNTER(rec_third_token_latency_microseconds,
-               "Latency of rec third token generation in microseconds");
-DEFINE_COUNTER(rec_sampling_latency_microseconds,
-               "Latency of rec sampling in microseconds");
-DEFINE_HISTOGRAM(expand_beam_latency_microseconds,
-                 "Histogram of expand beam latency in microseconds");
+DEFINE_HISTOGRAM(rec_total_latency_microseconds,
+                 "Latency of rec engine in microseconds");
+DEFINE_HISTOGRAM(prepare_input_latency_microseconds,
+                 "Latency of preparing input in microseconds");
+DEFINE_HISTOGRAM(rec_first_token_latency_microseconds,
+                 "Latency of rec first token generation in microseconds");
+DEFINE_HISTOGRAM(rec_second_token_latency_microseconds,
+                 "Latency of rec second token generation in microseconds");
+DEFINE_HISTOGRAM(rec_third_token_latency_microseconds,
+                 "Latency of rec third token generation in microseconds");
+DEFINE_HISTOGRAM(rec_sampling_latency_microseconds,
+                 "Latency of rec sampling in microseconds");
+
+DEFINE_GAUGE(rec_beam_search_width, "rec beam search width");
+
+DEFINE_HISTOGRAM(rec_input_token_num_per_request,
+                 "Histogram of input token number per request in rec engine");
 
 // multi node metrics
 DEFINE_COUNTER(worker_service_latency_seconds,

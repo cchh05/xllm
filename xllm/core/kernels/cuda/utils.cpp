@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/platform/device.h"
+#include "core/platform/platform.h"
 #include "core/util/env_var.h"
 #include "core/util/utils.h"
 
@@ -365,7 +366,7 @@ bool should_use_tensor_core(torch::ScalarType kv_cache_dtype,
   return false;
 }
 
-bool support_pdl() { return Device::is_enable_pdl(); }
+bool support_pdl() { return Platform::is_enable_pdl(); }
 
 std::string path_to_uri_so_lib(const std::string& uri) {
   return util::get_string_env("FLASHINFER_OPS_PATH") + "/" + uri + "/" + uri +
@@ -378,7 +379,7 @@ std::string determine_attention_backend(int64_t pos_encoding_mode,
   bool support_fa3_backend =
       (pos_encoding_mode == 0) && !use_fp16_qk_reduction && !use_custom_mask;
 
-  if (Device::is_support_sm90a() && support_fa3_backend) {
+  if (Platform::is_support_sm90a() && support_fa3_backend) {
     return "fa3";
   }
   return "fa2";
@@ -396,7 +397,12 @@ std::string get_batch_prefill_uri(const std::string& backend,
                                   bool use_logits_soft_cap,
                                   bool use_fp16_qk_reduction) {
   std::ostringstream oss;
+#if defined(USE_MACA)
+  // use batch_prefill_tvm_ffi_with_kv_cache api for maca
+  oss << "batch_prefill_tvm_ffi_with_kv_cache_"
+#else
   oss << "batch_prefill_with_kv_cache_"
+#endif
       << "dtype_q_" << filename_safe_dtype_map.at(dtype_q) << "_"
       << "dtype_kv_" << filename_safe_dtype_map.at(dtype_kv) << "_"
       << "dtype_o_" << filename_safe_dtype_map.at(dtype_o) << "_"
@@ -423,7 +429,13 @@ std::string get_batch_decode_uri(torch::ScalarType dtype_q,
                                  bool use_sliding_window,
                                  bool use_logits_soft_cap) {
   std::ostringstream oss;
+
+#if defined(USE_MACA)
+  // use batch_decode_tvm_ffi_with_kv_cache api for maca
+  oss << "batch_decode_tvm_ffi_with_kv_cache_"
+#else
   oss << "batch_decode_with_kv_cache_"
+#endif
       << "dtype_q_" << filename_safe_dtype_map.at(dtype_q) << "_"
       << "dtype_kv_" << filename_safe_dtype_map.at(dtype_kv) << "_"
       << "dtype_o_" << filename_safe_dtype_map.at(dtype_o) << "_"

@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre(
 
   c10::ScalarType original_type = x.scalar_type();
   torch::Tensor x_bf16 = x;
-  if (x_bf16.dtype() != torch::kBFloat16) {
+  if (x_bf16.scalar_type() != torch::kBFloat16) {
     x_bf16 = x_bf16.to(torch::kBFloat16);
   }
 

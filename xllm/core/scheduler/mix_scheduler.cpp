@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -407,6 +407,7 @@ void MixScheduler::handle_running_queue_requests(
       running_sequences_budgets_.insert(running_sequences_budgets_.end(),
                                         candidate_token_budgets.begin(),
                                         candidate_token_budgets.end());
+      cache_in_batch_prefix(candidate_sequences, candidate_token_budgets);
       remaining_token_budget -= allocated_tokens;
       remaining_seq_budget -= allocated_seqs;
       remaining_copy_blocks_budget -= allocated_copy_blocks;

@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -41,7 +41,7 @@ WorkerRendezvous::WorkerRendezvous(
 bool WorkerRendezvous::link_cluster(const std::vector<uint64_t>& cluster_ids,
                                     const std::vector<std::string>& addrs,
                                     const std::vector<uint16_t>& ports) {
-#if defined(USE_NPU) || defined(USE_MLU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
   if (!kv_cache_transfer_) {
     LOG(ERROR) << "KVCacheTransfer not initialized";
     return false;
@@ -58,7 +58,7 @@ bool WorkerRendezvous::link_cluster(const std::vector<uint64_t>& cluster_ids,
 bool WorkerRendezvous::unlink_cluster(const std::vector<uint64_t>& cluster_ids,
                                       const std::vector<std::string>& addrs,
                                       const std::vector<uint16_t>& ports) {
-#if defined(USE_NPU) || defined(USE_MLU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
   if (!kv_cache_transfer_) {
     LOG(ERROR) << "KVCacheTransfer not initialized";
     return false;

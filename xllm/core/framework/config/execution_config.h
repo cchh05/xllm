@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -41,6 +41,7 @@ class ExecutionConfig final {
     static const OptionCategory kOptionCategory = {
         "EXECUTION OPTIONS",
         {"enable_graph",
+         "enable_graph_double_buffer",
          "enable_graph_mode_decode_no_padding",
          "enable_prefill_piecewise_graph",
          "enable_graph_vmm_pool",
@@ -55,6 +56,8 @@ class ExecutionConfig final {
   }
 
   PROPERTY(bool, enable_graph) = false;
+
+  PROPERTY(bool, enable_graph_double_buffer) = true;
 
   PROPERTY(bool, enable_graph_mode_decode_no_padding) = false;
 

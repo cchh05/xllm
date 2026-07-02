@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ struct FusedMoEArgs {
   bool is_gated = true;
   bool enable_result_reduction = true;
   bool skip_gate_load = false;
+  bool use_hash = false;
 };
 
 }  // namespace layer

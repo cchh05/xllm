@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -42,6 +42,64 @@ limitations under the License.
 
 namespace xllm::kernel {
 
+namespace {
+#if defined(USE_NPU)
+bool is_supported_initial_state_dtype(torch::ScalarType dtype) {
+  return dtype == torch::kBFloat16 || dtype == torch::kFloat32;
+}
+#endif
+
+#if defined(USE_DCU)
+torch::Tensor pack_2d_position_ids(const torch::Tensor& position_ids,
+                                   const torch::Tensor& cu_query_lens,
+                                   const torch::Tensor& query) {
+  if (position_ids.numel() == query.size(0)) {
+    return position_ids.reshape({-1}).contiguous();
+  }
+
+  torch::Tensor cu_cpu = cu_query_lens.to(torch::kCPU).to(torch::kInt64);
+  CHECK_GE(cu_cpu.numel(), 2)
+      << "apply_rotary: cu_query_lens must have at least 2 elements when "
+         "packing 2D position_ids.";
+  const int64_t num_seqs = cu_cpu.numel() - 1;
+  CHECK_LE(num_seqs, position_ids.size(0))
+      << "apply_rotary: position_ids batch is smaller than cu_query_lens, "
+      << "position_ids: " << position_ids.sizes()
+      << ", cu_query_lens: " << cu_query_lens.sizes();
+
+  std::vector<torch::Tensor> packed_positions;
+  packed_positions.reserve(static_cast<size_t>(num_seqs));
+  int64_t total_tokens = 0;
+  for (int64_t seq_idx = 0; seq_idx < num_seqs; ++seq_idx) {
+    const int64_t start = cu_cpu[seq_idx].item<int64_t>();
+    const int64_t end = cu_cpu[seq_idx + 1].item<int64_t>();
+    const int64_t seq_len = end - start;
+    CHECK_GE(seq_len, 0) << "apply_rotary: cu_query_lens must be monotonic.";
+    CHECK_LE(seq_len, position_ids.size(1))
+        << "apply_rotary: position_ids seq dimension is smaller than "
+        << "q_seq_len, position_ids: " << position_ids.sizes()
+        << ", seq_len: " << seq_len;
+    if (seq_len > 0) {
+      packed_positions.emplace_back(
+          position_ids.select(/*dim=*/0, seq_idx)
+              .slice(/*dim=*/0, /*start=*/0, /*end=*/seq_len));
+    }
+    total_tokens += seq_len;
+  }
+  CHECK_EQ(total_tokens, query.size(0))
+      << "apply_rotary: packed position_ids token count mismatch, "
+      << "position_ids: " << position_ids.sizes()
+      << ", cu_query_lens: " << cu_query_lens.sizes()
+      << ", query: " << query.sizes();
+  if (packed_positions.empty()) {
+    return torch::empty({0}, position_ids.options().dtype(torch::kInt64));
+  }
+  return torch::cat(packed_positions, /*dim=*/0).to(torch::kInt64).contiguous();
+}
+
+#endif
+}  // namespace
+
 void apply_rotary(RotaryParams& params) {
 #if defined(USE_MLU)
   mlu::apply_rotary(params.q,
@@ -66,6 +124,22 @@ void apply_rotary(RotaryParams& params) {
     // positions is already int64 on CUDA/MUSA/DCU (pre-converted in
     // ForwardInput::to).
     pos_ids = params.position_ids.value().to(torch::kInt64);
+#if defined(USE_DCU)
+    if (pos_ids.dim() == 2 && params.q.dim() == 3) {
+      if (pos_ids.numel() == params.q.size(0)) {
+        pos_ids = pos_ids.reshape({-1}).contiguous();
+      } else {
+        CHECK(params.cu_query_lens.has_value())
+            << "apply_rotary: cu_query_lens is required to pack 2D "
+               "position_ids for packed query, position_ids: "
+            << pos_ids.sizes() << ", query: " << params.q.sizes();
+        pos_ids = pack_2d_position_ids(
+            pos_ids, params.cu_query_lens.value(), params.q);
+      }
+    } else {
+      pos_ids = pos_ids.contiguous();
+    }
+#endif
   } else if (params.cu_query_lens.has_value()) {
     auto cu = params.cu_query_lens.value().to(torch::kInt64);
     CHECK(cu.numel() >= 2)
@@ -111,7 +185,14 @@ void apply_rotary(RotaryParams& params) {
     LOG(FATAL) << "apply_rotary: neither cos_sin nor cos/sin "
                   "provided; cannot infer cos_sin.";
   }
+#if defined(USE_DCU)
+  std::optional<torch::Tensor> key =
+      params.k.defined() ? std::optional<torch::Tensor>(params.k)
+                         : std::nullopt;
+  cuda::rotary_embedding(pos_ids, params.q, key, cos_sin, is_neox);
+#else
   cuda::rotary_embedding(pos_ids, params.q, params.k, cos_sin, is_neox);
+#endif
 #elif defined(USE_ILU)
   torch::Tensor ilu_cos_sin;
   if (params.precomputed_cos_sin.defined()) {
@@ -436,6 +517,8 @@ torch::Tensor group_gemm(GroupGemmParams& params) {
                          params.token_count,
                          params.combine_idx,
                          params.output);
+#elif defined(USE_DCU)
+  return dcu::group_gemm(params.a, params.b, params.token_count, params.output);
 #else
   NOT_IMPLEMENTED();
 #endif
@@ -452,7 +535,11 @@ std::tuple<torch::Tensor, torch::Tensor> dequant_swiglu_quant(
                                    params.quant_offset,
                                    params.group_index,
                                    params.activate_left,
-                                   params.quant_mode);
+                                   params.quant_mode,
+                                   params.swiglu_mode,
+                                   params.clamp_limit,
+                                   params.glu_alpha,
+                                   params.glu_bias);
 #else
   NOT_IMPLEMENTED();
 #endif
@@ -514,7 +601,16 @@ std::tuple<torch::Tensor, torch::Tensor> moe_active_topk(
                               params.scoring_func,
                               params.route_scale,
                               params.e_score_correction_bias);
-#elif defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_DCU)
+#elif defined(USE_DCU)
+  return dcu::moe_active_topk(params.input,
+                              params.topk,
+                              params.num_expert_group,
+                              params.topk_group,
+                              params.normalize,
+                              params.e_score_correction_bias,
+                              params.scoring_func,
+                              params.route_scale);
+#elif defined(USE_CUDA) || defined(USE_MUSA)
   return cuda::moe_fused_topk(params.input,
                               params.topk,
                               params.normalize,
@@ -530,6 +626,10 @@ std::vector<torch::Tensor> moe_gen_idx(MoeGenIdxParams& params) {
   return mlu::moe_gen_idx(params.expert_id, params.expert_num);
 #elif defined(USE_ILU)
   return ilu::moe_gen_idx(params.expert_id, params.expert_num);
+#elif defined(USE_DCU)
+  auto [src_dst, dst_src, expert_sizes] =
+      cuda::moe_compute_index(params.expert_id, params.expert_num);
+  return {src_dst, dst_src, expert_sizes};
 #else
   NOT_IMPLEMENTED();
 #endif
@@ -576,6 +676,16 @@ torch::Tensor moe_combine_result(MoeCombineResultParams& params) {
   return output;
 #elif defined(USE_ILU)
   return ilu::moe_combine_result(params.input, params.reduce_weight);
+#elif defined(USE_DCU)
+  // N = params.reduce_weight.size(0), topk = params.reduce_weight.size(1)
+  int64_t N = params.reduce_weight.size(0);
+  int32_t topk = static_cast<int32_t>(params.reduce_weight.size(1));
+  auto out =
+      cuda::moe_combine_result(params.input, params.reduce_weight, N, topk);
+  if (params.residual.has_value()) {
+    out = out + params.residual.value();
+  }
+  return out;
 #else
   NOT_IMPLEMENTED();
 #endif
@@ -757,6 +867,16 @@ torch::Tensor random_sample(RandomSampleParams& params) {
 torch::Tensor rejection_sample(RejectionSampleParams& params) {
 #if defined(USE_MLU)
   return mlu::rejection_sample(params.draft_token_ids,
+                               params.num_draft_tokens,
+                               params.cu_num_draft_tokens,
+                               params.draft_probs,
+                               params.target_probs,
+                               params.bonus_token_ids,
+                               params.uniform_rand,
+                               params.uniform_probs,
+                               params.max_spec_len);
+#elif defined(USE_DCU)
+  return dcu::rejection_sample(params.draft_token_ids,
                                params.num_draft_tokens,
                                params.cu_num_draft_tokens,
                                params.draft_probs,
@@ -1074,7 +1194,14 @@ std::tuple<torch::Tensor, torch::Tensor> fp8_scaled_quantize(
 
 std::pair<torch::Tensor, torch::Tensor> fused_gdn_gating(
     FusedGdnGatingParams& params) {
-#if defined(USE_NPU)
+#if defined(USE_MLU)
+  return mlu::fused_gdn_gating(params.A_log,
+                               params.a,
+                               params.b,
+                               params.dt_bias,
+                               params.beta,
+                               params.threshold);
+#elif defined(USE_NPU)
   return npu::tilelang::fused_gdn_gating(params.A_log,
                                          params.a,
                                          params.b,
@@ -1261,24 +1388,152 @@ std::tuple<torch::Tensor, torch::Tensor> fused_add_rms_norm_static_fp8_quant(
 
 torch::Tensor causal_conv1d_update(CausalConv1dUpdateParams& params) {
 #if defined(USE_NPU)
-  if (params.conv_state_indices.has_value()) {
-    CHECK(params.conv_state_indices.value().is_contiguous())
-        << "causal_conv1d_update: conv_state_indices must be contiguous.";
-  }
-  return npu::npu_causal_conv1d_update_v2(params.x,
-                                          params.conv_state,
-                                          params.weight,
-                                          params.activation,
-                                          params.bias,
-                                          params.conv_state_indices,
-                                          params.query_start_loc,
-                                          params.max_query_len,
-                                          params.pad_slot_id,
-                                          params.block_idx_last_scheduled_token,
-                                          params.initial_state_idx,
-                                          params.validate_data,
-                                          params.num_accepted_tokens);
+  const bool has_silu = params.activation;
 
+  auto x_work = params.x;
+  auto weight_work = params.weight;
+  auto conv_state_work = params.conv_state;
+
+  const int32_t dim = static_cast<int32_t>(x_work.size(1));
+
+  auto bias_work = params.bias.has_value() && params.bias.value().defined()
+                       ? params.bias.value()
+                       : torch::zeros({dim}, x_work.options());
+
+  auto conv_state_t = conv_state_work;
+  auto weight_t = weight_work;
+
+  auto cu_seqlens =
+      params.query_start_loc.has_value()
+          ? params.query_start_loc.value().to(torch::kInt32)
+          : torch::arange(0,
+                          x_work.size(0) + 1,
+                          std::max(params.max_query_len, int32_t{1}),
+                          torch::TensorOptions()
+                              .dtype(torch::kInt32)
+                              .device(x_work.device()));
+
+  int64_t batch = cu_seqlens.size(0) - 1;
+  if (batch <= 0) {
+    return x_work;
+  }
+
+  auto i32_opts =
+      torch::TensorOptions().dtype(torch::kInt32).device(x_work.device());
+
+  torch::Tensor init_indices;
+  torch::Tensor current_indices;
+  if (params.conv_state_indices.has_value()) {
+    auto ci = params.conv_state_indices.value().to(torch::kInt32);
+    if (ci.dim() == 1) {
+      init_indices = ci;
+      current_indices = ci;
+    } else {
+      auto ci_0 = ci.select(1, 0);
+      auto ci_1 = ci.select(1, 1);
+      if (params.initial_state_idx.has_value()) {
+        auto isi = params.initial_state_idx.value().to(torch::kInt32);
+        init_indices = torch::where(isi == 0, ci_0, ci_1);
+      } else {
+        init_indices = ci_0;
+      }
+      if (params.block_idx_last_scheduled_token.has_value()) {
+        auto bilt =
+            params.block_idx_last_scheduled_token.value().to(torch::kInt32);
+        current_indices = torch::where(bilt == 0, ci_0, ci_1);
+      } else {
+        current_indices = ci_0;
+      }
+    }
+  } else {
+    init_indices = torch::arange(batch, i32_opts);
+    current_indices = init_indices;
+  }
+
+  torch::Tensor initial_state_mode;
+  if (params.initial_state_mode.has_value()) {
+    initial_state_mode = params.initial_state_mode.value().to(torch::kInt32);
+  } else {
+    initial_state_mode = torch::ones({batch}, i32_opts);
+  }
+
+  const bool is_3d = (x_work.dim() == 3);
+  auto x_flat = is_3d ? x_work.reshape({-1, dim}) : x_work;
+
+  if (npu::tilelang::has_causal_conv1d_decode_specialization(
+          batch, dim, has_silu)) {
+    auto conv_state_t_nonconst = conv_state_t;
+    auto y = npu::tilelang::causal_conv1d_decode(
+        /*conv_state=*/conv_state_t_nonconst,
+        /*x=*/x_flat,
+        /*weight=*/weight_t,
+        /*bias=*/bias_work,
+        /*init_indices=*/init_indices,
+        /*current_indices=*/current_indices,
+        /*initial_state_mode=*/initial_state_mode,
+        /*has_silu=*/has_silu);
+
+    if (is_3d) {
+      y = y.view(x_work.sizes());
+    }
+    return y;
+  }
+
+  // Fallback: per-batch loop using causal_conv1d (batch=1 kernel, fp16).
+  auto original_dtype = x_work.scalar_type();
+  bool need_cast = (original_dtype != torch::kFloat16);
+
+  auto x_fp16 = need_cast ? x_flat.to(torch::kFloat16) : x_flat;
+  auto weight_fp16 = need_cast ? weight_work.to(torch::kFloat16) : weight_work;
+  auto conv_state_fp16 = need_cast ? conv_state_work.to(torch::kFloat16).clone()
+                                   : conv_state_work.clone();
+  auto bias_fp16 = need_cast ? bias_work.to(torch::kFloat16) : bias_work;
+
+  auto y_fp16 = torch::empty({x_flat.size(0), dim}, x_fp16.options());
+  auto cu_seqlens_cpu = cu_seqlens.to(torch::kCPU);
+  const int32_t* cu_ptr = cu_seqlens_cpu.data_ptr<int32_t>();
+
+  for (int64_t b = 0; b < batch; ++b) {
+    int32_t seq_start_b = cu_ptr[b];
+    int32_t seq_end_b = cu_ptr[b + 1];
+    int32_t sb_len = seq_end_b - seq_start_b;
+    if (sb_len <= 0) {
+      continue;
+    }
+
+    auto x_b = x_fp16.slice(0, seq_start_b, seq_end_b);
+    auto init_b = init_indices.slice(0, b, b + 1);
+    auto curr_b = current_indices.slice(0, b, b + 1);
+    auto ism_b = initial_state_mode.slice(0, b, b + 1);
+
+    auto cu_b = torch::tensor(
+        {0, sb_len},
+        torch::TensorOptions().dtype(torch::kInt32).device(x_work.device()));
+
+    auto y_b = npu::tilelang::causal_conv1d(conv_state_fp16,
+                                            x_b,
+                                            weight_fp16,
+                                            bias_fp16,
+                                            cu_b,
+                                            init_b,
+                                            curr_b,
+                                            ism_b,
+                                            has_silu);
+
+    y_fp16.slice(0, seq_start_b, seq_end_b).copy_(y_b);
+  }
+
+  if (need_cast) {
+    params.conv_state.copy_(conv_state_fp16.to(original_dtype));
+  } else {
+    params.conv_state.copy_(conv_state_fp16);
+  }
+  auto y = need_cast ? y_fp16.to(original_dtype) : y_fp16;
+
+  if (is_3d) {
+    y = y.view(x_work.sizes());
+  }
+  return y;
 #else
   NOT_IMPLEMENTED();
 #endif
@@ -1584,17 +1839,110 @@ torch::Tensor sparse_attn_sharedkv_metadata(
 std::pair<torch::Tensor, torch::Tensor> chunk_gated_delta_rule(
     ChunkGatedDeltaRuleParams& params) {
 #if defined(USE_NPU)
-  return npu::npu_chunk_gated_delta_rule(params.q,
-                                         params.k,
-                                         params.v,
-                                         params.g,
-                                         params.beta,
-                                         params.scale,
-                                         params.initial_state,
-                                         params.output_final_state,
-                                         params.cu_seqlens,
-                                         params.head_first,
-                                         params.use_qk_l2norm_in_kernel);
+  CHECK(!params.head_first)
+      << "chunk_gated_delta_rule only supports head_first=false.";
+  CHECK(params.q.scalar_type() == torch::kBFloat16 &&
+        params.k.scalar_type() == torch::kBFloat16 &&
+        params.v.scalar_type() == torch::kBFloat16)
+      << "chunk_gated_delta_rule expects q/k/v to be bfloat16.";
+  if (params.initial_state.has_value()) {
+    CHECK(is_supported_initial_state_dtype(
+        params.initial_state.value().scalar_type()))
+        << "chunk_gated_delta_rule expects initial_state to be bfloat16 or "
+           "float32, got "
+        << params.initial_state.value().scalar_type();
+  }
+
+  const torch::ScalarType input_dtype = params.q.scalar_type();
+  const int64_t batch_size = params.q.size(0);
+  const int64_t seq_len = params.q.size(1);
+  const int64_t num_heads_qk = params.q.size(2);
+  CHECK(params.q.sizes() == params.k.sizes())
+      << "q and k must have the same shape.";
+  CHECK(params.v.dim() == 4 && params.v.size(0) == batch_size &&
+        params.v.size(1) == seq_len)
+      << "v must have shape [B, T, Hv, V].";
+  const int64_t num_heads_v = params.v.size(2);
+  const int64_t head_dim = params.q.size(3);
+  const int64_t chunk_size = params.chunk_size;
+  CHECK(num_heads_v % num_heads_qk == 0)
+      << "chunk_gated_delta_rule expects num_heads_v to be "
+         "divisible by num_heads_qk, got "
+      << num_heads_v << " and " << num_heads_qk;
+  CHECK(params.beta.dim() == 3 && params.beta.size(0) == batch_size &&
+        params.beta.size(1) == seq_len && params.beta.size(2) == num_heads_v)
+      << "beta must have shape [B, T, H].";
+  CHECK(params.g.dim() == 3 && params.g.size(0) == batch_size &&
+        params.g.size(1) == seq_len && params.g.size(2) == num_heads_v)
+      << "g must have shape [B, T, H].";
+
+  auto q_prepared = params.use_qk_l2norm_in_kernel
+                        ? npu::npu_l2norm_last_dim(params.q)
+                        : params.q;
+  auto k_prepared = params.use_qk_l2norm_in_kernel
+                        ? npu::npu_l2norm_last_dim(params.k)
+                        : params.k;
+  auto cu_prepared =
+      params.cu_seqlens.has_value()
+          ? std::optional<torch::Tensor>(
+                params.cu_seqlens.value().to(torch::kInt32).contiguous())
+          : std::nullopt;
+  auto g_cumsum =
+      npu::npu_chunk_local_cumsum(params.g, chunk_size, cu_prepared);
+  const float scale_value = params.scale.has_value()
+                                ? params.scale.value()
+                                : std::pow(static_cast<float>(head_dim), -0.5f);
+  auto matrix_a = npu::npu_chunk_scaled_dot_kkt_fwd(
+      k_prepared, params.beta, g_cumsum, chunk_size, cu_prepared);
+  auto matrix_a_inv = npu::npu_solve_tril(
+      matrix_a, chunk_size, cu_prepared, params.k.scalar_type());
+  auto [w, u] = npu::npu_recompute_w_u_fwd(
+      k_prepared, params.v, params.beta, g_cumsum, matrix_a_inv, cu_prepared);
+  auto init_state_prepared =
+      params.initial_state.has_value()
+          ? std::optional<torch::Tensor>(
+                params.initial_state.value().to(torch::kFloat32).contiguous())
+          : std::nullopt;
+  auto [h, v_new, final_state] = npu::tilelang::chunk_gated_delta_rule_fwd_h(
+      k_prepared.squeeze(0),
+      w.squeeze(0),
+      u.squeeze(0),
+      g_cumsum.squeeze(0),
+      init_state_prepared,
+      params.output_final_state,
+      chunk_size,
+      /*save_new_value=*/true,
+      cu_prepared,
+      /*chunk_offsets=*/std::nullopt);
+  auto out = npu::npu_chunk_fwd_o(q_prepared,
+                                  k_prepared,
+                                  v_new.unsqueeze(0),
+                                  h.unsqueeze(0),
+                                  g_cumsum,
+                                  scale_value,
+                                  chunk_size,
+                                  cu_prepared);
+
+  return {out.to(input_dtype),
+          params.output_final_state ? final_state : torch::Tensor()};
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+std::pair<torch::Tensor, torch::Tensor> mega_chunk_gdn(
+    MegaChunkGdnParams& params) {
+#if defined(USE_NPU)
+  return npu::npu_mega_chunk_gdn(params.q,
+                                 params.k,
+                                 params.v,
+                                 params.g,
+                                 params.beta,
+                                 params.scale,
+                                 params.initial_state,
+                                 params.output_final_state,
+                                 params.cu_seqlens,
+                                 params.use_qk_l2norm_in_kernel);
 #else
   NOT_IMPLEMENTED();
 #endif
@@ -1664,6 +2012,36 @@ torch::Tensor causal_conv1d(const torch::Tensor& x,
                             activation_mode,
                             pad_slot_id,
                             run_mode);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+void causal_conv1d_out(const torch::Tensor& output,
+                       const torch::Tensor& x,
+                       const torch::Tensor& weight,
+                       const torch::Tensor& conv_state,
+                       const std::optional<torch::Tensor>& bias_opt,
+                       const torch::IntArrayRef query_start_loc_opt,
+                       const torch::IntArrayRef cache_indices_opt,
+                       const torch::IntArrayRef initial_state_mode_opt,
+                       const torch::IntArrayRef num_accepted_tokens_opt,
+                       int64_t activation_mode,
+                       int64_t pad_slot_id,
+                       int64_t run_mode) {
+#if defined(USE_NPU)
+  npu::causal_conv1d_out(output,
+                         x,
+                         weight,
+                         conv_state,
+                         bias_opt,
+                         query_start_loc_opt,
+                         cache_indices_opt,
+                         initial_state_mode_opt,
+                         num_accepted_tokens_opt,
+                         activation_mode,
+                         pad_slot_id,
+                         run_mode);
 #else
   NOT_IMPLEMENTED();
 #endif

@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -244,17 +244,19 @@ class VMMTorchAllocator
     return nullptr;
   }
 
-#if TORCH_VERSION_MAJOR >= 2 && TORCH_VERSION_MINOR >= 10
+#if (TORCH_VERSION_MAJOR >= 2 && TORCH_VERSION_MINOR >= 10) || defined(USE_MACA)
   void emptyCache(at::cuda::MempoolId_t /*mempool_id*/ = {0, 0}) override {
     LOG(FATAL) << "VMMTorchAllocator::emptyCache() called unexpectedly!";
   }
 
+#if TORCH_VERSION_MAJOR >= 2 && TORCH_VERSION_MINOR >= 10
   std::vector<c10::cuda::CUDACachingAllocator::StreamSegmentSize>
   getExpandableSegmentSizes(c10::DeviceIndex /*device*/) override {
     LOG(FATAL) << "VMMTorchAllocator::getExpandableSegmentSizes() called "
                   "unexpectedly!";
     return {};
   }
+#endif  // TORCH_VERSION_MAJOR >= 2 && TORCH_VERSION_MINOR >= 10
 
   c10::cuda::CUDACachingAllocator::SnapshotInfo snapshot(
       at::cuda::MempoolId_t /*mempool_id*/ = {0, 0}) override {

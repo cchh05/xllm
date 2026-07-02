@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,8 +32,8 @@ limitations under the License.
 #include <unordered_set>
 #include <utility>
 
-#include "core/common/global_flags.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/state_dict/utils.h"
 #include "core/kernels/ops_api.h"
 #include "core/layers/common/dsa_metadata.h"
@@ -334,7 +334,7 @@ inline void deepseek_v4_build_cache_specs(
   const auto& compress_ratios = model_args.compress_ratios();
   const int32_t window_size = model_args.window_size();
   const int32_t base_block_size = 128;
-  CHECK_EQ(FLAGS_block_size, base_block_size)
+  CHECK_EQ(KVCacheConfig::get_instance().block_size(), base_block_size)
       << "DeepSeek V4 currently only supports block_size=128.";
 
   std::unordered_map<DSAGroupKey, int32_t, DSAGroupKeyHash> group_key_map;
@@ -497,7 +497,7 @@ class DeepseekV4ModelImpl
     // TODO: Wire runtime block_size into model metadata so this stays aligned
     // with the DSv4 KV cache and block manager when the default changes.
     const int32_t base_block_size = 128;  // default block size
-    CHECK_EQ(FLAGS_block_size, base_block_size)
+    CHECK_EQ(KVCacheConfig::get_instance().block_size(), base_block_size)
         << "DeepSeek V4 currently only supports block_size=128.";
 
     std::unordered_map<DSAGroupKey, int32_t, DSAGroupKeyHash> group_key_map;
@@ -1044,6 +1044,8 @@ class DeepseekV4ModelImpl
   void fill_empty_dp_rank_input_params(
       ModelInputParams& params,
       const std::vector<KVCache>* kv_caches = nullptr) const {
+    const bool is_chunked_prefill =
+        params.meta.batch_forward_type.is_chunked_prefill();
     params.attn_metadata = nullptr;
     auto cpu_int_options = torch::TensorOptions()
                                .dtype(torch::kInt32)
@@ -1062,7 +1064,9 @@ class DeepseekV4ModelImpl
     params.meta.kv_max_seq_len =
         std::max<int32_t>(params.meta.kv_max_seq_len, dummy_kv_len);
     params.meta.q_max_seq_len = 1;
-    params.meta.batch_forward_type = BatchForwardType::DECODE;
+    params.meta.batch_forward_type = is_chunked_prefill
+                                         ? BatchForwardType::CHUNKED_PREFILL
+                                         : BatchForwardType::DECODE;
     params.attention.host.kv_seq_lens = {dummy_kv_len};
     params.attention.host.q_seq_lens = {1};
     params.attention.host.q_cu_seq_lens = {1};
@@ -1647,6 +1651,7 @@ inline void load_deepseek_v4_model_args(const JsonReader& json,
   LOAD_ARG_OR(n_hash_layers, "num_hash_layers", 3);
   LOAD_ARG_OR(routed_scaling_factor, "routed_scaling_factor", 1.5f);
   LOAD_ARG_OR(scoring_func, "scoring_func", "sqrtsoftplus");
+  LOAD_ARG_OR(swiglu_limit, "swiglu_limit", 10.0f);
 
   // Indexer
   LOAD_ARG_OR(index_head_dim, "index_head_dim", 128);
@@ -1772,6 +1777,9 @@ inline void validate_deepseek_v4_args(const ModelArgs& args,
       << "deepseek_v4 config routed_scaling_factor/route_scale must be > 0, "
          "got "
       << args.routed_scaling_factor();
+  CHECK_GT(args.swiglu_limit(), 0.0f)
+      << "deepseek_v4 config swiglu_limit must be > 0, got "
+      << args.swiglu_limit();
   CHECK(!args.scoring_func().empty())
       << "deepseek_v4 config scoring_func/score_func must not be empty";
   {

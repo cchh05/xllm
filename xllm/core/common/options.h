@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,6 +65,9 @@ class Options {
 
   // maximum encoder cache size in MB (0 disables encoder cache)
   PROPERTY(int64_t, max_encoder_cache_size) = 0;
+
+  // active linear-state slots. 0 derives capacity from the KV cache budget.
+  PROPERTY(int64_t, max_linear_state_cache_slots) = 0;
 
   // max tokens num per batch
   PROPERTY(int32_t, max_tokens_per_batch) = 20480;
@@ -137,6 +140,8 @@ class Options {
 
   PROPERTY(int32_t, cfg_size) = 1;
 
+  PROPERTY(int32_t, vae_size) = 1;
+
   PROPERTY(std::optional<std::string>, instance_name);
 
   PROPERTY(bool, enable_disagg_pd) = false;
@@ -168,8 +173,6 @@ class Options {
   PROPERTY(double, host_blocks_factor) = 0.0;
 
   PROPERTY(bool, enable_kvcache_store) = false;
-
-  PROPERTY(bool, enable_cache_upload) = false;
 
   PROPERTY(std::string, store_protocol) = "tcp";
 
@@ -213,6 +216,15 @@ class Options {
 
   // for offline inference: start with offline inference, default is false
   PROPERTY(bool, enable_offline_inference) = false;
+
+  // Enable the RL sleep/wakeup memory mode (SleepableAllocator). When set, the
+  // offline Python sleep()/wake_up() interface releases / re-acquires physical
+  // HBM via the VMM-backed allocator (vllm-ascend style), independent of the
+  // xtensor-based online sleep/wakeup path.
+  PROPERTY(bool, enable_sleep_mode) = false;
+
+  // disable per-request statistic logs.
+  PROPERTY(bool, disable_log_stats) = false;
   // for offline inference: the path to spawn worker binary
   PROPERTY(std::string, spawn_worker_path) = "";
 

@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,7 +30,6 @@ limitations under the License.
 #include <sstream>
 #include <vector>
 
-#include "common/global_flags.h"
 #include "common/metrics.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/parallel_config.h"
@@ -50,7 +49,7 @@ namespace {
 size_t estimate_decode_extra_blocks(Sequence* sequence,
                                     size_t updated_num_tokens,
                                     size_t block_size) {
-  const size_t num_blocks = sequence->kv_state().num_kv_blocks();
+  const size_t num_blocks = sequence->kv_state().num_blocks(BlockType::KV);
   const size_t num_blocks_needed =
       (updated_num_tokens + block_size - 1) / block_size;
   if (num_blocks_needed > num_blocks) {
@@ -111,6 +110,8 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
 
   enable_prefix_cache_ =
       ::xllm::KVCacheConfig::get_instance().enable_prefix_cache();
+  enable_in_batch_prefix_cache_ =
+      ::xllm::KVCacheConfig::get_instance().enable_in_batch_prefix_cache();
 
   last_batch_.resize(options_.dp_size());
 
@@ -124,6 +125,7 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
       .max_seqs_per_batch(options.max_seqs_per_batch())
       .max_global_tpot_ms(options.max_global_tpot_ms())
       .max_global_ttft_ms(options.max_global_ttft_ms())
+      .instance_role(options.instance_role().value_or(InstanceRole::DEFAULT))
       .enable_profile_token_budget(options.enable_profile_token_budget());
   profile_manager_ =
       std::make_unique<ProfileManager>(engine, profile_manager_options);
@@ -131,7 +133,8 @@ ContinuousScheduler::ContinuousScheduler(Engine* engine, const Options& options)
   response_processor_ = std::make_unique<AsyncResponseProcessor>(
       engine_->tokenizer(),
       options_.instance_role(),
-      options_.enable_service_routing());
+      options_.enable_service_routing(),
+      options_.disable_log_stats());
   create_waiting_queue(options);
   create_running_queue(options);
   if (options_.enable_service_routing()) {
@@ -222,7 +225,7 @@ void ContinuousScheduler::get_latency_budget_and_request_order(
     latency_budget = std::max(min_remaining_time, latency_budget_threshold);
   }
 
-  const double lambda = FLAGS_aggressive_coeff;
+  const double lambda = SchedulerConfig::get_instance().aggressive_coeff();
   double load_judge_func = 0.0;
   if (for_prefill) {
     load_judge_func = total_exec_time + constant_overhead;
@@ -238,12 +241,13 @@ void ContinuousScheduler::get_latency_budget_and_request_order(
     auto request = *it;
     auto& sequence = request->sequences()[0];
 
-    if (FLAGS_enable_starve_prevent) {
+    if (SchedulerConfig::get_instance().enable_starve_prevent()) {
       const int32_t starve_unit_time = sequence->is_prefill_stage()
                                            ? -request->ttft_slo_ms()
                                            : -request->tpot_slo_ms();
-      const int32_t starve_time_threshold =
-          static_cast<int32_t>(FLAGS_starve_threshold * starve_unit_time);
+      const int32_t starve_time_threshold = static_cast<int32_t>(
+          SchedulerConfig::get_instance().starve_threshold() *
+          starve_unit_time);
       if (request->get_remaining_time() < starve_time_threshold) {
         request->set_starved(true);
       }
@@ -330,13 +334,14 @@ bool ContinuousScheduler::check_if_enough_to_evict(
     num_request_to_evict++;
     // count the number of blocks belong to the request
     for (const auto& seq : request_to_preempt->sequences()) {
-      // num_blocks_can_evict += seq->kv_state().num_kv_blocks();
-      size_t shared_kv_blocks_num = seq->kv_state().shared_kv_blocks_num();
-      size_t num_kv_blocks = seq->kv_state().num_kv_blocks();
+      // num_blocks_can_evict += seq->kv_state().num_blocks(BlockType::KV);
+      size_t shared_kv_blocks_num =
+          seq->kv_state().shared_blocks_num(BlockType::KV);
+      size_t num_kv_blocks = seq->kv_state().num_blocks(BlockType::KV);
       CHECK_GE(num_kv_blocks, shared_kv_blocks_num);
       for (size_t i = 0; i < shared_kv_blocks_num; i++) {
         // if ==2, prefix cache block will be evicted when allocate
-        const auto& block = seq->kv_state().kv_blocks()[i];
+        const auto& block = seq->kv_state().blocks(BlockType::KV)[i];
         if (block.ref_count() <= 2) {
           num_blocks_can_evict += 1;
         }
@@ -348,6 +353,26 @@ bool ContinuousScheduler::check_if_enough_to_evict(
     }
   }
   return false;
+}
+
+void ContinuousScheduler::cache_in_batch_prefix(
+    const std::vector<Sequence*>& sequences,
+    const std::vector<size_t>& current_step_token_budgets) {
+  if (!enable_prefix_cache_ || !enable_in_batch_prefix_cache_ ||
+      sequences.empty()) {
+    return;
+  }
+  CHECK_EQ(sequences.size(), current_step_token_budgets.size());
+  for (size_t i = 0; i < sequences.size(); ++i) {
+    Sequence* sequence = sequences[i];
+    if (sequence == nullptr || !sequence->is_prefill_stage()) {
+      continue;
+    }
+    const size_t max_handle_num_tokens =
+        sequence->kv_state().kv_cache_tokens_num() +
+        current_step_token_budgets[i];
+    kv_cache_manager_->cache(sequence, max_handle_num_tokens);
+  }
 }
 
 void ContinuousScheduler::clear_mtp_bootstrap(Request* request) {
@@ -546,6 +571,7 @@ void ContinuousScheduler::handle_prefill_requests(
     running_sequences_budgets_.insert(running_sequences_budgets_.end(),
                                       prefill_sequences_budget.begin(),
                                       prefill_sequences_budget.end());
+    cache_in_batch_prefix(prefill_sequences, prefill_sequences_budget);
   }
   // maybe can pre-compute if prompt beyond length
   if (running_sequences_.empty() && !waiting_priority_queue->empty() &&
@@ -1591,6 +1617,12 @@ bool ContinuousScheduler::try_complete_pause() {
 }
 
 // ============== Async RL training support: Pause/Resume ==============
+void ContinuousScheduler::reset_prefix_cache() {
+  if (kv_cache_manager_ != nullptr) {
+    kv_cache_manager_->reset_prefix_cache();
+  }
+}
+
 void ContinuousScheduler::pause(PauseMode mode) {
   const char* mode_str = mode == PauseMode::KEEP    ? "KEEP"
                          : mode == PauseMode::ABORT ? "ABORT"

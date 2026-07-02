@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,13 +24,16 @@ namespace layer {
 
 class ActivationImpl : public torch::nn::Module {
  public:
-  ActivationImpl(const std::string& act_mode, bool is_gated);
+  ActivationImpl(const std::string& act_mode,
+                 bool is_gated,
+                 double swiglu_limit = 0.0);
 
   void forward(torch::Tensor& input, torch::Tensor& output);
 
  private:
   std::string act_mode_;
   bool is_gated_;
+  double swiglu_limit_ = 0.0;
 };
 TORCH_MODULE(Activation);
 

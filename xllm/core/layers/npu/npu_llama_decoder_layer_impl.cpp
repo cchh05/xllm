@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -185,7 +185,7 @@ torch::Tensor NpuLlamaDecoderLayerImpl::forward(torch::Tensor& x,
     // mstxRangeEnd(id);
     st = execute_node(prefill_node_, node_id);
     LOG_IF(FATAL, st != 0) << model_name_
-                           << "excute prefill layer fail, error code: " << st;
+                           << "execute prefill layer fail, error code: " << st;
   } else {
     build_node_variant_pack(decode_node_,
                             x,
@@ -197,7 +197,7 @@ torch::Tensor NpuLlamaDecoderLayerImpl::forward(torch::Tensor& x,
                             false);
     st = execute_node(decode_node_, node_id + 1000);
     LOG_IF(FATAL, st != 0) << model_name_
-                           << "excute decode layer fail, error code: " << st;
+                           << "execute decode layer fail, error code: " << st;
   }
 
   return at_placeholder_;

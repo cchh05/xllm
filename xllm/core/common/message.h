@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -29,14 +30,17 @@ using Embedding = xllm::proto::Embedding;
 
 struct ImageURL {
   std::string url;
+  std::unordered_map<std::string, std::string> headers;
 };
 
 struct VideoURL {
   std::string url;
+  std::unordered_map<std::string, std::string> headers;
 };
 
 struct AudioURL {
   std::string url;
+  std::unordered_map<std::string, std::string> headers;
 };
 
 struct MMContent {

@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ limitations under the License.
 #endif
 // clang-format on
 
+#include <c10/core/Event.h>
 #include <c10/core/Stream.h>
 #include <c10/core/StreamGuard.h>
 
@@ -69,6 +70,7 @@ class Stream {
 
   int synchronize() const;
   c10::StreamGuard set_stream_guard() const;
+  void wait_event(const c10::Event& event);
   PlatformStream* get_stream() { return &stream_; }
   const PlatformStream* get_stream() const { return &stream_; }
   void wait_stream(const Stream& other_stream);

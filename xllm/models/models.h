@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ limitations under the License.
 #include "dit/pipelines/pipeline_flux_control.h"         // IWYU pragma: keep
 #include "dit/pipelines/pipeline_flux_fill.h"            // IWYU pragma: keep
 #include "dit/pipelines/pipeline_qwenimage_edit_plus.h"  // IWYU pragma: keep
+#include "dit/pipelines/pipeline_wan_i2v.h"              // IWYU pragma: keep
 #include "llm/deepseek_v4.h"                             // IWYU pragma: keep
 #include "llm/deepseek_v4_mtp.h"                         // IWYU pragma: keep
 #include "llm/npu/deepseek_mtp.h"                        // IWYU pragma: keep
@@ -72,6 +73,7 @@ limitations under the License.
 #include "llm/glm5_mtp.h"                         // IWYU pragma: keep
 #include "llm/joyai_llm_flash.h"                  // IWYU pragma: keep
 #include "llm/joyai_llm_flash_mtp.h"              // IWYU pragma: keep
+#include "llm/mlu/deepseek_v4.h"                  // IWYU pragma: keep
 #include "llm/mtp_model_base.h"                   // IWYU pragma: keep
 #include "llm/oxygen.h"                           // IWYU pragma: keep
 #include "llm/qwen2.h"                            // IWYU pragma: keep
@@ -92,6 +94,7 @@ limitations under the License.
 #include "dit/pipelines/pipeline_longcat_image.h"       // IWYU pragma: keep
 #include "dit/pipelines/pipeline_longcat_image_edit.h"  // IWYU pragma: keep
 #include "llm/mimo.h"                                   // IWYU pragma: keep
+#include "llm/mimo_mtp.h"                               // IWYU pragma: keep
 #include "llm/qwen2.h"                                  // IWYU pragma: keep
 #include "llm/qwen3.h"                                  // IWYU pragma: keep
 #include "llm/qwen3_moe.h"                              // IWYU pragma: keep
@@ -102,9 +105,17 @@ limitations under the License.
 #elif defined(USE_MUSA)
 #include "llm/musa/qwen3.h"  // IWYU pragma: keep
 #elif defined(USE_DCU)
+#include "dit/pipelines/pipeline_flux.h"
+#include "llm/deepseek_v2.h"  // IWYU pragma: keep
+#include "llm/mimo.h"         // IWYU pragma: keep
+#include "llm/mimo_mtp.h"     // IWYU pragma: keep
 #include "llm/qwen2.h"
 #include "llm/qwen3.h"
 #include "llm/qwen3_moe.h"
+#include "vlm/qwen2_5_vl.h"
+#include "vlm/qwen2_vl.h"
+#include "vlm/qwen3_vl.h"
+#include "vlm/qwen3_vl_moe.h"
 #else
 #error "Unsupported device type, only support NPU, CUDA, MLU, ILU and MUSA now."
 #endif

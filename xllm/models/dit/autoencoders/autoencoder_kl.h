@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -42,6 +42,19 @@ limitations under the License.
 // https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/autoencoders/autoencoder_kl.py
 
 namespace xllm {
+
+using dit::DiagonalGaussianDistribution;
+
+struct AutoencoderKLOutput {
+  DiagonalGaussianDistribution latent_dist;
+  AutoencoderKLOutput(DiagonalGaussianDistribution dist)
+      : latent_dist(std::move(dist)) {}
+};
+
+struct DecoderOutput {
+  torch::Tensor sample;
+  DecoderOutput(torch::Tensor sample) : sample(std::move(sample)) {}
+};
 
 class AttentionImpl : public torch::nn::Module {
  public:
@@ -706,8 +719,6 @@ class UpDecoderBlock2DImpl : public torch::nn::Module {
   bool add_upsample_ = false;
 };
 TORCH_MODULE(UpDecoderBlock2D);
-
-using dit::DiagonalGaussianDistribution;
 
 // VAE standard encoder implementation
 // This class is used to encode images into latent representations.

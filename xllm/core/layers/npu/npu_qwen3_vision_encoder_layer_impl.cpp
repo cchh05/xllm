@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -138,7 +138,7 @@ torch::Tensor NpuQwen3VisionEncoderLayerImpl::forward(
   // mstxRangeEnd(id);
   st = execute_node(encode_node_, node_id);
   LOG_IF(FATAL, st != 0) << model_name_
-                         << "excute encode layer fail, error code: " << st;
+                         << "execute encode layer fail, error code: " << st;
   return x;
 }
 

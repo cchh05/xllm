@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -169,6 +169,7 @@ Options create_options(const std::string& instance_name, bool is_local) {
       .tp_size(static_cast<int32_t>(parallel_config.tp_size()))
       .sp_size(static_cast<int32_t>(parallel_config.sp_size()))
       .cfg_size(static_cast<int32_t>(parallel_config.cfg_size()))
+      .vae_size(static_cast<int32_t>(parallel_config.vae_size()))
       .instance_name(instance_name)
       .enable_disagg_pd(disagg_pd_config.enable_disagg_pd())
       .enable_pd_ooc(disagg_pd_config.enable_pd_ooc())
@@ -183,10 +184,6 @@ Options create_options(const std::string& instance_name, bool is_local) {
       .priority_strategy(scheduler_config.priority_strategy())
       .enable_online_preempt_offline(
           scheduler_config.enable_online_preempt_offline())
-      .enable_cache_upload((distributed_config.enable_service_routing() ||
-                            disagg_pd_config.enable_disagg_pd()) &&
-                           kv_cache_config.enable_prefix_cache() &&
-                           kv_cache_store_config.enable_cache_upload())
       .host_blocks_factor(kv_cache_store_config.host_blocks_factor())
       .enable_kvcache_store(kv_cache_store_config.enable_kvcache_store() &&
                             kv_cache_config.enable_prefix_cache() &&
@@ -285,6 +282,21 @@ void validate_config(const std::string& model_type) {
       LOG(FATAL) << "MLU disaggregated PD only supports backend=llm.";
     }
     disagg_pd_config.normalize_mlu(kv_cache_config, scheduler_config);
+  }
+#endif
+
+#if defined(USE_DCU)
+  if (disagg_pd_config.enable_disagg_pd()) {
+    if (scheduler_config.enable_schedule_overlap()) {
+      LOG(WARNING) << "enable_schedule_overlap is not supported for "
+                      "disaggregated PD on DCU backend. "
+                   << "Disabling enable_schedule_overlap.";
+      scheduler_config.enable_schedule_overlap(false);
+    }
+    if (model_config.backend() != "llm") {
+      LOG(FATAL) << "DCU disaggregated PD only supports backend=llm.";
+    }
+    disagg_pd_config.normalize_dcu(scheduler_config);
   }
 #endif
 
@@ -445,7 +457,7 @@ int run() {
   if (options.node_rank() != 0) {
     if (model_config.backend() == "dit") {
       master = std::make_unique<DiTAssistantMaster>(options);
-    } else if (FLAGS_backend == "vlm") {
+    } else if (model_config.backend() == "vlm") {
       master = std::make_unique<VLMAssistantMaster>(options);
     } else {
       master = std::make_unique<LLMAssistantMaster>(options);

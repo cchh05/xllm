@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,6 +17,9 @@ limitations under the License.
 
 #include <framework/graphs/MLUGraph.h>
 #include <torch/torch.h>
+
+#include <cstddef>
+#include <optional>
 
 #include "executor_impl.h"
 #include "executor_impl_factory.h"
@@ -46,6 +49,8 @@ class GraphPersistentParam {
                            const ModelInputParams& params,
                            uint32_t padding_needed);
 
+  std::size_t get_persistent_tensor_bytes() const;
+
   // input tensors
   torch::Tensor tokens_;
   torch::Tensor positions_;
@@ -63,12 +68,25 @@ class GraphPersistentParam {
   torch::Tensor new_cache_slots_;
   torch::Tensor block_table_;
   uint32_t num_decoding_tokens_;
+  torch::Tensor linear_state_indices_;
 
   // for vl
   torch::Tensor input_embeds_;
 
   // for mtp model
   torch::Tensor embedding_;
+
+  // linear state indices for GDN models
+  torch::Tensor linear_state_indices(uint32_t actual_batch_size = 0) const {
+    if (linear_state_indices_.numel() == 0) {
+      return linear_state_indices_;
+    }
+    if (actual_batch_size > 0) {
+      return linear_state_indices_.slice(
+          /*dim=*/0, /*start=*/0, /*end=*/actual_batch_size);
+    }
+    return linear_state_indices_;
+  }
 };
 
 // graph executor using libtorch MLUGraph for memory management
@@ -77,18 +95,32 @@ class MluGraph {
  public:
   MluGraph(GraphPersistentParam* persistent_param, uint32_t padding_num_tokens);
 
-  // Capture computation graph for given bucket num_tokens
+  // Capture computation graph for given bucket num_tokens.
+  // All buckets must capture on the same MLU stream so the caching allocator
+  // can reuse scratch freed by earlier captures within the shared mempool;
+  // capturing on different streams defeats its per-stream block reuse.
   void capture(CausalLM* model,
                std::vector<KVCache>& kv_cache,
-               torch_mlu::MempoolId_t& pool,
+               const torch_mlu::MempoolId_t& pool,
+               const torch_mlu::MLUStream& capture_stream,
                const runtime::Options& options);
 
   // Replay captured graph with new input data
   ModelOutput replay();
-  void update_input_buffer(const torch::Tensor& tokens,
+  void update_input_buffer(CausalLM* model,
+                           const torch::Tensor& tokens,
                            const torch::Tensor& positions,
                            const ModelInputParams& params,
                            bool is_init = false);
+
+  // Accessor for graph metadata state (used by executor to prepare
+  // metadata before replay).
+  ModelGraphMetadataState* model_graph_metadata_state() {
+    return model_graph_metadata_state_.get();
+  }
+
+  void prepare_model_graph_metadata(CausalLM* model,
+                                    const ModelInputParams& params);
 
  private:
   // MLUGraph with mempool for managing temporary tensors during forward pass
@@ -98,6 +130,10 @@ class MluGraph {
   // instances)
   GraphPersistentParam* persistent_param_;  // not owned
   uint32_t padding_num_tokens_;
+
+  // Per-graph metadata state for models that require graph-forward
+  // metadata preparation (e.g., DeepSeek V4 DSA metadata).
+  std::unique_ptr<ModelGraphMetadataState> model_graph_metadata_state_;
 };
 
 // Executor implementation using MLU graph optimization
@@ -125,12 +161,19 @@ class MluGraphExecutorImpl : public ExecutorImpl {
                         std::vector<KVCache>& kv_caches,
                         const ModelInputParams& params);
   void init_param_once();
+  void log_memory_after_capture();
 
   CausalLM* model_;  // not owned
   ModelArgs args_;
   torch::Device device_;
   runtime::Options options_;
-  torch_mlu::MempoolId_t pool_;
+  torch_mlu::MempoolId_t graph_pool_;
+  // Fixed capture stream shared by every bucket capture. Lazily initialized on
+  // the first capture so the allocator can reuse pool scratch across buckets.
+  std::optional<torch_mlu::MLUStream> graph_capture_stream_;
+  int64_t max_tokens_for_graph_mode_ = 0;
+  std::size_t last_pool_reserved_bytes_ = 0;
+  std::size_t peak_pool_reserved_bytes_ = 0;
 
   std::unordered_map<uint32_t, std::unique_ptr<MluGraph>> graphs_;
   std::unique_ptr<GraphPersistentParam> persistent_param_;

@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ limitations under the License.
 #include "framework/kv_cache_transfer/llm_data_dist_transfer.h"
 #endif
 
-#if defined(USE_NPU) || defined(USE_MLU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
 #include "framework/kv_cache_transfer/mooncake_kv_cache_transfer.h"
 #endif
 
@@ -169,7 +169,7 @@ std::vector<std::string> KVCacheTransfer::rotate_dst_rank(
   return rotated_keys;
 }
 
-#if defined(USE_NPU) || defined(USE_MLU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
 folly::SemiFuture<bool> KVCacheTransfer::push_kv_blocks_async(
     const std::vector<TransferKVInfo>& transfer_kv_infos,
     const ParallelArgs& parallel_args,
@@ -390,7 +390,7 @@ std::shared_ptr<KVCacheTransfer> KVCacheTransferFactory::create(
 
   int32_t device_id = device.index();
 
-#if defined(USE_NPU) || defined(USE_MLU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
   LOG(INFO) << "Create KVCacheTransfer for " << transfer_type << "flag"
             << ::xllm::DisaggPDConfig::get_instance().kv_cache_transfer_type();
   if (transfer_type == "LlmDataDist") {
@@ -406,7 +406,7 @@ std::shared_ptr<KVCacheTransfer> KVCacheTransferFactory::create(
         << "Allocate KV cache failed.";
     transfer->register_kv_cache(kv_caches, kv_cache_shape, dtype);
 #else
-    LOG(FATAL) << "LlmDataDist is not supported on MLU backend.";
+    LOG(FATAL) << "LlmDataDist is not supported on this backend.";
 #endif
   } else if (transfer_type == "Mooncake") {
     std::shared_ptr<MooncakeKVCacheTransferBase> mooncake_transfer;

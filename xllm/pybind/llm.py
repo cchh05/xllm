@@ -1,10 +1,26 @@
+# Copyright 2025-2026 The xLLM Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://github.com/jd-opensource/xllm/blob/main/LICENSE
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 import os
 import signal
 import sys
+import threading
 import time
 import uuid
 from . import utils
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 from xllm_export import (LLMMaster, VLMMaster, Options, RequestOutput,
                          RequestParams)
@@ -17,6 +33,23 @@ from .params import (
     to_request_params,
     to_request_params_list,
 )
+
+
+def _get_tqdm(
+    use_tqdm: Union[bool, Callable[..., Any]],
+) -> Optional[Callable[..., Any]]:
+    if not use_tqdm:
+        return None
+    if callable(use_tqdm):
+        return use_tqdm
+    try:
+        from tqdm import tqdm
+    except ImportError as exc:
+        raise ImportError(
+            "tqdm is required when use_tqdm=True. "
+            "Set use_tqdm=False to disable the progress bar."
+        ) from exc
+    return tqdm
 
 
 class BeamSearchOutput:
@@ -103,6 +136,8 @@ class LLM:
         output_shm_size: int = 128,
         kv_cache_dtype: str = 'auto',
         use_cpp_chat_template: bool = True,
+        disable_log_stats: bool = True,
+        enable_sleep_mode: bool = False,
         **kwargs: Any,
     ) -> None:
         signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
@@ -123,8 +158,6 @@ class LLM:
         model_type, backend = utils._infer_model_type_and_backend(model)
         if backend == "dit":
             raise ValueError("LLM does not support DiT backend models")
-        if backend == "vlm" and task != "generate":
-            raise ValueError("VLM backend only supports generate task in LLM")
         if model_type is None:
             raise ValueError("model_type is required for offline inference")
         utils._configure_cpp_chat_template(use_cpp_chat_template, model_type)
@@ -180,6 +213,8 @@ class LLM:
         options.input_shm_size = input_shm_size
         options.output_shm_size = output_shm_size
         options.kv_cache_dtype = kv_cache_dtype
+        options.disable_log_stats = disable_log_stats
+        options.enable_sleep_mode = enable_sleep_mode
         self._backend = backend
         if backend == "vlm":
             self.master = VLMMaster(options)
@@ -194,6 +229,40 @@ class LLM:
         except Exception as e:
             pass
 
+    def sleep(self) -> None:
+        """Deep sleep: release device HBM (model weights + KV cache) for RL
+        training, returning the physical memory to the driver.
+
+        Contents are discarded; after ``wake_up`` weights are re-loaded and
+        KV cache is re-prefilled. Requires the engine to be created with
+        ``enable_sleep_mode=True``.
+        """
+        self.master.sleep()
+
+    def wake_up(self, tags: Optional[List[str]] = None) -> None:
+        """Re-acquire device HBM previously released by ``sleep``.
+
+        ``tags`` is reserved for future fine-grained wake-up
+        (e.g. ["weights"] / ["kv_cache"]); the current version performs a
+        full wake-up regardless of ``tags``.
+        """
+        self.master.wake_up()
+
+    def is_sleeping(self) -> bool:
+        return self.master.is_sleeping()
+
+    def update_weights(self, checkpoint_path: str = "") -> None:
+        """Reload model weights in place from disk (vllm-ascend ``reload_weights``).
+
+        Typical level-2 RL flow:
+            llm.sleep()
+            llm.wake_up()                 # re-map empty weight + KV memory
+            llm.update_weights("/path/to/new_ckpt")  # reload weights in place
+        An empty ``checkpoint_path`` reuses the original model path.
+        Requires ``enable_sleep_mode=True``.
+        """
+        self.master.update_weights(checkpoint_path)
+
     def generate(
         self,
         prompts: Union[
@@ -207,6 +276,7 @@ class LLM:
             List[SamplingParams],
         ]] = None,
         wait_for_schedule: bool = True,
+        use_tqdm: Union[bool, Callable[..., Any]] = True,
         **kwargs: Any,
     ) -> List[RequestOutput]:
         request_params = kwargs.pop("request_params", None)
@@ -238,47 +308,60 @@ class LLM:
             )
 
         outputs = [None] * len(prompts)
+        progress_bar = None
+        progress_bar_lock = threading.Lock()
+        tqdm_cls = _get_tqdm(use_tqdm)
+        if tqdm_cls is not None:
+            progress_bar = tqdm_cls(total=len(prompts), desc="Processed prompts")
+
         def callback(index: int, output: RequestOutput) -> bool:
             outputs[index] = output
+            if progress_bar is not None:
+                with progress_bar_lock:
+                    progress_bar.update(1)
             return True
 
-        # schedule all requests
-        if self._backend == "vlm":
-            if mm_datas is not None:
-                self.master.handle_batch_request(
-                    prompts, mm_datas, request_params_list, callback
-                )
+        try:
+            # schedule all requests
+            if self._backend == "vlm":
+                if mm_datas is not None:
+                    self.master.handle_batch_request(
+                        prompts, mm_datas, request_params_list, callback
+                    )
+                else:
+                    if image_urls is None:
+                        image_urls = [[] for _ in prompts]
+                    self.master.handle_batch_request_with_image_urls(
+                        prompts, image_urls, request_params_list, callback
+                    )
             else:
-                if image_urls is None:
-                    image_urls = [[] for _ in prompts]
-                self.master.handle_batch_request_with_image_urls(
-                    prompts, image_urls, request_params_list, callback
+                has_images = image_urls is not None and any(image_urls)
+                if mm_datas is not None or has_images:
+                    raise ValueError("multi_modal_data is only supported for VLM models")
+                self.master.handle_batch_request(
+                    prompts, request_params_list, callback
                 )
-        else:
-            has_images = image_urls is not None and any(image_urls)
-            if mm_datas is not None or has_images:
-                raise ValueError("multi_modal_data is only supported for VLM models")
-            self.master.handle_batch_request(
-                prompts, request_params_list, callback
-            )
 
-        # TODO: add wait later
-        if wait_for_schedule:
-            pass
+            # TODO: add wait later
+            if wait_for_schedule:
+                pass
 
-        # generate
-        self.master.generate()
+            # generate
+            self.master.generate()
 
-        count = len(prompts)
-        idx = 0
-        while idx < count:
-            # wait async output
-            if outputs[idx] is None:
-                continue
-            if outputs[idx].status is not None and not outputs[idx].status.ok:
-                raise ValidationError(outputs[idx].status.code, outputs[idx].status.message)
-            outputs[idx].prompt = prompts[idx]
-            idx += 1
+            count = len(prompts)
+            idx = 0
+            while idx < count:
+                # wait async output
+                if outputs[idx] is None:
+                    continue
+                if outputs[idx].status is not None and not outputs[idx].status.ok:
+                    raise ValidationError(outputs[idx].status.code, outputs[idx].status.message)
+                outputs[idx].prompt = prompts[idx]
+                idx += 1
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
 
         return outputs
 
@@ -287,6 +370,7 @@ class LLM:
         prompts: Union[str, Dict[str, str], List[Union[str, Dict[str, str]]]],
         params: Optional[Union[RequestParams, BeamSearchParams]] = None,
         wait_for_schedule: bool = True,
+        use_tqdm: Union[bool, Callable[..., Any]] = True,
     ) -> List[BeamSearchOutput]:
         if isinstance(prompts, (str, dict)):
             prompts = [prompts]
@@ -324,7 +408,8 @@ class LLM:
 
         outputs = self.generate(parsed_prompts,
                                 request_params=params,
-                                wait_for_schedule=wait_for_schedule)
+                                wait_for_schedule=wait_for_schedule,
+                                use_tqdm=use_tqdm)
         return [BeamSearchOutput(output) for output in outputs]
 
     def embed(
@@ -336,6 +421,7 @@ class LLM:
             List[Union[RequestParams, PoolingParams]],
         ]] = None,
         wait_for_schedule: bool = True,
+        use_tqdm: Union[bool, Callable[..., Any]] = True,
     ) -> List[EmbeddingOutput]:
         request_params_list = to_request_params_list(
             pooling_params, default_cls=PoolingParams)
@@ -350,7 +436,8 @@ class LLM:
 
         outputs = self.generate(prompts,
                                 request_params=use_params,
-                                wait_for_schedule=wait_for_schedule)
+                                wait_for_schedule=wait_for_schedule,
+                                use_tqdm=use_tqdm)
         return [EmbeddingOutput(output) for output in outputs]
 
     @staticmethod

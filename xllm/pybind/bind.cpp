@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -97,11 +97,13 @@ PYBIND11_MODULE(xllm_export, m) {
                      &Options::max_tokens_for_graph_mode_)
       .def_readwrite("enable_offline_inference",
                      &Options::enable_offline_inference_)
+      .def_readwrite("disable_log_stats", &Options::disable_log_stats_)
       .def_readwrite("spawn_worker_path", &Options::spawn_worker_path_)
       .def_readwrite("enable_shm", &Options::enable_shm_)
       .def_readwrite("input_shm_size", &Options::input_shm_size_)
       .def_readwrite("output_shm_size", &Options::output_shm_size_)
       .def_readwrite("is_local", &Options::is_local_)
+      .def_readwrite("enable_sleep_mode", &Options::enable_sleep_mode_)
       .def_readwrite("kv_cache_dtype", &Options::kv_cache_dtype_);
 
   // 2. export LLMMaster
@@ -160,6 +162,35 @@ PYBIND11_MODULE(xllm_export, m) {
       .def("get_rate_limiter",
            &LLMMaster::get_rate_limiter,
            py::call_guard<py::gil_scoped_release>())
+      // RL offline deep sleep/wakeup (SleepableAllocator path). Distinct from
+      // the xtensor-based online sleep/wakeup exposed via the brpc API service.
+      .def(
+          "sleep",
+          [](LLMMaster& self) {
+            self.set_master_status(MasterStatus::DEEP_SLEEP);
+            return self.sleep();
+          },
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "wake_up",
+          [](LLMMaster& self) {
+            bool ok = self.wakeup();
+            if (ok) {
+              self.set_master_status(MasterStatus::WAKEUP);
+            }
+            return ok;
+          },
+          py::call_guard<py::gil_scoped_release>())
+      .def("is_sleeping",
+           &LLMMaster::is_sleeping,
+           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "update_weights",
+          [](LLMMaster& self, const std::string& weights_path) {
+            return self.update_weights(weights_path);
+          },
+          py::arg("weights_path") = "",
+          py::call_guard<py::gil_scoped_release>())
       .def("__repr__", [](const LLMMaster& self) {
         return "LLMMaster({})"_s.format(self.options());
       });

@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +34,6 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
-#include "core/common/global_flags.h"
 #include "core/common/version_singleton.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/rec_config.h"
@@ -46,6 +45,7 @@ limitations under the License.
 #include "core/framework/tokenizer/tiktoken_tokenizer.h"
 #include "core/framework/tokenizer/tokenizer_factory.h"
 #include "core/platform/device.h"
+#include "core/platform/platform.h"
 #include "core/util/blocking_counter.h"
 #include "core/util/json_reader.h"
 #include "core/util/model_config_utils.h"
@@ -133,7 +133,7 @@ bool try_load_compressed_tensors_quant_cfg(const JsonReader& reader,
     if (!is_compressed_tensors_fp8_scheme(*weights_it) ||
         !is_compressed_tensors_fp8_scheme(*input_activations_it)) {
       // Check for INT8 W8A8 (compressed-tensors int quantized)
-      if (Device::type_str() == "dcu" &&
+      if (Platform::is_dcu() &&
           is_compressed_tensors_int8_scheme(*weights_it,
                                             /*expected_dynamic=*/false) &&
           is_compressed_tensors_int8_scheme(*input_activations_it,
@@ -392,7 +392,7 @@ bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args) {
   // Only CUDA and DCU currently adapts this compressed-tensors JSON layout.
   // For other backends, skip this special parsing path and continue with the
   // generic quantization config parsing path.
-  if ((Device::type_str() == "cuda" || Device::type_str() == "dcu") &&
+  if ((Platform::is_cuda() || Platform::is_dcu()) &&
       try_load_compressed_tensors_quant_cfg(reader, quant_args)) {
     return true;
   }
@@ -779,8 +779,10 @@ bool HFModelLoader::load_model_args(const std::string& model_weights_path) {
     return false;
   }
 
-  const std::string model_type = util::get_model_type(
-      reader, std::filesystem::path(model_weights_path), FLAGS_backend);
+  const std::string model_type =
+      util::get_model_type(reader,
+                           std::filesystem::path(model_weights_path),
+                           ModelConfig::get_instance().backend());
 
   std::string resolved_model_type;
   std::string error_message;
@@ -799,8 +801,9 @@ bool HFModelLoader::load_model_args(const std::string& model_weights_path) {
   }
   const JsonReader config_reader = normalize_config_torch_dtype(reader);
   model_args_loader(config_reader, &args_);
-  args_.enable_mla(util::should_enable_mla(
-      std::filesystem::path(model_weights_path), FLAGS_backend));
+  args_.enable_mla(
+      util::should_enable_mla(std::filesystem::path(model_weights_path),
+                              ModelConfig::get_instance().backend()));
 
   return true;
 }

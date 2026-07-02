@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ limitations under the License.
 
 #include "kernels/ops_api.h"
 #include "platform/device.h"
+#include "platform/platform.h"
 
 namespace xllm {
 namespace layer {
@@ -32,11 +33,13 @@ DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
                            const QuantArgs& quant_args,
                            ProcessGroup* process_group,
                            const torch::TensorOptions& options,
-                           const std::string& module_prefix)
+                           const std::string& module_prefix,
+                           double swiglu_limit)
     : is_gated_(is_gated),
       intermediate_size_(intermediate_size),
       process_group_(process_group),
-      hidden_act_(hidden_act) {
+      hidden_act_(hidden_act),
+      swiglu_limit_(swiglu_limit) {
   // Check if using w8a8 smoothquant quantization
   is_smoothquant_ = quant_args.quant_method() == kQuantMethodSmoothquant;
 
@@ -71,7 +74,8 @@ DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
                                            options,
                                            gate_up_proj_extra_args));
 
-  act_ = register_module("act", Activation(hidden_act_, is_gated_));
+  act_ =
+      register_module("act", Activation(hidden_act_, is_gated_, swiglu_limit_));
 
   // 2. down
   const auto down_proj_quant_args =
@@ -99,7 +103,7 @@ torch::Tensor DenseMLPImpl::forward(const torch::Tensor& hidden_states) {
     return down_proj_->forward(gate_up);
   } else {
     torch::Tensor output;
-    if (Device::type_str() != "npu") {
+    if (!Platform::is_npu()) {
       int64_t batch_size = gate_up.sizes()[0];
       output = torch::empty(
           {batch_size, intermediate_size_ / process_group_->world_size()},

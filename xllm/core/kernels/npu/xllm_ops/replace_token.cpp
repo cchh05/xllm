@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -42,7 +42,9 @@ namespace xllm::kernel::npu {
 //   src: sampled tokens from the previous step.
 // Outputs:
 //   dst: current-step input token tensor, updated in place after replacement.
-void replace_token(torch::Tensor& dst, torch::Tensor& src) {
+void replace_token(torch::Tensor& dst,
+                   torch::Tensor& src,
+                   bool synchronize_stream) {
   check_tensor(dst, "dst", "replace_token");
   check_tensor(src, "src", "replace_token");
   aclTensor* dst_ids = nullptr;
@@ -60,6 +62,10 @@ void replace_token(torch::Tensor& dst, torch::Tensor& src) {
   CHECK_ACL_SUCCESS(
       aclnnReplaceToken(workspace_addr, workspace_size, executor, stream),
       "replace_token: failed to replace token");
+  if (synchronize_stream) {
+    CHECK_ACL_SUCCESS(aclrtSynchronizeStream(stream),
+                      "replace_token: failed to synchronize stream");
+  }
   aclDestroyTensor(dst_ids);
   aclDestroyTensor(src_ids);
 }

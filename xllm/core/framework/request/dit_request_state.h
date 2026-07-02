@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -142,16 +142,12 @@ struct DiTInputParams {
 
   torch::Tensor control_image;
 
-  torch::Tensor condition_image;
-
   torch::Tensor mask_image;
 
   torch::Tensor masked_image_latent;
 
   // Video-specific input fields
   torch::Tensor last_image;
-
-  torch::Tensor image_embeds;
 
   // Prompt audio for voice cloning (LongCat-AudioDiT).
   // Float32 PCM, shape (1, num_samples), mono 24 kHz.

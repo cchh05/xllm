@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,7 @@ limitations under the License.
 
 #include "core/common/types.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "core/framework/prefix_cache/block_hasher.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/tokenizer/tokenizer.h"
 #include "core/util/slice.h"
@@ -199,22 +200,28 @@ class Sequence final {
   void clear_mtp_bootstrap_embedding() {
     mtp_bootstrap_embedding_ = torch::Tensor();
   }
-  bool has_single_block_id() const { return single_block_.is_valid(); }
+  // Single per-sequence resource block id (linear-state / embedding), or -1.
   int32_t get_single_block_id() const {
-    return has_single_block_id() ? single_block_.id() : -1;
+    return kv_state_.get_single_block_id();
   }
-  void set_single_block(Block&& single_block) {
-    single_block_ = std::move(single_block);
-  }
-  Block reset_single_block() { return std::move(single_block_); }
   const std::string& request_id() const { return request_id_; }
   // get input embedding
   torch::Tensor get_input_embedding() const { return input_embedding_; }
 
-  void add_kv_blocks(const std::vector<Block>& blocks);
-  void add_host_kv_blocks(const std::vector<Block>& blocks);
-  void add_shared_kv_blocks(std::vector<Block>&& blocks);
-  void add_shared_host_kv_blocks(std::vector<Block>&& blocks);
+  void add_blocks(BlockType type, const std::vector<Block>& blocks);
+  void add_host_blocks(BlockType type, const std::vector<Block>& blocks);
+  void add_shared_blocks(BlockType type, std::vector<Block>&& blocks);
+  void add_shared_host_blocks(BlockType type, std::vector<Block>&& blocks);
+
+  // Precomputed chained block hashes used by the prefix cache. Covers all full
+  // blocks of the current tokens; reused by match()/insert() so the hash is
+  // computed once per sequence instead of recomputed on every call.
+  Slice<XXH3Key> block_hashes() const { return block_hashes_; }
+
+  // Extend `block_hashes_` to cover any newly completed full blocks. Cheap
+  // (no-op) when no new full block is available, so it is safe to call before
+  // every match()/cache().
+  void update_block_hashes(uint32_t block_size, BlockHasherType hasher_type);
 
   // whether the prefill stage has been cached.
   bool if_cache_block_for_prefill() {
@@ -417,6 +424,10 @@ class Sequence final {
  private:
   void record_first_token(const Token& token);
 
+  // Drop cached block hashes that may be stale after the token at
+  // `token_index` was rewritten (beam search / speculative / disagg PD).
+  void invalidate_block_hashes_from(size_t token_index);
+
   SequenceOutputType output_type();
   void generate_embeddings_output(SequenceOutput& output);
   void generate_mm_embeddings_output(SequenceOutput& output);
@@ -494,6 +505,13 @@ class Sequence final {
   // the length of the prompt tokens
   size_t num_prompt_tokens_ = 0;
 
+  // Precomputed chained block hashes covering all full blocks of `tokens_`.
+  // Extended incrementally; consumed by the prefix cache.
+  std::vector<XXH3Key> block_hashes_;
+
+  // Block size used to compute `block_hashes_` (0 until first computed).
+  uint32_t hash_block_size_ = 0;
+
   std::optional<OneRecState> onerec_state_;
 
   // NOTE: MUST FIXME Later
@@ -503,10 +521,6 @@ class Sequence final {
   // but the generated tokens are retained for the next execution.
   // In the next execution, we should treat these generated tokens as prompts.
   size_t volatile_num_prompt_tokens_ = 0;
-
-  // Scheduler-side logical single-block handle. Transport expands this into
-  // embedding_ids / linear_state_ids as needed by worker-side physical caches.
-  Block single_block_;
 
   // is the sequence finished
   mutable bool finished_ = false;

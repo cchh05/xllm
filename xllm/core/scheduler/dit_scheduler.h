@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -37,7 +37,8 @@ namespace xllm {
 
 class DiTAsyncResponseProcessor final {
  public:
-  DiTAsyncResponseProcessor() = default;
+  explicit DiTAsyncResponseProcessor(bool disable_log_stats = false)
+      : disable_log_stats_(disable_log_stats) {}
   ~DiTAsyncResponseProcessor() = default;
 
   void process_completed_request(std::shared_ptr<DiTRequest> request);
@@ -52,6 +53,8 @@ class DiTAsyncResponseProcessor final {
       /*num_threads=*/1,
       /*cpu_binding=*/false,
       /*pool_name=*/"DiTAsyncResponseProcessor.response"};
+
+  bool disable_log_stats_ = false;
 };
 
 class DiTScheduler : public SchedulerBase {
@@ -59,6 +62,7 @@ class DiTScheduler : public SchedulerBase {
   struct Options {
     // the request per batch
     PROPERTY(int32_t, max_request_per_batch) = 4;
+    PROPERTY(bool, disable_log_stats) = false;
   };
 
   virtual ~DiTScheduler() = default;

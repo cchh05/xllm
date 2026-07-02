@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@ limitations under the License.
 
 #include "layers/npu/npu_column_parallel_linear_impl.h"
 
-#include "common/global_flags.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/parallel_config.h"
 namespace xllm {
@@ -43,7 +42,8 @@ void NpuColumnParallelLinearImpl::param_from_args(
       const int32_t tp_group_id =
           use_local_tp ? (parallel_args.rank() / dp_local_tp_size_) : 0;
       param.tensorParallelInfo.commDomain = std::to_string(tp_group_id);
-      param.tensorParallelInfo.backend = FLAGS_communication_backend;
+      param.tensorParallelInfo.backend =
+          ParallelConfig::get_instance().communication_backend();
     } else {
       param.parallelType = atb_speed::common::COLUMN_PARALLEL;
       atb_speed::common::ParallelInfo parallelInfo =

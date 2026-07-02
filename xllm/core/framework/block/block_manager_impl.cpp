@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -53,7 +53,6 @@ BlockManagerImpl::BlockManagerImpl(const Options& options)
   if (options_.enable_prefix_cache()) {
     PrefixCache::Options prefix_cache_options;
     prefix_cache_options.block_size(options.block_size())
-        .enable_cache_upload(options.enable_cache_upload())
         .hasher_type(options.hasher_type());
     prefix_cache_ = create_prefix_cache(prefix_cache_options);
     CHECK(prefix_cache_) << "Failed to create prefix cache!";
@@ -159,13 +158,14 @@ bool BlockManagerImpl::has_enough_blocks(uint32_t num_blocks) {
 std::vector<Block> BlockManagerImpl::allocate_shared(
     const Slice<int32_t>& token_ids,
     const Slice<Block>& existed_shared_blocks,
-    const MMData& mm_data) {
+    const MMData& mm_data,
+    const Slice<XXH3Key>& block_hashes) {
   // only allocate shared blocks for prefill sequences
   if (options_.enable_prefix_cache()) {
     AUTO_COUNTER(prefix_cache_latency_seconds_match);
 
-    std::vector<Block> shared_blocks =
-        prefix_cache_->match(token_ids, existed_shared_blocks, mm_data);
+    std::vector<Block> shared_blocks = prefix_cache_->match(
+        token_ids, existed_shared_blocks, mm_data, block_hashes);
 
     const size_t prefix_length =
         shared_blocks.empty() ? 0
@@ -186,12 +186,13 @@ std::vector<Block> BlockManagerImpl::allocate_shared(
 void BlockManagerImpl::cache(const Slice<int32_t>& token_ids,
                              std::vector<Block>& blocks,
                              size_t existed_shared_blocks_num,
-                             const MMData& mm_data) {
+                             const MMData& mm_data,
+                             const Slice<XXH3Key>& block_hashes) {
   if (options_.enable_prefix_cache()) {
     AUTO_COUNTER(prefix_cache_latency_seconds_insert);
     // Add the kv cache to the prefix cache
     prefix_cache_->insert(
-        token_ids, blocks, existed_shared_blocks_num, mm_data);
+        token_ids, blocks, existed_shared_blocks_num, mm_data, block_hashes);
   }
 }
 
@@ -200,15 +201,6 @@ void BlockManagerImpl::cache(const std::vector<Block>& blocks) {
     AUTO_COUNTER(prefix_cache_latency_seconds_insert);
     // Add the kv cache to the prefix cache
     prefix_cache_->insert(blocks);
-  }
-}
-
-void BlockManagerImpl::get_merged_kvcache_event(KvCacheEvent* event) const {
-  auto events = prefix_cache_->get_upload_kvcache_events();
-  if (events != nullptr) {
-    event->removed_cache.merge(events->removed_cache);
-    event->stored_cache.merge(events->stored_cache);
-    events->clear();
   }
 }
 
@@ -233,6 +225,33 @@ void BlockManagerImpl::free(int32_t block_id) {
     CHECK(prev_count < free_blocks_.size());
     free_blocks_[prev_count] = block_id;
   }
+}
+
+// Flat incremental growth (the default sequence-level policy). Reads how many
+// blocks the sequence already holds for this manager's block_type(), allocates
+// the delta to cover num_tokens, and returns it (does not insert into the
+// sequence -- the CompositeBlockManager commits the returned blocks). Returns
+// std::nullopt on post-eviction shortage. SlidingWindow / Single override.
+std::optional<std::vector<Block>> BlockManagerImpl::allocate_for_sequence(
+    Sequence* seq,
+    size_t num_tokens) {
+  if (seq == nullptr) {
+    return std::nullopt;
+  }
+  if (block_size_ == 0) {
+    return std::vector<Block>{};
+  }
+  const size_t held = seq->kv_state().num_blocks(block_type());
+  const size_t num_blocks_needed = (num_tokens + block_size_ - 1) / block_size_;
+  if (num_blocks_needed <= held) {
+    return std::vector<Block>{};
+  }
+  const size_t num_additional = num_blocks_needed - held;
+  std::vector<Block> blocks = allocate(num_additional);
+  if (blocks.size() != num_additional) {
+    return std::nullopt;
+  }
+  return blocks;
 }
 
 }  // namespace xllm

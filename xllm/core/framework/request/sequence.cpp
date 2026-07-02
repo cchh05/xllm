@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -291,6 +291,8 @@ Sequence::Sequence(const Sequence& other)
       num_tokens_(other.num_tokens_),
       token_to_count_map_(other.token_to_count_map_),
       num_prompt_tokens_(other.num_prompt_tokens_),
+      block_hashes_(other.block_hashes_),
+      hash_block_size_(other.hash_block_size_),
       onerec_state_(other.onerec_state_),
       volatile_num_prompt_tokens_(other.volatile_num_prompt_tokens_),
       request_id_(other.request_id_),
@@ -305,6 +307,13 @@ Sequence::Sequence(const Sequence& other)
       updated_since_last_beam_search_(other.updated_since_last_beam_search_),
       termination_flag_(std::make_shared<std::atomic<int32_t>>(INT32_MAX)) {
   logprob_state_ = std::make_unique<LogprobState>(*other.logprob_state_);
+  // A forked sequence (beam / best_of) shares the prompt KV prefix by
+  // ref-counting those blocks, but its linear-state / embedding resource block
+  // is private: drop the copied Single block so this sequence allocates its own
+  // on the next allocate. Preserves the pre-map behavior where single_block_
+  // was never copied by this constructor.
+  kv_state_.erase_blocks(BlockType::SINGLE);
+  host_kv_state_.erase_blocks(BlockType::SINGLE);
 }
 
 // The first token will be only used in disagg pd mode.
@@ -381,7 +390,7 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
     // This happens when the sequence was preempted during schedule_request(),
     // causing its KV cache to be deallocated (reset), but it's still in
     // last_batch_ being processed by update_last_step_result().
-    if (kv_state_.num_kv_blocks() == 0) {
+    if (kv_state_.num_blocks(BlockType::KV) == 0) {
       return;
     }
     kv_state_.incr_kv_cache_tokens_num(1);
@@ -394,6 +403,9 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
 
   const int32_t token_id = static_cast<int32_t>(token.id);
   tokens_[cur_generated_token_idx_] = token_id;
+  // Overlap/MTP may rewrite tokens at decode positions; drop any cached block
+  // hash from this position onward so it is recomputed when next needed.
+  invalidate_block_hashes_from(cur_generated_token_idx_);
   if (need_unique_tokens_) {
     token_to_count_map_[token_id]++;
   }
@@ -416,6 +428,9 @@ void Sequence::update_token(size_t index, const Token& token) {
   const int32_t origin_token_id = tokens_[index];
   const int32_t token_id = static_cast<int32_t>(token.id);
   tokens_[index] = token_id;
+  // A rewritten token invalidates the cached hash of its block and all
+  // subsequent blocks; recompute lazily on the next update_block_hashes().
+  invalidate_block_hashes_from(index);
   if (need_unique_tokens_) {
     --token_to_count_map_[origin_token_id];
     ++token_to_count_map_[token_id];
@@ -690,17 +705,18 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
   return output;
 }
 
-void Sequence::add_kv_blocks(const std::vector<Block>& blocks) {
-  kv_state_.add_kv_blocks(blocks);
+void Sequence::add_blocks(BlockType type, const std::vector<Block>& blocks) {
+  kv_state_.add_blocks(type, blocks);
 }
 
-void Sequence::add_host_kv_blocks(const std::vector<Block>& blocks) {
-  host_kv_state_.add_kv_blocks(blocks);
+void Sequence::add_host_blocks(BlockType type,
+                               const std::vector<Block>& blocks) {
+  host_kv_state_.add_blocks(type, blocks);
 }
 
 size_t Sequence::num_prefix_cache_tokens() const {
-  size_t cached_tokens = std::max(kv_state_.shared_kv_tokens_num(),
-                                  host_kv_state_.shared_kv_tokens_num());
+  size_t cached_tokens = std::max(kv_state_.shared_tokens_num(),
+                                  host_kv_state_.shared_tokens_num());
   DCHECK_LE(cached_tokens, num_prompt_tokens_);
   return cached_tokens;
 }
@@ -712,15 +728,56 @@ void Sequence::reset() {
   timer_.reset();
   is_timeout_set_ = false;
   volatile_num_prompt_tokens_ = num_tokens_;
-  single_block_ = Block();
 }
 
-void Sequence::add_shared_kv_blocks(std::vector<Block>&& blocks) {
-  kv_state_.add_shared_kv_blocks(std::move(blocks), num_tokens_);
+void Sequence::add_shared_blocks(BlockType type, std::vector<Block>&& blocks) {
+  kv_state_.add_shared_blocks(type, std::move(blocks), num_tokens_);
 }
 
-void Sequence::add_shared_host_kv_blocks(std::vector<Block>&& blocks) {
-  host_kv_state_.add_shared_kv_blocks(std::move(blocks), num_tokens_);
+void Sequence::add_shared_host_blocks(BlockType type,
+                                      std::vector<Block>&& blocks) {
+  host_kv_state_.add_shared_blocks(type, std::move(blocks), num_tokens_);
+}
+
+void Sequence::update_block_hashes(uint32_t block_size,
+                                   BlockHasherType hasher_type) {
+  if (block_size == 0) {
+    return;
+  }
+  hash_block_size_ = block_size;
+
+  const size_t n_full_blocks = num_tokens_ / block_size;
+  if (n_full_blocks <= block_hashes_.size()) {
+    return;
+  }
+
+  const Slice<int32_t> tokens = this->tokens();
+  const size_t start_block = block_hashes_.size();
+  // Resume the chain from the last already-hashed block (its hash is the
+  // parent of the next block).
+  XXH3Key prev_key = start_block == 0 ? XXH3Key{} : block_hashes_.back();
+  auto hasher =
+      BlockHasher::create(hasher_type, mm_data_, start_block * block_size);
+
+  block_hashes_.reserve(n_full_blocks);
+  for (size_t b = start_block; b < n_full_blocks; ++b) {
+    const size_t i = b * block_size;
+    const uint8_t* pre_hash_value = (b == 0) ? nullptr : prev_key.data;
+    XXH3Key key;
+    hasher->compute(tokens, i, i + block_size, pre_hash_value, key);
+    block_hashes_.emplace_back(key);
+    prev_key = key;
+  }
+}
+
+void Sequence::invalidate_block_hashes_from(size_t token_index) {
+  if (block_hashes_.empty() || hash_block_size_ == 0) {
+    return;
+  }
+  const size_t first_stale_block = token_index / hash_block_size_;
+  if (first_stale_block < block_hashes_.size()) {
+    block_hashes_.resize(first_stale_block);
+  }
 }
 
 bool Sequence::finished() const {
@@ -812,14 +869,14 @@ bool Sequence::update_prefetch_result(uint32_t timeout, uint32_t& success_cnt) {
   }
 
   termination_flag_->store(0, std::memory_order_release);
-  success_cnt = host_kv_state_.kv_blocks().size();
+  success_cnt = host_kv_state_.blocks(BlockType::KV).size();
   for (auto& cnt : prefetch_results_) {
     success_cnt = std::min(success_cnt, cnt->load());
   }
   if (success_cnt > 0) {
     host_kv_state_.incr_kv_cache_tokens_num(
-        success_cnt * host_kv_state_.kv_blocks()[0].size());
-    host_kv_state_.incr_shared_kv_blocks_num(success_cnt);
+        success_cnt * host_kv_state_.blocks(BlockType::KV)[0].size());
+    host_kv_state_.incr_shared_blocks_num(BlockType::KV, success_cnt);
   }
   prefetch_results_.clear();
   return true;

@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -144,6 +144,9 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InitOptions {
 
   /** FlashInfer attention workspace buffer size in bytes. */
   uint32_t flashinfer_workspace_buffer_size;
+
+  /** Maximum number of requests in the request queue */
+  uint32_t request_queue_size;
 
   /** Model task type (generate/embed) */
   char task[XLLM_META_STRING_FIELD_MAX_LEN];

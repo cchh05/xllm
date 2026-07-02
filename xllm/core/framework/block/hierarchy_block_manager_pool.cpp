@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@ limitations under the License.
 ==============================================================================*/
 
 #include "hierarchy_block_manager_pool.h"
+
+#include <algorithm>
 
 #include "block_manager_impl.h"
 #include "concurrent_block_manager_impl.h"
@@ -34,7 +36,6 @@ HierarchyBlockManagerPool::HierarchyBlockManagerPool(
       .enable_prefix_cache(options_.enable_prefix_cache())
       .enable_disagg_pd(options_.enable_disagg_pd())
       .num_blocks(options_.host_num_blocks())
-      .enable_cache_upload(options_.enable_cache_upload())
       .hasher_type(options_.hasher_type());
 
   for (int32_t i = 0; i < dp_size; ++i) {
@@ -84,7 +85,13 @@ void HierarchyBlockManagerPool::deallocate(Sequence* sequence) {
         host_block_managers_[dp_rank]->allocate(needed_block_num));
   }
 
-  for (size_t i = cached_host_block_num; i < host_blocks->size(); i++) {
+  // Only offload blocks that are fully computed on device. In-batch prefix
+  // cache insertion may register blocks before they are computed, so bound the
+  // offload range by cached_device_block_num to avoid copying uncomputed data
+  // to host/store.
+  const size_t offload_end_block_num =
+      std::min({cached_device_block_num, host_blocks->size(), blocks->size()});
+  for (size_t i = cached_host_block_num; i < offload_end_block_num; i++) {
     if (blocks->at(i).ref_count() != 2) {
       continue;
     }
@@ -351,17 +358,6 @@ void HierarchyBlockManagerPool::transfer_blocks() {
 
             return 0;
           });
-    }
-  }
-}
-
-void HierarchyBlockManagerPool::get_merged_kvcache_event(
-    KvCacheEvent* event) const {
-  if (host_block_managers_.empty()) {
-    BlockManagerPool::get_merged_kvcache_event(event);
-  } else {
-    for (int32_t i = 0; i < host_block_managers_.size(); ++i) {
-      host_block_managers_[i]->get_merged_kvcache_event(event);
     }
   }
 }

@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -91,6 +91,7 @@ LLMMaster::LLMMaster(const Options& options)
       .instance_role(options_.instance_role())
       .kv_cache_transfer_mode(options_.kv_cache_transfer_mode())
       .enable_service_routing(options_.enable_service_routing())
+      .disable_log_stats(options_.disable_log_stats())
       .priority_strategy(options_.priority_strategy())
       .enable_online_preempt_offline(options_.enable_online_preempt_offline())
       .enable_profile_step_time(options_.enable_profile_step_time())
@@ -543,13 +544,24 @@ bool LLMMaster::sleep() { return engine_->sleep(master_status_); }
 bool LLMMaster::wakeup() {
   WakeupOptions options;
   options.master_status = master_status_;
-  return engine_->wakeup(options);
+  const bool ok = engine_->wakeup(options);
+  // RL deep sleep discards the KV cache; on wake the physical memory is
+  // re-mapped but its contents are garbage. Drop all prefix-cache entries so a
+  // subsequent request never reuses a stale (now-garbage) cached prefix.
+  if (ok && options_.enable_sleep_mode() && scheduler_ != nullptr) {
+    scheduler_->reset_prefix_cache();
+  }
+  return ok;
 }
 
 bool LLMMaster::wakeup(const WakeupOptions& options) {
   WakeupOptions opts = options;
   opts.master_status = master_status_;
   return engine_->wakeup(opts);
+}
+
+bool LLMMaster::update_weights(const std::string& weights_path) {
+  return engine_->update_weights(weights_path);
 }
 
 bool LLMMaster::link_p2p(const std::vector<std::string>& remote_addrs) {

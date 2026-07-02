@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ namespace xllm {
 // Weight transfer using Mooncake transfer engine for remote weight loading
 class MooncakeWeightTransfer {
  public:
-  MooncakeWeightTransfer(int16_t listen_port, const torch::Device& device);
+  MooncakeWeightTransfer(uint16_t listen_port, const torch::Device& device);
   ~MooncakeWeightTransfer() = default;
 
   bool initialize();
@@ -53,7 +53,7 @@ class MooncakeWeightTransfer {
                     size_t size);
 
  private:
-  int16_t listen_port_;
+  uint16_t listen_port_;
   int32_t device_id_;
   std::string addr_;
   uint64_t cluster_id_ = 0;

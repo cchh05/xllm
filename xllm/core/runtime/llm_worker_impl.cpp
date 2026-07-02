@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -80,6 +80,21 @@ LLMWorkerImpl::LLMWorkerImpl(const ParallelArgs& parallel_args,
 bool LLMWorkerImpl::init_model(ModelContext& context) {
   CHECK(model_ == nullptr) << "Model is already initialized.";
 
+#if defined(USE_CUDA)
+  // Ensure FlashinferWorkspace is initialized on the calling thread before
+  // constructing model layers. When called synchronously from
+  // SpeculativeWorkerImpl (e.g. MTP target/draft setup), init_model runs on
+  // the MTP worker's thread (T_MTP) rather than on the LLMWorkerImpl's own
+  // threadpool thread (T_worker) where the scheduled initialize() runs.
+  // FlashinferWorkspace is thread_local, so T_MTP's instance must be
+  // explicitly initialized here; otherwise FlashInferAttentionImpl captures
+  // an undefined int_workspace_buffer_ and crashes at prefill time.
+  auto& ws = ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance();
+  if (!ws.get_int_workspace_buffer().defined()) {
+    ws.initialize(device_);
+  }
+#endif
+
   // Try to create a causal LM model
   model_ = create_llm_model(context);
 
@@ -136,28 +151,22 @@ std::optional<ForwardOutput> LLMWorkerImpl::execute_no_sync_on_stream(
 }
 
 std::optional<ForwardOutput> LLMWorkerImpl::step(const ForwardInput& input) {
-  if (::xllm::LoadConfig::get_instance().enable_manual_loader()) {
 #if defined(USE_NPU)
+  if (::xllm::LoadConfig::get_instance().enable_manual_loader()) {
     if (!enable_schedule_overlap() && options_.backend() == "llm") {
       aclrtStream current_stream =
           c10_npu::getCurrentNPUStream(device_.index()).stream();
       atb::Context* atb_context =
           const_cast<atb::Context*>(context_.get_atb_context());
       atb_context->SetExecuteStream(current_stream);
-      std::unique_ptr<Stream> stream = device_.current_stream();
-      wait_input_ready_events(input, *stream);
-      return step_internal(input, ForwardSyncPolicy::LEGACY);
     } else {
       SET_ATB_EXECUTE_STREAM(compute_stream_, device_, context_);
       wait_input_ready_events(input, *compute_stream_);
       return step_internal(input, ForwardSyncPolicy::LEGACY);
     }
-#else
-    std::unique_ptr<Stream> stream = device_.current_stream();
-    wait_input_ready_events(input, *stream);
-    return step_internal(input, ForwardSyncPolicy::LEGACY);
-#endif
   }
+#endif
+
   std::unique_ptr<Stream> stream = device_.current_stream();
   wait_input_ready_events(input, *stream);
   return step_internal(input, ForwardSyncPolicy::LEGACY);
@@ -176,9 +185,10 @@ LLMWorkerImpl::step_async_no_sync(const ForwardInput& input) {
   threadpool_.schedule([this,
                         input = std::move(input_on_device),
                         promise = std::move(promise)]() mutable {
-    if (hierarchy_kv_cache_transfer_ != nullptr) {
-      hierarchy_kv_cache_transfer_->set_layer_synchronizer(input.input_params);
-    }
+    // hierarchy temporarily disabled during the block-manager refactor
+    // if (hierarchy_kv_cache_transfer_ != nullptr) {
+    //   hierarchy_kv_cache_transfer_->set_layer_synchronizer(input.input_params);
+    // }
 
     const auto output = this->step_no_sync(input);
     promise.setValue(output);
@@ -220,8 +230,12 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     std::shared_ptr<MLULayerSynchronizerImpl> layer_synchronizer =
         std::make_shared<MLULayerSynchronizerImpl>(
             context_.get_model_args().n_layers());
+#elif defined(USE_DCU)
+    std::shared_ptr<DCULayerSynchronizerImpl> layer_synchronizer =
+        std::make_shared<DCULayerSynchronizerImpl>(
+            context_.get_model_args().n_layers());
 #endif
-#if defined(USE_NPU) || defined(USE_MLU)
+#if defined(USE_NPU) || defined(USE_MLU) || defined(USE_DCU)
     const_cast<ModelInputParams*>(&(input.input_params))
         ->parallel.layer_synchronizer = layer_synchronizer;
 
@@ -279,7 +293,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
       return std::nullopt;
     }
-    auto ret = device_.synchronize_default_stream();
+    int ret = device_.synchronize_default_stream();
     // in p-d disaggregation scene, all micro batches should be in same
     // prefill/decode stage, so, to judge transfer_kv_infos.empty,
     if (options_.kv_cache_transfer_mode() == "PUSH" &&
@@ -360,6 +374,11 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   }
 
   MULTI_MODEL_STEP_UNLOCK();
+  bool should_sync_default_stream = true;
+#if defined(USE_NPU)
+  should_sync_default_stream =
+      !can_skip_npu_graph_decode_sync(input.input_params);
+#endif
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
     output.retained_input = std::make_shared<ForwardInput>(input);
     if (enable_schedule_overlap()) {
@@ -367,7 +386,10 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     }
     return output;
   }
-  auto ret = device_.synchronize_default_stream();
+  if (should_sync_default_stream) {
+    int ret = device_.synchronize_default_stream();
+    CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
+  }
 
   if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
@@ -383,8 +405,10 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   }
 
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
-  DeviceMonitor::get_instance().update_active_activation_memory(
-      device_.index());
+  if (should_sync_default_stream) {
+    DeviceMonitor::get_instance().update_active_activation_memory(
+        device_.index());
+  }
 
   return output;
 }

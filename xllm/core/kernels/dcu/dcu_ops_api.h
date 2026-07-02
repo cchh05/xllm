@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,6 +31,24 @@ torch::Tensor matmul(torch::Tensor a,
                      torch::Tensor b,
                      std::optional<torch::Tensor> bias);
 
+// MoE group GEMM via CK Tile grouped_gemm_tileloop.
+//
+// Computes a batched per-expert GEMM:
+//   for each expert e:
+//     C[e] = A[t_start:t_end, :] * B[e, :, :]^T
+//
+// Parameters:
+//   input       — [total_tokens, K]  contiguous, fp16 or bf16
+//   weight      — [num_experts, N, K] contiguous, same dtype as input
+//   token_count — [num_experts] int32, number of tokens per expert
+//   output      — optional [total_tokens, N] contiguous; allocated if omitted
+//
+// Returns output tensor.
+torch::Tensor group_gemm(const torch::Tensor& input,
+                         const torch::Tensor& weight,
+                         const torch::Tensor& token_count,
+                         std::optional<torch::Tensor> output = std::nullopt);
+
 // Build a 2D block_table [B, max_pages] int32 from CSR-format paged KV
 // metadata.
 //
@@ -51,6 +69,35 @@ torch::Tensor build_block_table_from_paged_kv_cuda(
     const torch::Tensor& paged_kv_indptr,
     const torch::Tensor& paged_kv_indices);
 torch::Tensor random_sample(const torch::Tensor& probs);
+torch::Tensor rejection_sample(const torch::Tensor& draft_token_ids,
+                               const torch::Tensor& num_draft_tokens,
+                               const torch::Tensor& cu_num_draft_tokens,
+                               const std::optional<torch::Tensor>& draft_probs,
+                               const torch::Tensor& target_probs,
+                               const torch::Tensor& bonus_token_ids,
+                               const torch::Tensor& uniform_rand,
+                               const torch::Tensor& uniform_probs,
+                               int64_t max_spec_len);
+
+std::tuple<torch::Tensor, torch::Tensor> moe_grouped_topk(
+    torch::Tensor& gating_output,
+    int64_t topk,
+    int64_t num_expert_group,
+    int64_t topk_group,
+    bool renormalize,
+    const std::optional<torch::Tensor>& correction_bias,
+    const std::string& scoring_func,
+    double routed_scaling_factor);
+
+std::tuple<torch::Tensor, torch::Tensor> moe_active_topk(
+    torch::Tensor& gating_output,
+    int64_t topk,
+    int64_t num_expert_group,
+    int64_t topk_group,
+    bool renormalize,
+    const std::optional<torch::Tensor>& correction_bias,
+    const std::string& scoring_func,
+    double routed_scaling_factor);
 
 // DCU W8A8 dynamic activation quantization.
 // Current DCU implementation supports only no-smooth per-token INT8

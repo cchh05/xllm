@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -126,25 +126,22 @@ int64_t infer_actual_batch_size(const ModelInputParams& params) {
   return 0;
 }
 
-bool is_qwen3_5_model_type(const std::string& model_type) {
-  return model_type == "qwen3_5" || model_type == "qwen3_5_moe" ||
-         model_type == "qwen3_5_text" || model_type.rfind("qwen3_5_", 0) == 0;
-}
-
 }  // namespace
 
 // GraphPersistentParam implementation
 GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
                                            const torch::Device& device,
                                            const runtime::Options& options,
-                                           bool need_update_attn_mask)
+                                           bool need_update_attn_mask,
+                                           bool is_hybrid_linear_attention)
     : args_(args),
       device_(device),
       options_(options),
       context_for_plan_(nullptr),
       custom_pa_op_for_plan_(nullptr),
       stream_for_plan_(nullptr),
-      need_update_attn_mask_(need_update_attn_mask) {
+      need_update_attn_mask_(need_update_attn_mask),
+      is_hybrid_linear_attention_(is_hybrid_linear_attention) {
   // Determine whether attention plan needs to be updated based on model type
   // Future logic can be extended here for more complex model-specific behavior
   need_update_attention_plan_ = (args.model_type() != "deepseek_v32" &&
@@ -511,51 +508,37 @@ std::vector<int32_t>
 GraphPersistentParam::update_expanded_spec_decode_attention(
     const ModelInputParams& input_params,
     uint32_t actual_num_tokens,
-    uint32_t padded_num_tokens,
-    int64_t actual_batch_size) {
+    uint32_t padded_num_tokens) {
   CHECK(input_params.is_spec_verify)
       << "expanded spec decode attention is only for spec verify";
   CHECK(input_params.meta.batch_forward_type.is_chunked_prefill())
       << "expanded spec decode attention expects chunked prefill";
-  CHECK_EQ(input_params.attention.host.q_seq_lens.size(),
-           static_cast<size_t>(actual_batch_size))
-      << "q_seq_lens_vec must be sequence-scoped";
-  CHECK_EQ(input_params.attention.host.kv_seq_lens.size(),
-           static_cast<size_t>(actual_batch_size))
-      << "kv_seq_lens_vec must be sequence-scoped";
+  CHECK(input_params.graph.use_expanded_decode_for_spec_verify_attention)
+      << "MTP worker must prepare expanded spec-verify graph input";
+  CHECK(input_params.graph.expanded_kv_seq_lens.defined())
+      << "expanded spec-verify kv seq lens must be defined";
+  CHECK(input_params.graph.expanded_block_tables.defined())
+      << "expanded spec-verify block tables must be defined";
+  CHECK_EQ(input_params.graph.expanded_kv_seq_lens_vec.size(),
+           static_cast<size_t>(actual_num_tokens))
+      << "expanded kv seq lens size must match validate tokens";
+  CHECK_EQ(input_params.graph.expanded_kv_seq_lens.numel(),
+           static_cast<int64_t>(actual_num_tokens))
+      << "expanded kv seq lens tensor size must match validate tokens";
+  CHECK_EQ(input_params.graph.expanded_block_tables.dim(), 2)
+      << "expanded block tables must be 2D";
+  CHECK_EQ(input_params.graph.expanded_block_tables.size(0),
+           static_cast<int64_t>(actual_num_tokens))
+      << "expanded block table rows must match validate tokens";
 
-  std::vector<int32_t> expanded_kv_seq_lens_vec;
+  std::vector<int32_t> expanded_kv_seq_lens_vec =
+      input_params.graph.expanded_kv_seq_lens_vec;
   expanded_kv_seq_lens_vec.reserve(padded_num_tokens);
-  std::vector<torch::Tensor> expanded_block_rows;
-  expanded_block_rows.reserve(padded_num_tokens);
-
-  int64_t expanded_tokens = 0;
-  for (int64_t seq_idx = 0; seq_idx < actual_batch_size; ++seq_idx) {
-    const int32_t q_len = input_params.attention.host.q_seq_lens[seq_idx];
-    const int32_t kv_len = input_params.attention.host.kv_seq_lens[seq_idx];
-    CHECK_GE(q_len, 1) << "spec verify q_len must be positive";
-    CHECK_GE(kv_len, q_len) << "kv_len must include the validate query tokens";
-    for (int32_t token_idx = 0; token_idx < q_len; ++token_idx) {
-      expanded_kv_seq_lens_vec.emplace_back(kv_len - q_len + token_idx + 1);
-      expanded_block_rows.emplace_back(
-          input_params.attention.device.block_tables.select(/*dim=*/0,
-                                                            seq_idx));
-      ++expanded_tokens;
-    }
-  }
-  CHECK_EQ(expanded_tokens, static_cast<int64_t>(actual_num_tokens))
-      << "expanded spec decode token count must match validate tokens";
 
   if (padded_num_tokens > actual_num_tokens) {
     const int64_t pad_count = padded_num_tokens - actual_num_tokens;
-    torch::Tensor pad_row = torch::zeros(
-        {input_params.attention.device.block_tables.size(1)},
-        torch::TensorOptions()
-            .dtype(input_params.attention.device.block_tables.dtype())
-            .device(input_params.attention.device.block_tables.device()));
     for (int64_t i = 0; i < pad_count; ++i) {
       expanded_kv_seq_lens_vec.emplace_back(1);
-      expanded_block_rows.emplace_back(pad_row);
     }
   }
 
@@ -565,13 +548,41 @@ GraphPersistentParam::update_expanded_spec_decode_attention(
       .copy_(expanded_kv_tensor, /*non_blocking=*/true);
 
   const int64_t block_table_len =
-      input_params.attention.device.block_tables.size(1);
-  torch::Tensor expanded_block_table = torch::stack(expanded_block_rows, 0);
+      input_params.graph.expanded_block_tables.size(1);
   persistent_expanded_block_tables_
       .slice(/*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens)
+      .zero_();
+  persistent_expanded_block_tables_
+      .slice(/*dim=*/0, /*start=*/0, /*end=*/actual_num_tokens)
       .slice(/*dim=*/1, /*start=*/0, /*end=*/block_table_len)
-      .copy_(expanded_block_table, /*non_blocking=*/true);
+      .copy_(input_params.graph.expanded_block_tables, /*non_blocking=*/true);
   return expanded_kv_seq_lens_vec;
+}
+
+void GraphPersistentParam::update_tokens(const torch::Tensor& tokens,
+                                         const ModelInputParams& params,
+                                         uint32_t actual_num_tokens,
+                                         uint32_t padded_num_tokens) {
+  CHECK_GT(padded_num_tokens, 0) << "padded_num_tokens must be > 0";
+  const torch::Tensor& graph_tokens =
+      params.graph.input_tokens_override.defined()
+          ? params.graph.input_tokens_override
+          : tokens;
+  CHECK(graph_tokens.defined()) << "graph tokens must be defined";
+  CHECK_GE(graph_tokens.size(0), static_cast<int64_t>(actual_num_tokens))
+      << "graph token override is shorter than actual decode tokens";
+  if (actual_num_tokens > 0) {
+    persistent_tokens_.slice(/*dim=*/0, /*start=*/0, /*end=*/actual_num_tokens)
+        .copy_(graph_tokens.slice(/*dim=*/0,
+                                  /*start=*/0,
+                                  /*end=*/actual_num_tokens),
+               /*non_blocking=*/true);
+  }
+  if (padded_num_tokens > actual_num_tokens) {
+    zero_tensor_tail(persistent_tokens_,
+                     actual_num_tokens,
+                     static_cast<int64_t>(padded_num_tokens));
+  }
 }
 
 std::optional<ModelInputParams> GraphPersistentParam::update(
@@ -581,7 +592,8 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     const torch::Tensor& positions,
     const ModelInputParams& params,
     uint32_t padded_num_tokens,
-    bool return_capture_params) {
+    bool return_capture_params,
+    bool skip_token_update) {
   CHECK_GT(padded_num_tokens, 0) << "padded_num_tokens must be > 0";
   const uint32_t actual_num_tokens = tokens.size(0);
   const bool is_decode = params.meta.batch_forward_type.is_decode();
@@ -589,7 +601,7 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
       params.meta.batch_forward_type.is_chunked_prefill();
   const bool is_qwen3_5_spec_verify_chunked_prefill =
       params.is_spec_verify && is_chunked_prefill &&
-      is_qwen3_5_model_type(args_.model_type());
+      is_hybrid_linear_attention_;
   CHECK(is_decode || is_qwen3_5_spec_verify_chunked_prefill)
       << "ACL graph persistent param only supports decode or Qwen3.5 "
          "spec-verify chunked prefill";
@@ -610,18 +622,21 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
       is_chunked_prefill
           ? (padded_num_tokens + q_max_seq_len - 1) / q_max_seq_len
           : padded_num_tokens;
+  const bool is_empty_dp_decode_rank =
+      is_decode && params.meta.num_sequences == 0 && actual_num_tokens > 0 &&
+      params.parallel.dp_global_token_nums.size() > 1 &&
+      params.attention.host.kv_seq_lens.empty() &&
+      params.attention.host.q_seq_lens.empty();
   const int64_t actual_seq_len_rows =
-      is_chunked_prefill ? actual_batch_size : actual_num_tokens;
+      is_empty_dp_decode_rank
+          ? 0
+          : (is_chunked_prefill ? actual_batch_size : actual_num_tokens);
 
-  // Copy data from input parameters to persistent graph tensors
-  if (actual_num_tokens > 0) {
-    persistent_tokens_.slice(/*dim=*/0, /*start=*/0, /*end=*/actual_num_tokens)
-        .copy_(tokens, /*non_blocking=*/true);
-  }
-  if (padded_num_tokens > actual_num_tokens) {
-    zero_tensor_tail(persistent_tokens_,
-                     actual_num_tokens,
-                     static_cast<int64_t>(padded_num_tokens));
+  // Copy data from input parameters to persistent graph tensors.
+  // Schedule-overlap prepare can defer token copy until replay because tokens
+  // are replaced asynchronously from the previous step output.
+  if (!skip_token_update) {
+    update_tokens(tokens, params, actual_num_tokens, padded_num_tokens);
   }
   // mRoPE positions have shape [3, num_tokens], slice on dim 1
   if (actual_num_tokens > 0) {
@@ -820,8 +835,7 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
           ? params.attention.device.q_cu_seq_lens.size(0)
           : 0;
   if (has_q_cu && q_cu_size > 0) {
-    const bool use_qwen3_5_query_start_loc =
-        is_qwen3_5_model_type(args_.model_type());
+    const bool use_qwen3_5_query_start_loc = is_hybrid_linear_attention_;
     const bool input_has_leading_zero =
         params.is_spec_verify && use_qwen3_5_query_start_loc;
     const int64_t required_q_cu_seq_lens =
@@ -846,7 +860,8 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
                  /*non_blocking=*/true);
     }
     if (padded_batch_size > actual_seq_len_rows) {
-      int32_t offset = static_cast<int32_t>(actual_num_tokens);
+      int32_t offset =
+          is_empty_dp_decode_rank ? 0 : static_cast<int32_t>(actual_num_tokens);
       std::vector<int32_t> padded_q_cu_seq_lens;
       padded_q_cu_seq_lens.reserve(padded_batch_size - actual_seq_len_rows);
       const int32_t padding_q_len = is_chunked_prefill ? q_max_seq_len : 1;
@@ -893,12 +908,16 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
         is_chunked_prefill ? q_max_seq_len : 1;
   }
   const bool use_expanded_spec_decode_attention =
-      params.is_spec_verify && is_chunked_prefill &&
-      is_qwen3_5_model_type(args_.model_type());
+      params.graph.use_expanded_decode_for_spec_verify_attention;
+  if (is_qwen3_5_spec_verify_chunked_prefill) {
+    CHECK(use_expanded_spec_decode_attention)
+        << "Qwen3.5 spec-verify ACL graph requires MTP worker expanded "
+           "decode attention input";
+  }
   std::vector<int32_t> expanded_kv_seq_lens_vec;
   if (use_expanded_spec_decode_attention) {
     expanded_kv_seq_lens_vec = update_expanded_spec_decode_attention(
-        params, actual_num_tokens, padded_num_tokens, actual_batch_size);
+        params, actual_num_tokens, padded_num_tokens);
   }
 
   if (uses_paged_attention_tiling()) {
@@ -962,7 +981,7 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     params_for_capture->attention.device.q_seq_lens =
         q_seq_lens(static_cast<uint32_t>(padded_batch_size));
     params_for_capture->meta.actual_num_sequences =
-        static_cast<int32_t>(actual_num_tokens);
+        is_empty_dp_decode_rank ? 0 : static_cast<int32_t>(actual_num_tokens);
     params_for_capture->attention.host.kv_seq_lens = padded_kv_seq_lens_vec;
     params_for_capture->attention.host.q_seq_lens = padded_q_seq_lens_vec;
     params_for_capture->meta.num_sequences =
@@ -1022,8 +1041,7 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
           expanded_kv_seq_lens_vec;
     }
     if (params.attention.device.q_cu_seq_lens.defined()) {
-      const bool use_qwen3_5_query_start_loc =
-          is_qwen3_5_model_type(args_.model_type());
+      const bool use_qwen3_5_query_start_loc = is_hybrid_linear_attention_;
       params_for_capture->attention.device.q_cu_seq_lens = q_cu_seq_lens_.slice(
           /*dim=*/0,
           /*start=*/0,
@@ -1042,6 +1060,38 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
     replace_capture_cp_ep_padding(
         params.parallel.cp_ep_padding_data,
         params_for_capture->parallel.cp_ep_padding_data);
+
+    auto& qsl = params_for_capture->parallel.query_start_loc;
+    qsl.clear();
+    qsl.reserve(static_cast<size_t>(padded_batch_size) + 1);
+    qsl.emplace_back(0);
+    for (int64_t i = 0; i < padded_batch_size; ++i) {
+      qsl.emplace_back(qsl.back() +
+                       padded_q_seq_lens_vec[static_cast<size_t>(i)]);
+    }
+
+    if (!params.parallel.has_initial_state.empty()) {
+      auto& his = params_for_capture->parallel.has_initial_state;
+      his = params.parallel.has_initial_state;
+      if (his.size() > static_cast<size_t>(actual_batch_size)) {
+        his.resize(static_cast<size_t>(actual_batch_size));
+      }
+      his.resize(static_cast<size_t>(padded_batch_size), 0);
+    }
+
+    if (params.num_accepted_tokens.defined() &&
+        params.num_accepted_tokens.numel() > 0) {
+      torch::Tensor nat_host = params.num_accepted_tokens.to(torch::kCPU)
+                                   .to(torch::kLong)
+                                   .contiguous();
+      const int64_t copy_size =
+          std::min<int64_t>(actual_batch_size, nat_host.numel());
+      const int64_t* data = nat_host.data_ptr<int64_t>();
+      params_for_capture->num_accepted_tokens_host.assign(data,
+                                                          data + copy_size);
+      params_for_capture->num_accepted_tokens_host.resize(
+          static_cast<size_t>(padded_batch_size), 1);
+    }
 
     return params_for_capture;
   }

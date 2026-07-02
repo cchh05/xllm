@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -237,6 +237,7 @@ void ChunkedPrefillScheduler::handle_running_queue_requests(
       running_sequences_budgets_.insert(running_sequences_budgets_.end(),
                                         candidate_token_budgets.begin(),
                                         candidate_token_budgets.end());
+      cache_in_batch_prefix(candidate_sequences, candidate_token_budgets);
       remaining_token_budget -= allocated_tokens;
       remaining_seq_budget -= allocated_seqs;
       estimate_latency += allocated_estimate_latency;
@@ -508,6 +509,7 @@ void ChunkedPrefillScheduler::handle_prefill_requests(
     running_sequences_budgets_.insert(running_sequences_budgets_.end(),
                                       prefill_sequences_budget.begin(),
                                       prefill_sequences_budget.end());
+    cache_in_batch_prefix(prefill_sequences, prefill_sequences_budget);
   }
   // maybe can pre-compute if prompt beyond length
   if (running_sequences_.empty() && !waiting_priority_queue->empty() &&
@@ -863,7 +865,7 @@ bool ChunkedPrefillScheduler::allocate_blocks_for(
 }
 
 void ChunkedPrefillScheduler::allocate_shared_blocks_for(Sequence* sequence) {
-  if (sequence->kv_state().num_kv_blocks() == 0) {
+  if (sequence->kv_state().num_blocks(BlockType::KV) == 0) {
     // allocate shared blocks
     kv_cache_manager_->allocate_shared(sequence);
     return;

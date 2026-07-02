@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -227,9 +227,6 @@ Master::Master(const Options& options, EngineType type)
   }
 
   if (type == EngineType::VLM) {
-    CHECK(!(options.enable_prefix_cache() && options.enable_cache_upload()))
-        << "VLM prefix cache does not support cache upload yet.";
-
     runtime::Options eng_options;
     eng_options.model_path(options_.model_path())
         .devices(devices)
@@ -239,12 +236,14 @@ Master::Master(const Options& options, EngineType type)
         .max_memory_utilization(options.max_memory_utilization())
         .enable_prefix_cache(options.enable_prefix_cache())
         .max_encoder_cache_size(options.max_encoder_cache_size())
+        .max_linear_state_cache_slots(options.max_linear_state_cache_slots())
         .task_type(options.task_type())
         .enable_mla(options_.enable_mla())
         .enable_prefill_sp(options_.enable_prefill_sp())
         .npu_kernel_backend(options_.npu_kernel_backend())
         .enable_chunked_prefill(options_.enable_chunked_prefill())
         .enable_offline_inference(options_.enable_offline_inference())
+        .disable_log_stats(options_.disable_log_stats())
         .spawn_worker_path(options_.spawn_worker_path())
         .enable_shm(options_.enable_shm())
         .input_shm_size(options_.input_shm_size() * 1024 * 1024)
@@ -290,6 +289,7 @@ Master::Master(const Options& options, EngineType type)
         .max_cache_size(options_.max_cache_size())
         .max_memory_utilization(options_.max_memory_utilization())
         .enable_prefix_cache(options_.enable_prefix_cache())
+        .max_linear_state_cache_slots(options_.max_linear_state_cache_slots())
         .num_speculative_tokens(options_.num_speculative_tokens())
         .speculative_algorithm(options_.speculative_algorithm())
         .speculative_suffix_cache_max_depth(
@@ -325,8 +325,8 @@ Master::Master(const Options& options, EngineType type)
         .enable_disagg_pd(options_.enable_disagg_pd())
         .enable_service_routing(options_.enable_service_routing())
         .enable_schedule_overlap(options_.enable_schedule_overlap())
-        .enable_cache_upload(options_.enable_cache_upload())
         .enable_offline_inference(options_.enable_offline_inference())
+        .disable_log_stats(options_.disable_log_stats())
         .spawn_worker_path(options_.spawn_worker_path())
         .enable_shm(options_.enable_shm())
         .input_shm_size(options_.input_shm_size() * 1024 * 1024)
@@ -358,6 +358,7 @@ Master::Master(const Options& options, EngineType type)
         .max_cache_size(options_.max_cache_size())
         .max_memory_utilization(options_.max_memory_utilization())
         .enable_prefix_cache(options_.enable_prefix_cache())
+        .max_linear_state_cache_slots(options_.max_linear_state_cache_slots())
         .task_type(options_.task_type())
         .enable_mla(options_.enable_mla())
         .npu_kernel_backend(options_.npu_kernel_backend())
@@ -379,7 +380,6 @@ Master::Master(const Options& options, EngineType type)
         .enable_disagg_pd(options_.enable_disagg_pd())
         .enable_service_routing(options_.enable_service_routing())
         .enable_schedule_overlap(options_.enable_schedule_overlap())
-        .enable_cache_upload(options_.enable_cache_upload())
         .host_blocks_factor(options_.host_blocks_factor())
         .enable_kvcache_store(options_.enable_kvcache_store())
         .store_protocol(options_.store_protocol())
@@ -389,6 +389,7 @@ Master::Master(const Options& options, EngineType type)
         .prefetch_batch_size(options_.prefetch_batch_size())
         .layers_wise_copy_batchs(options_.layers_wise_copy_batchs())
         .enable_offline_inference(options_.enable_offline_inference())
+        .disable_log_stats(options_.disable_log_stats())
         .spawn_worker_path(options_.spawn_worker_path())
         .enable_shm(options_.enable_shm())
         .input_shm_size(options_.input_shm_size() * 1024 * 1024)
@@ -402,6 +403,7 @@ Master::Master(const Options& options, EngineType type)
             options_.enable_prefill_piecewise_graph())
         .max_tokens_for_graph_mode(options_.max_tokens_for_graph_mode())
         .kv_cache_dtype(options_.kv_cache_dtype())
+        .enable_sleep_mode(options_.enable_sleep_mode())
         .model_id(options_.model_id());
 
     engine_ = std::make_unique<LLMEngine>(eng_options);
@@ -422,6 +424,7 @@ Master::Master(const Options& options, EngineType type)
         .enable_mla(options_.enable_mla())
         .enable_chunked_prefill(options_.enable_chunked_prefill())
         .enable_offline_inference(options_.enable_offline_inference())
+        .disable_log_stats(options_.disable_log_stats())
         .spawn_worker_path(options_.spawn_worker_path())
         .enable_shm(options_.enable_shm())
         .is_local(options_.is_local())
@@ -456,6 +459,7 @@ Master::Master(const Options& options, EngineType type)
         .enable_prefix_cache(options_.enable_prefix_cache())
         .enable_chunked_prefill(options_.enable_chunked_prefill())
         .enable_offline_inference(options_.enable_offline_inference())
+        .disable_log_stats(options_.disable_log_stats())
         .max_memory_utilization(options_.max_memory_utilization())
         .master_node_addr(options.master_node_addr())
         .nnodes(options.nnodes())
@@ -470,7 +474,8 @@ Master::Master(const Options& options, EngineType type)
         .ep_size(options_.ep_size())
         .tp_size(options_.tp_size())
         .sp_size(options_.sp_size())
-        .cfg_size(options_.cfg_size());
+        .cfg_size(options_.cfg_size())
+        .vae_size(options_.vae_size());
 
     auto dit_engine = std::make_unique<DiTEngine>(eng_options);
     engine_ = std::move(dit_engine);

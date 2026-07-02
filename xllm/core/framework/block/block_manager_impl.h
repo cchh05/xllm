@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,6 @@ limitations under the License.
 #pragma once
 
 #include "block_manager.h"
-#include "framework/kv_cache/kv_cache_event.h"
 
 namespace xllm {
 
@@ -35,20 +34,27 @@ class BlockManagerImpl : public BlockManager {
 
   void deallocate(const Slice<Block>& blocks) override;
 
+  // Flat incremental growth: allocate ceil(num_tokens/block_size) - held blocks
+  // and return them (does not insert into the sequence). The shared default for
+  // flat-KV / compressed / xtensor leaves; SlidingWindow and Single override.
+  std::optional<std::vector<Block>> allocate_for_sequence(
+      Sequence* seq,
+      size_t num_tokens) override;
+
   // allocate shared blocks when enable prefix cache
   std::vector<Block> allocate_shared(
       const Slice<int32_t>& token_ids,
       const Slice<Block>& existed_shared_blocks = {},
-      const MMData& mm_data = MMData()) override;
+      const MMData& mm_data = MMData(),
+      const Slice<XXH3Key>& block_hashes = {}) override;
 
   // cache blocks when enable prefix cache
   void cache(const Slice<int32_t>& token_ids,
              std::vector<Block>& blocks,
              size_t existed_shared_blocks_num = 0,
-             const MMData& mm_data = MMData()) override;
+             const MMData& mm_data = MMData(),
+             const Slice<XXH3Key>& block_hashes = {}) override;
   void cache(const std::vector<Block>& blocks) override;
-
-  void get_merged_kvcache_event(KvCacheEvent* event) const override;
 
   size_t num_blocks_in_prefix_cache() const override {
     if (options_.enable_prefix_cache()) {
@@ -56,6 +62,12 @@ class BlockManagerImpl : public BlockManager {
       return prefix_cache_->num_blocks();
     }
     return 0;
+  }
+
+  void reset_prefix_cache() override {
+    if (options_.enable_prefix_cache() && prefix_cache_) {
+      prefix_cache_->evict(prefix_cache_->num_blocks());
+    }
   }
 
   // free blocks num

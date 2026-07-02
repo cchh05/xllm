@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -50,7 +50,10 @@ class MMHandlerBase {
 
   MMErrCode load_from_local(const std::string& url, std::string& data);
 
-  MMErrCode load_from_http(const std::string& url, std::string& data);
+  MMErrCode load_from_http(
+      const std::string& url,
+      std::string& data,
+      const std::unordered_map<std::string, std::string>& headers = {});
 
  protected:
   std::string httpurl_prefix_{"http"};

@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -163,7 +163,8 @@ void WorkerServer::create_server(const runtime::Options& options,
                                                     options.dp_size(),
                                                     options.tp_size(),
                                                     options.sp_size(),
-                                                    options.cfg_size());
+                                                    options.cfg_size(),
+                                                    options.vae_size());
     comm = std::move(dit_comm);
   } else {
     auto common_comm = std::make_unique<CollectiveCommunicator>(

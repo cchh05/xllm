@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -96,6 +96,8 @@ class ContinuousScheduler : public Scheduler {
     PROPERTY(bool, enable_chunked_prefill) = true;
 
     PROPERTY(bool, enable_service_routing) = false;
+
+    PROPERTY(bool, disable_log_stats) = false;
 
     // TODO: think if distinguish prefill and decode priority strategy
     PROPERTY(std::string,
@@ -209,6 +211,8 @@ class ContinuousScheduler : public Scheduler {
   };
 
   // Pause the scheduler. See PauseMode for in-flight request handling.
+  void reset_prefix_cache() override;
+
   void pause(PauseMode mode = PauseMode::KEEP);
 
   // Block until the scheduler has fully transitioned to PAUSED (i.e. running
@@ -273,6 +277,8 @@ class ContinuousScheduler : public Scheduler {
   std::unique_ptr<ProfileManager> profile_manager_;
 
   bool enable_prefix_cache_ = false;
+
+  bool enable_in_batch_prefix_cache_ = false;
 
   // the number of requests that are waiting to be scheduled
   std::atomic<size_t> pending_requests_{0};
@@ -341,6 +347,12 @@ class ContinuousScheduler : public Scheduler {
                                 Sequence* prefill_sequence,
                                 size_t max_handle_num_tokens,
                                 size_t& num_request_to_evict);
+
+  // Publish the full prefill blocks admitted in this scheduling step into the
+  // prefix cache, so later requests in the same batch can share them.
+  void cache_in_batch_prefix(
+      const std::vector<Sequence*>& sequences,
+      const std::vector<size_t>& current_step_token_budgets);
 
   // build a batch of requests from the priority queue
   virtual std::vector<Batch> prepare_batch();

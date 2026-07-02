@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ limitations under the License.
 
 namespace xllm {
 
-MooncakeWeightTransfer::MooncakeWeightTransfer(int16_t listen_port,
+MooncakeWeightTransfer::MooncakeWeightTransfer(uint16_t listen_port,
                                                const torch::Device& device)
     : listen_port_(listen_port), device_id_(device.index()) {
   std::string instance_ip = net::get_local_ip_addr();

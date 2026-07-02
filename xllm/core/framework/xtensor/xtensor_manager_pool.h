@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -40,6 +40,9 @@ class XTensorManagerPool final : public KVCacheManager {
 
   // unimplemented functions
   void cache(Sequence* sequence) override { NOT_IMPLEMENTED(); }
+  void cache(Sequence* sequence, size_t num_tokens) override {
+    NOT_IMPLEMENTED();
+  }
 
   bool allocate(Sequence* sequence,
                 size_t num_tokens,

@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -270,7 +270,6 @@ class UniPCMultistepSchedulerImpl final : public torch::nn::Module {
         convert_model_output(model_output, sample);
 
     if (use_corrector) {
-      LOG(INFO) << "scheduler step use_corrector";
       sample = multistep_uni_c_bh_update(
           model_output_convert, last_sample_, sample, this_order_);
     }
@@ -292,8 +291,6 @@ class UniPCMultistepSchedulerImpl final : public torch::nn::Module {
     }
     this_order_ =
         std::min(this_order_calc, static_cast<int64_t>(lower_order_nums_ + 1));
-
-    LOG(INFO) << "self.this_order = " << this_order_;
 
     last_sample_ = sample;
     torch::Tensor prev_sample =
@@ -823,9 +820,6 @@ REGISTER_MODEL_ARGS(UniPCMultistepScheduler, [&] {
   LOAD_ARG_OR(rescale_betas_zero_snr, "rescale_betas_zero_snr", false);
   LOAD_ARG_OR(use_dynamic_shifting, "use_dynamic_shifting", false);
   LOAD_ARG_OR(time_shift_type, "time_shift_type", "exponential");
-  LOAD_ARG_OR(sigma_min, "sigma_min", 0.0f);
-  LOAD_ARG_OR(sigma_max, "sigma_max", 0.0f);
-  LOAD_ARG_OR(shift_terminal, "shift_terminal", false);
 });
 
 }  // namespace xllm

@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 Copyright 2024 The ScaleLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@ limitations under the License.
 #include <openssl/sha.h>
 #include <string.h>
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -28,6 +29,30 @@ limitations under the License.
 namespace xllm {
 
 class BlockManager;
+
+// Identity of a KV block's cache role inside a sequence's KVCacheState. Used as
+// the key of the per-sequence block map: the legacy flat attention KV lives
+// under KV, DSV4's three groups under SWA/C4/C128, and the per-sequence
+// linear/embedding resource block (formerly Sequence::single_block_) under
+// Single. A block carries no type identity itself; the owning BlockManager
+// decides which key to store it under when it fills the sequence state.
+enum class BlockType : int8_t {
+  KV = 0,      // normal/Qwen flat attention KV, exported to block_tables
+  SWA = 1,     // DSV4 sliding window, exported to multi_block_tables[0]
+  C4 = 2,      // DSV4 compressed, exported to multi_block_tables[1]
+  C128 = 3,    // DSV4 compressed, exported to multi_block_tables[2]
+  SINGLE = 4,  // per-sequence linear-state / embedding resource block, exported
+               // via get_single_block_id() (linear_state_ids / embedding_ids),
+               // not to block_tables / multi_block_tables
+};
+
+// Fixed column order of worker multi_block_tables. The exported tables must
+// follow this order so they line up with the worker-side DSA group_infos; it
+// must never depend on std::map iteration order or config traversal order.
+inline constexpr std::array<BlockType, 3> kMultiBlockExportOrder = {
+    BlockType::SWA,
+    BlockType::C4,
+    BlockType::C128};
 
 class Block final {
  public:
@@ -59,6 +84,12 @@ class Block final {
 
   // owner manager that allocated this block.
   BlockManager* manager() const { return manager_; }
+
+  // Reassign this block's owning manager. Used by concurrency wrappers (e.g.
+  // ConcurrentBlockManagerImpl) to route Block dtor -> free() through the
+  // wrapper layer so the wrapper's lock covers the free path too. Must not be
+  // used to transfer ownership across pools.
+  void set_manager(BlockManager* manager) { manager_ = manager; }
 
   // NOTE: Below block `hash_value_` is used for prefix cache and
   // for recording the hash value of the current block and previous blocks.

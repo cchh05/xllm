@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -56,8 +56,12 @@ void dump_startup_config();
     property(FLAGS_##property);                \
   } while (false)
 
+// Assign a config property from JSON, then write the resolved value back to
+// the corresponding FLAGS_ global so that code reading FLAGS_##property
+// directly observes the JSON-provided value instead of the gflags default.
 #define XLLM_CONFIG_ASSIGN_FROM_JSON(property)                               \
   do {                                                                       \
     property(json.value_or<std::decay_t<decltype(property())>>(#property,    \
                                                                property())); \
+    FLAGS_##property = property();                                           \
   } while (false)

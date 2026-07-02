@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -80,12 +80,12 @@ void EtcdClient::add_watch(const std::string& key_prefix,
   }
 
   uint64_t prefix_len = etcd_namespace_prefix_.size();
-  auto bound_callback = std::bind(callback, std::placeholders::_1, prefix_len);
-
   auto watcher = std::make_unique<etcd::Watcher>(
       client_,
       namespaced_key(key_prefix),
-      [bound_callback](etcd::Response response) { bound_callback(response); },
+      [callback, prefix_len](const etcd::Response& response) {
+        callback(response, prefix_len);
+      },
       recursive);
 
   watchers_[key_prefix] = {std::move(watcher), callback};

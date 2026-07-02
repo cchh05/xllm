@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -151,17 +151,17 @@ bool XServiceClient::init(const std::string& etcd_addr,
       &XServiceClient::reconcile_registration_loop, this);
 
   // watch master xllm_service change
-  auto master_func = std::bind(&XServiceClient::handle_master_service_watch,
-                               this,
-                               std::placeholders::_1,
-                               std::placeholders::_2);
+  auto master_func = [this](const etcd::Response& response,
+                            uint64_t prefix_len) {
+    handle_master_service_watch(response, prefix_len);
+  };
   etcd_client_->add_watch(ETCD_MASTER_SERVICE_KEY, master_func);
 
   // watch all xllm_service changes
-  auto xservices_func = std::bind(&XServiceClient::handle_xservices_watch,
-                                  this,
-                                  std::placeholders::_1,
-                                  std::placeholders::_2);
+  auto xservices_func = [this](const etcd::Response& response,
+                               uint64_t prefix_len) {
+    handle_xservices_watch(response, prefix_len);
+  };
   etcd_client_->add_watch(ETCD_XSERVICES_KEY_PREFIX, xservices_func);
 
   block_manager_pool_ = block_manager_pool;
@@ -340,9 +340,7 @@ InstanceInfo XServiceClient::get_instance_info(
 }
 
 void XServiceClient::heartbeat() {
-  KvCacheEvent event;
   while (!exited_.load()) {
-    event.clear();
     std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int64_t>(
         ::xllm::DistributedConfig::get_instance().heart_beat_interval() *
         1000)));
@@ -354,24 +352,6 @@ void XServiceClient::heartbeat() {
     xllm_service::proto::HeartbeatRequest req;
     req.set_name(instance_name_);
     req.set_incarnation_id(incarnation_id_);
-    if (block_manager_pool_->options().enable_prefix_cache()) {
-      block_manager_pool_->get_merged_kvcache_event(&event);
-      auto cache_event = req.mutable_cache_event();
-      if (event.stored_cache.size()) {
-        cache_event->mutable_stored_cache()->Reserve(event.stored_cache.size());
-        for (auto& hash_key : event.stored_cache) {
-          cache_event->add_stored_cache(hash_key.data, sizeof(hash_key.data));
-        }
-      }
-
-      if (event.removed_cache.size()) {
-        cache_event->mutable_removed_cache()->Reserve(
-            event.removed_cache.size());
-        for (auto& hash_key : event.removed_cache) {
-          cache_event->add_removed_cache(hash_key.data, sizeof(hash_key.data));
-        }
-      }
-    }
 
     req.mutable_load_metrics()->set_gpu_cache_usage_perc(
         block_manager_pool_->get_gpu_cache_usage_perc());

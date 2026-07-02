@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -353,7 +353,7 @@ void KVCacheShape::apply_device_layout(const ModelArgs& model_args) {
   }
 #endif
 
-#if defined(USE_MLU)
+#if defined(USE_MLU) || defined(USE_DCU)
   if (model_args.enable_mla()) {
     CHECK(key_cache_shape_.has_value())
         << "key_cache_shape is not initialized.";

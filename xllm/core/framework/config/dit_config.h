@@ -1,4 +1,4 @@
-/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+/* Copyright 2025-2026 The xLLM Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -52,8 +52,10 @@ class DiTConfig final {
          "dit_cache_start_blocks",
          "dit_cache_end_blocks",
          "dit_sp_communication_overlap",
-         "dit_debug_print"
-         "dit_generation_image_area_max"}};
+         "dit_debug_print",
+         "dit_generation_image_area_max",
+         "dit_vae_image_size",
+         "dit_enable_vae_tiling"}};
     return kOptionCategory;
   }
 
@@ -77,11 +79,15 @@ class DiTConfig final {
 
   PROPERTY(int64_t, dit_cache_end_blocks) = 5;
 
-  PROPERTY(int64_t, dit_sp_communication_overlap) = 1;
+  PROPERTY(bool, dit_sp_communication_overlap) = true;
 
   PROPERTY(bool, dit_debug_print) = false;
 
   PROPERTY(int64_t, dit_generation_image_area_max) = 0;
+
+  PROPERTY(int64_t, dit_vae_image_size) = 1048576;
+
+  PROPERTY(bool, dit_enable_vae_tiling) = false;
 };
 
 }  // namespace xllm

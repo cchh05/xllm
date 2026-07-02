@@ -1,5 +1,29 @@
 include(cc_test)
 
+# Add test for Qwen3.5 MLU layers (gated delta net operators, GDN layer, and
+# hybrid attention layer).
+cc_test(
+  NAME
+    qwen3_5_layer_test
+  SRCS
+    qwen3_5_gated_delta_net_ops_test.cpp
+    qwen3_5_gated_delta_net_test.cpp
+    qwen3_5_attention_test.cpp
+    tests_utils.cpp
+  DEPS
+    :config
+    :mlu_layers
+    :common_layers
+    :block
+    :parallel_state
+    :model
+    :model_context
+    :state_dict
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
 # Add test for MLU layers
 cc_test(
   NAME
@@ -16,8 +40,9 @@ cc_test(
     qwen2_vision_attention_test.cpp
   DEPS
     :config
-    :common_layers
     :mlu_layers
+    :common_layers
+    :block
     :parallel_state
     :model
     :model_context
@@ -52,6 +77,45 @@ cc_test(
 
 cc_test(
   NAME
+    deepseek_v4_hyper_connection_test
+  SRCS
+    deepseek_v4_hyper_connection_test.cpp
+    tests_utils.cpp
+  DEPS
+    :mlu_layers
+    :common_layers
+    :block
+    :parallel_state
+    :model
+    :model_context
+    :state_dict
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    deepseek_v4_decoder_layer_test
+  SRCS
+    deepseek_v4_decoder_layer_test.cpp
+    deepseek_v4_ref_utils.cpp
+    tests_utils.cpp
+  DEPS
+    :mlu_layers
+    :common_layers
+    :block
+    :parallel_state
+    :model
+    :model_context
+    :state_dict
+    glog::glog
+    torch
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     deepseek_v4_dsa_metadata_builder_test
   SRCS
     dsa_metadata_builder_mlu_test.cpp
@@ -70,12 +134,15 @@ cc_test(
   SRCS
     moe_gate_test.cpp
     fused_moe_test.cpp
+    moe_weight_loader_helper_test.cpp
     deepseek_v2_sparse_moe_block_test.cpp
+    deepseek_v4_sparse_moe_block_test.cpp
     tests_utils.cpp
   DEPS
     :config
-    :common_layers
     :mlu_layers
+    :common_layers
+    :block
     :parallel_state
     :model
     :model_context
@@ -95,6 +162,7 @@ cc_test(
     deep_ep_test.cpp
     tests_utils.cpp
   DEPS
+    :mlu_layers
     :common_layers
     :parallel_state
     :model
@@ -116,8 +184,8 @@ cc_test(
     tests_utils.cpp
   DEPS
     :config
-    :common_layers
     :mlu_layers
+    :common_layers
     :block
     :parallel_state
     :model
