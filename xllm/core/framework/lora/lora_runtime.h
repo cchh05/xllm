@@ -57,20 +57,24 @@ class LoRARuntime {
 
   bool enabled() const;
 
-  // Load an adapter from a filesystem path, register it, and materialise
-  // its whole-block A/B tensors on `device`. Returns int_id on success.
+  // Called once by the model (QWen3ModelImpl ctor) so subsequent HTTP
+  // calls to /v1/load_lora_adapter know what device / dtype to
+  // materialise weights on. Idempotent; last caller wins (single model
+  // per engine today).
+  void set_model_device_dtype(torch::Device device, torch::ScalarType dtype);
+
+  // Load an adapter from a filesystem path, parse its PEFT files, pick a
+  // whole-block A/B pair, cast to the model's dtype, and register it.
   //
-  // `whole_block_A_key` / `whole_block_B_key` name the two tensor entries
-  // inside the loaded LoRAAdapter that should be used as the model-level
-  // delta. When they are missing (rare in practice) we fall back to the
-  // first suitable A/B pair we find so the demo path stays alive.
+  // The tensors stay on CPU here -- the actual device migration happens
+  // lazily on the first active_delta() call from the model forward
+  // thread, which owns the correct NPU context.
   //
-  // The most recently loaded adapter becomes the active one.
+  // The most recently loaded adapter becomes the pending one and will
+  // be promoted to active on the next forward.
   std::optional<uint64_t> load_and_activate(const std::string& lora_name,
                                             const std::string& lora_path,
-                                            const std::string& base_model_name,
-                                            torch::Device device,
-                                            torch::ScalarType dtype);
+                                            const std::string& base_model_name);
 
   // Deactivate an adapter by name. If it was the active one, active_delta
   // will subsequently return std::nullopt.
@@ -81,30 +85,54 @@ class LoRARuntime {
 
   // The active whole-block delta tensors. std::nullopt = no adapter, the
   // forward path should just skip its delta step.
+  //
+  // Note: tensors are populated on CPU by the load path (which typically
+  // runs on the API thread, without an NPU context) and lazily migrated
+  // to device on the first active_delta() call from the model forward
+  // thread (which owns the correct NPU context). This avoids the
+  // aclrtMemcpy-invalid-handle failure you hit when a background thread
+  // tries to allocate device memory it does not own.
   struct ActiveDelta {
-    torch::Tensor A;  // [rank, hidden]
-    torch::Tensor B;  // [hidden, rank]
+    torch::Tensor A;  // [rank, hidden] on model_device
+    torch::Tensor B;  // [hidden, rank] on model_device
     float scaling;
     std::string name;
     uint64_t int_id;
   };
-  std::optional<ActiveDelta> active_delta() const;
+  std::optional<ActiveDelta> active_delta();
 
  private:
   LoRARuntime() = default;
 
   // Called with materialise_mu_ held. Picks a plausible A/B pair from the
-  // adapter's canonicalised tensor set. See notes in impl.
+  // adapter's canonicalised tensor set. Result is CPU-side, dtype-cast to
+  // the model dtype but kept off-device.
   bool pick_whole_block_ab(const LoRAAdapter& adapter,
-                           torch::Device device,
                            torch::ScalarType dtype,
                            torch::Tensor* A_out,
                            torch::Tensor* B_out) const;
+
+  // Pending / not-yet-migrated CPU tensors, seeded by load_and_activate.
+  // active_delta() moves these to device on the forward thread.
+  struct PendingDelta {
+    torch::Tensor A_cpu;
+    torch::Tensor B_cpu;
+    float scaling;
+    std::string name;
+    uint64_t int_id;
+  };
+  std::optional<PendingDelta> pending_;
 
   mutable std::mutex materialise_mu_;
   LoRAConfig config_;
   LoRARegistry registry_;
   std::unique_ptr<LoRAAdapterLoader> loader_;
+
+  // Recorded by the model at forward-init time so the HTTP handler knows
+  // where to place freshly-loaded LoRA tensors. std::nullopt means no
+  // model has registered yet.
+  std::optional<torch::Device> model_device_;
+  std::optional<torch::ScalarType> model_dtype_;
 
   // Currently-active adapter's device tensors. Guarded by materialise_mu_.
   std::optional<ActiveDelta> active_;

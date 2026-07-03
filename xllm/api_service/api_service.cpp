@@ -35,6 +35,7 @@ limitations under the License.
 #include "core/distributed_runtime/llm_master.h"
 #include "core/distributed_runtime/rec_master.h"
 #include "core/distributed_runtime/vlm_master.h"
+#include "core/framework/lora/lora_runtime.h"
 #include "core/util/closure_guard.h"
 #include "embedding.pb.h"
 #include "image_generation.pb.h"
@@ -1270,6 +1271,148 @@ void APIService::UnlinkD2DHttp(::google::protobuf::RpcController* controller,
     LOG(ERROR) << "proto to json failed: " << err_msg;
     return;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-tenant LoRA (M9). All three handlers hand-parse the JSON body via
+// nlohmann::json and delegate to LoRARuntime, keeping this layer thin so
+// vLLM-compatible extensions (load_inplace, priority) can land later
+// without proto churn.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Small helper: fill an HTTP response with a JSON string and a status
+// header. The brpc HTTP layer will forward the status code back to the
+// client. Returning early on error is easier than plumbing a Status
+// object through every path here.
+void write_json_response(brpc::Controller* ctrl,
+                         int http_status,
+                         const nlohmann::json& body) {
+  ctrl->http_response().set_status_code(http_status);
+  ctrl->http_response().set_content_type("application/json");
+  ctrl->response_attachment().append(body.dump());
+}
+
+// Read the whole request attachment into a std::string. brpc already
+// gave us an IOBuf; std::string is easier to feed to nlohmann::json.
+std::string read_body(brpc::Controller* ctrl) {
+  butil::IOBuf& buf = ctrl->request_attachment();
+  return buf.to_string();
+}
+
+}  // namespace
+
+void APIService::LoadLoraAdapterHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = reinterpret_cast<brpc::Controller*>(controller);
+
+  auto& runtime = LoRARuntime::instance();
+  if (!runtime.enabled()) {
+    write_json_response(
+        ctrl, 400, {{"error", "LoRA is disabled; start with --enable_lora"}});
+    return;
+  }
+
+  const std::string body = read_body(ctrl);
+  nlohmann::json j;
+  try {
+    j = nlohmann::json::parse(body);
+  } catch (const std::exception& e) {
+    write_json_response(
+        ctrl, 400, {{"error", std::string("bad json: ") + e.what()}});
+    return;
+  }
+  if (!j.is_object() || !j.contains("lora_name") || !j.contains("lora_path")) {
+    write_json_response(
+        ctrl,
+        400,
+        {{"error", "expected {\"lora_name\":..., \"lora_path\":...}"}});
+    return;
+  }
+  const std::string lora_name = j["lora_name"].get<std::string>();
+  const std::string lora_path = j["lora_path"].get<std::string>();
+  const std::string base_model_name =
+      j.value("base_model_name", std::string(""));
+
+  auto id_opt =
+      runtime.load_and_activate(lora_name, lora_path, base_model_name);
+  if (!id_opt) {
+    write_json_response(ctrl,
+                        400,
+                        {{"error", "load failed; see server log for details"},
+                         {"lora_name", lora_name}});
+    return;
+  }
+  write_json_response(
+      ctrl,
+      200,
+      {{"status", "ok"}, {"lora_name", lora_name}, {"lora_int_id", *id_opt}});
+}
+
+void APIService::UnloadLoraAdapterHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = reinterpret_cast<brpc::Controller*>(controller);
+
+  const std::string body = read_body(ctrl);
+  nlohmann::json j;
+  try {
+    j = nlohmann::json::parse(body);
+  } catch (const std::exception& e) {
+    write_json_response(
+        ctrl, 400, {{"error", std::string("bad json: ") + e.what()}});
+    return;
+  }
+  if (!j.is_object() || !j.contains("lora_name")) {
+    write_json_response(ctrl, 400, {{"error", "expected {\"lora_name\":...}"}});
+    return;
+  }
+  const std::string lora_name = j["lora_name"].get<std::string>();
+  const bool ok = LoRARuntime::instance().unload(lora_name);
+  if (!ok) {
+    write_json_response(
+        ctrl, 404, {{"error", "adapter not found"}, {"lora_name", lora_name}});
+    return;
+  }
+  write_json_response(ctrl, 200, {{"status", "ok"}, {"lora_name", lora_name}});
+}
+
+void APIService::ListLoraAdaptersHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = reinterpret_cast<brpc::Controller*>(controller);
+
+  const auto adapters = LoRARuntime::instance().registry().list();
+  nlohmann::json arr = nlohmann::json::array();
+  for (const auto& a : adapters) {
+    arr.push_back({{"lora_name", a.lora_name},
+                   {"lora_int_id", a.lora_int_id},
+                   {"lora_path", a.lora_path},
+                   {"base_model_name", a.base_model_name}});
+  }
+  write_json_response(ctrl, 200, {{"data", arr}});
 }
 
 }  // namespace xllm

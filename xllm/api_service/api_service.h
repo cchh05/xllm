@@ -170,6 +170,22 @@ class APIService : public proto::XllmAPIService {
                      proto::HttpResponse* response,
                      ::google::protobuf::Closure* done) override;
 
+  // Multi-tenant LoRA (M9). See xllm_service.proto for URL mapping.
+  void LoadLoraAdapterHttp(::google::protobuf::RpcController* controller,
+                           const proto::HttpRequest* request,
+                           proto::HttpResponse* response,
+                           ::google::protobuf::Closure* done) override;
+
+  void UnloadLoraAdapterHttp(::google::protobuf::RpcController* controller,
+                             const proto::HttpRequest* request,
+                             proto::HttpResponse* response,
+                             ::google::protobuf::Closure* done) override;
+
+  void ListLoraAdaptersHttp(::google::protobuf::RpcController* controller,
+                            const proto::HttpRequest* request,
+                            proto::HttpResponse* response,
+                            ::google::protobuf::Closure* done) override;
+
  private:
   bool ParseForkMasterRequest(const proto::MasterInfos* request,
                               Options& options);

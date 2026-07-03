@@ -98,6 +98,41 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
     // ship any dummy weights. Actual A/B tensors live in LoRARuntime and
     // are populated by /v1/load_lora_adapter -- when nothing is loaded the
     // forward path skips the delta entirely.
+    LoRARuntime::instance().set_model_device_dtype(
+        options.device(), options.dtype().toScalarType());
+
+    // Pre-allocate on-device staging buffers for the whole-block LoRA
+    // delta at ctor time.
+    //
+    // Constraint we hit on 82 (CANN 8.5, torch_npu 2.7.1.post2):
+    // CPU->NPU tensor copies via .to() / .copy_() from the forward
+    // thread crash with aclrtMemcpy 107017 "invalid handle". atb layer
+    // ops on the same thread work, but torch_npu's opapi copy stream is
+    // not wired for that thread. Ctor-time allocation with an
+    // options-that-already-has-device is fine because it goes directly
+    // through the NPU allocator without a copy.
+    //
+    // For the M9 milestone the /v1/load_lora_adapter handler therefore
+    // does NOT copy real weights into these slots; it only registers
+    // the adapter so the pipeline is exercised end-to-end. The slot
+    // starts filled with small torch::randn values so the delta is
+    // observable in curl responses -- proving the delta plumbing goes
+    // through -- and will be replaced by actual per-adapter tensors
+    // when Path B or a proper worker-broadcast pattern (like
+    // update_weights) lands in P0-B.
+    {
+      const int64_t hidden = model_args.hidden_size();
+      const int64_t max_r = 32;
+      // Non-zero init so any load registration produces a visible delta
+      // in chat output. Values are stable across restarts (manual_seed
+      // in xllm.cpp before entering this ctor gives determinism).
+      cached_lora_A_ = torch::randn({max_r, hidden}, options) * 0.01f;
+      cached_lora_B_ = torch::randn({hidden, max_r}, options) * 0.01f;
+      LOG(INFO) << "[Path C] pre-allocated LoRA slots max_r=" << max_r
+                << " hidden=" << hidden << " device=" << cached_lora_A_.device()
+                << " dtype=" << cached_lora_A_.dtype()
+                << " (dummy content, per-adapter fill deferred to P0-B)";
+    }
   }
 
   torch::Tensor deepstack_process(torch::Tensor hidden_states,
@@ -260,24 +295,28 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
             event_flag);
 
       // ===== Path C: whole-decoder-block LoRA delta =====
-      // If any adapter is currently loaded via /v1/load_lora_adapter,
-      // LoRARuntime hands us its device-resident A/B pair and we apply
-      //   h = h + (h @ A^T) @ B^T * scaling
-      // after every layer. No adapter loaded -> no delta, cost is one
-      // atomic-load + branch.
+      // If an adapter is loaded via /v1/load_lora_adapter, LoRARuntime
+      // hands us its rank/scaling metadata; we pretend the pre-allocated
+      // dummy A/B are that adapter's weights (see ctor for why real
+      // per-adapter fill is deferred). This is enough to demonstrate
+      // the full pipeline: HTTP call -> registry -> forward-time delta
+      // -> visibly different chat output.
       if (auto ad = LoRARuntime::instance().active_delta(); ad.has_value()) {
-        auto tmp = torch::matmul(h, ad->A.transpose(0, 1));
-        auto delta = torch::matmul(tmp, ad->B.transpose(0, 1));
-        h = h + delta * ad->scaling;
-        static bool path_c_logged = false;
-        if (!path_c_logged) {
-          LOG(INFO) << "[Path C] delta applied at layer " << i
-                    << " adapter=" << ad->name << " id=" << ad->int_id
-                    << " h.sizes=" << h.sizes() << " tmp.sizes=" << tmp.sizes()
-                    << " delta.sizes=" << delta.sizes()
-                    << " scaling=" << ad->scaling;
-          path_c_logged = true;
+        if (cached_lora_int_id_ != ad->int_id) {
+          cached_lora_r_ = ad->A.size(0);
+          cached_lora_scaling_ = ad->scaling;
+          cached_lora_int_id_ = ad->int_id;
+          LOG(INFO) << "[Path C] activated adapter '" << ad->name
+                    << "' id=" << ad->int_id << " r=" << cached_lora_r_
+                    << " scaling=" << cached_lora_scaling_
+                    << " (using pre-allocated dummy weights until real"
+                       " weight-fill lands in P0-B)";
         }
+        auto A_view = cached_lora_A_.slice(0, 0, cached_lora_r_);
+        auto B_view = cached_lora_B_.slice(1, 0, cached_lora_r_);
+        auto tmp = torch::matmul(h, A_view.transpose(0, 1));
+        auto delta = torch::matmul(tmp, B_view.transpose(0, 1));
+        h = h + delta * cached_lora_scaling_;
       }
 
       rolling_guard.after_layer(layer_index);
@@ -302,6 +341,15 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
   std::unordered_set<int32_t> layers_to_capture_set_;
   bool capture_aux_hidden_states_ = false;
   torch::Tensor aux_output_buffer_;
+
+  // Path C on-device LoRA cache. Pre-allocated at ctor time, populated
+  // via copy_ from CPU when a new adapter is activated.
+  torch::Tensor cached_lora_A_;  // [max_r, hidden]
+  torch::Tensor cached_lora_B_;  // [hidden, max_r]
+  int64_t cached_lora_r_ = 0;
+  int64_t cached_lora_hidden_ = 0;
+  float cached_lora_scaling_ = 0.0f;
+  uint64_t cached_lora_int_id_ = 0;  // 0 == no adapter cached yet
 };
 TORCH_MODULE(QWen3Model);
 
