@@ -23,6 +23,7 @@ cc_library(
     dp_utils.h
     add_matmul.h
     moe_fused_topk.h
+    lora/lora_qkv_parallel_linear.h
   SRCS
     qwen2_attention.cpp
     qwen2_vision_attention.cpp
@@ -42,6 +43,7 @@ cc_library(
     dp_utils.cpp
     add_matmul.cpp
     moe_fused_topk.cpp
+    lora/lora_qkv_parallel_linear.cpp
   DEPS
     "-Wl,--whole-archive"
     "-Wl,--no-whole-archive"
