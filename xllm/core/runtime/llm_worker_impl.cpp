@@ -254,7 +254,11 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
                                      /*non_blocking=*/false)
                                  .contiguous();
     }
-    if (options_.cp_size() > 1) {
+    // options_.cp_size() is the STARTUP value and never follows a runtime flip;
+    // read the live layout so a post-flip DP_DECODE step takes the non-CP
+    // logits path. Using the stale CP path after flipping to DP runs CP-only
+    // all-gather logic against a DP layout.
+    if (parallel_args_.cp_size() > 1) {
       logits = model_->logits(model_output.hidden_states,
                               selected_token_idxes,
                               selected_hidden_from_lm_head);

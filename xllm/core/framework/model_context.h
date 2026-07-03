@@ -68,6 +68,15 @@ class ModelContext {
 
   const ParallelArgs& get_parallel_args() const { return parallel_args_; }
 
+  // Refresh the cached ParallelArgs snapshot after a runtime CP<->DP flip.
+  // ModelContext keeps its own copy (not a reference), so a mode switch that
+  // only updates the worker's ParallelArgs would leave this stale and the
+  // forward path would read the pre-flip cp_size/dp_size. Called from
+  // WorkerImpl::switch_mode with the post-flip active() args.
+  void set_parallel_args(const ParallelArgs& parallel_args) {
+    parallel_args_ = parallel_args;
+  }
+
   const torch::TensorOptions& get_tensor_options() const {
     return tensor_options_;
   }

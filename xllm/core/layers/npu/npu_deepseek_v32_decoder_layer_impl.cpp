@@ -948,9 +948,20 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   auto& dp_ep_padding = input_params.parallel.dp_ep_padding_data;
   auto& cp_ep_padding = input_params.parallel.cp_ep_padding_data;
   auto& cp_inputs = input_params.parallel.cp_prefill_inputs;
-  const bool use_cp_ep_padding = (cp_size_ > 1 && is_prefill);
+  // cp_size_/dp_size_ are baked in at ctor from the construction-time mode. A
+  // runtime CP<->DP flip changes the live layout but does NOT rewrite these
+  // members, so read the current layout from dual_parallel_args_ when present
+  // (the forward path already picks the ATB node the same way). Falls back to
+  // the ctor members on the legacy single-mode path.
+  const int32_t active_cp_size =
+      dual_parallel_args_ != nullptr ? dual_parallel_args_->active().cp_size()
+                                     : cp_size_;
+  const int32_t active_dp_size =
+      dual_parallel_args_ != nullptr ? dual_parallel_args_->active().dp_size()
+                                     : dp_size_;
+  const bool use_cp_ep_padding = (active_cp_size > 1 && is_prefill);
 
-  if (dp_size_ <= 1 && ep_size_ <= 1 || cp_size_ > 1) {
+  if (active_dp_size <= 1 && ep_size_ <= 1 || active_cp_size > 1) {
     dp_ep_padding.set_placeholder(tensor_placeholder_);
   }
   if (!use_cp_ep_padding) {
@@ -1117,7 +1128,7 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
 
   if (skip_topk_ || output_topk_) {
     // TODO: support DSA top-k sharing for CP prefill.
-    CHECK(!(cp_size_ > 1 && is_prefill))
+    CHECK(!(active_cp_size > 1 && is_prefill))
         << "DSA top-k sharing does not support CP prefill yet.";
     if (skip_topk_) {
       CHECK(shared_topk_indices.defined())
@@ -1127,7 +1138,7 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
     }
   }
 
-  if (cp_size_ > 1 && is_prefill) {
+  if (active_cp_size > 1 && is_prefill) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 32) =
         atb_speed::Utils::AtTensor2Tensor(cp_inputs.cp_o_recover_idx);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 33) =

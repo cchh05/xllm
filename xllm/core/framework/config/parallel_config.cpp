@@ -79,6 +79,23 @@ DEFINE_bool(
     "Desktop/cp_docs_work/probes_results_20260629/DESIGN_DOC_v0.2.md "
     "for the budget. Costs ~600 MB / NPU plus extra ATB graph workspace.");
 
+DEFINE_bool(
+    enable_flip_verbose_log,
+    false,
+    "Enable per-request/per-step FLIPDIAG diagnostic logs for CP<->DP "
+    "flip debugging (dispatch, recv, per-step batch shape, per-worker "
+    "forward shard, dp_global_token_nums broadcast). Off by default -- "
+    "flip lifecycle events (switch_mode/rebuild/relink/backdoor) are "
+    "still logged unconditionally. Turn on when investigating flip "
+    "regressions; expect 20-100x log volume during DP burst traffic. "
+    "Runtime-toggleable via brpc /flags endpoint.");
+// Registering a no-op validator marks the flag as reloadable so brpc's
+// /flags?setvalue=true HTTP endpoint accepts runtime toggles. Without it
+// brpc rejects with "A reloadable gflag must have validator" and forces
+// a service restart just to flip verbose logging.
+static bool ValidateFlipVerboseLog(const char*, bool) { return true; }
+DEFINE_validator(enable_flip_verbose_log, &ValidateFlipVerboseLog);
+
 DEFINE_int32(
     dual_mode_port_stride,
     256,
