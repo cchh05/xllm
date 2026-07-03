@@ -69,6 +69,7 @@ cc_library(
     :block
     :tokenizer
     :chat_template
+    :lora
     glog::glog
     absl::strings
     absl::time

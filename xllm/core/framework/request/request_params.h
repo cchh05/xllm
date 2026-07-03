@@ -169,6 +169,23 @@ struct RequestParams {
   bool is_sample_request = false;
 
   std::vector<SampleSlot> sample_slots;
+
+  // ---- Multi-tenant LoRA (M7) ----
+  //
+  // Engine-assigned int_id of the adapter this request should route to.
+  // Set by APIService when the incoming HTTP `model` field matches a
+  // registered adapter name; left unset for base-model requests.
+  //
+  // Kept as std::optional so the scheduler can partition base vs adapter
+  // requests without a magic sentinel.
+  //
+  // Downstream: this value must be copied into RequestState / Sequence and
+  // reach the model forward path so per-batch LoRA metadata can be built.
+  std::optional<uint64_t> adapter_id;
+
+  // Human-readable adapter name kept for logging / metrics only. The
+  // registry is the source of truth; do not use this field for routing.
+  std::string adapter_name;
 };
 
 }  // namespace xllm

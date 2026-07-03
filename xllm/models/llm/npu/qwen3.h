@@ -22,6 +22,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/common/global_flags.h"
+#include "core/framework/lora/lora_runtime.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/npu/npu_qwen3_decoder_layer_impl.h"
 #include "llm_model_base.h"
@@ -93,34 +94,10 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
           torch::empty({FLAGS_max_tokens_per_batch, aux_dim}, options);
     }
 
-    // ===== Spike Day 5c Path C: hardcoded per-layer LoRA delta =====
-    // For a Spike we hard-wire one dummy LoRA that applies to every decoder
-    // layer as a whole-block delta:  h += (h @ A^T) @ B^T * scale
-    // This is intentionally the coarsest possible injection (one shared A/B
-    // for all layers), enough to prove the "delta plumbing works end-to-end".
-    // Real per-proj / per-layer LoRA is P0 work.
-    {
-      const int64_t hidden = model_args.hidden_size();
-      lora_rank_ = 8;
-      lora_scale_ = 0.5;  // Spike: crank up scale for visible delta
-      // Deterministic seed so reruns give the same delta and an offline
-      // reference (same seed, same shapes) can be reproduced in Python.
-      torch::manual_seed(42);
-      auto cpu_opts = torch::TensorOptions().dtype(torch::kFloat32);
-      // A: [rank, hidden], B: [hidden, rank]  (LoRA convention y = x @ A^T @
-      // B^T)
-      auto A_cpu = torch::randn({lora_rank_, hidden}, cpu_opts) * 0.02f;
-      auto B_cpu = torch::randn({hidden, lora_rank_}, cpu_opts) * 0.02f;
-      // Move to device with model dtype (bfloat16/float16).
-      lora_A_ = A_cpu.to(options.device()).to(options.dtype().toScalarType());
-      lora_B_ = B_cpu.to(options.device()).to(options.dtype().toScalarType());
-      LOG(INFO) << "[Spike Path C] dummy LoRA registered rank=" << lora_rank_
-                << " scale=" << lora_scale_ << " hidden=" << hidden
-                << " A_shape=" << lora_A_.sizes()
-                << " B_shape=" << lora_B_.sizes()
-                << " dtype=" << lora_A_.dtype()
-                << " device=" << lora_A_.device();
-    }
+    // Path C wires the model's whole-decoder-block delta path but does not
+    // ship any dummy weights. Actual A/B tensors live in LoRARuntime and
+    // are populated by /v1/load_lora_adapter -- when nothing is loaded the
+    // forward path skips the delta entirely.
   }
 
   torch::Tensor deepstack_process(torch::Tensor hidden_states,
@@ -282,21 +259,24 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
             event,
             event_flag);
 
-      // ===== Spike Path C: hardcoded LoRA delta added after each layer =====
-      // At this point `h` has been in-place updated by the atb decoder layer.
-      // We add: h = h + (h @ A^T) @ B^T * scale
-      // No reshape (matmul broadcasts leading dims) so we always modify the
-      // real hidden state rather than a possibly-copied view.
-      if (lora_A_.defined() && lora_B_.defined()) {
-        auto tmp = torch::matmul(h, lora_A_.transpose(0, 1));
-        auto delta = torch::matmul(tmp, lora_B_.transpose(0, 1));
-        h = h + delta * static_cast<float>(lora_scale_);
-        static bool spike_delta_logged = false;
-        if (!spike_delta_logged) {
-          LOG(INFO) << "[Spike Path C] delta applied at layer " << i
+      // ===== Path C: whole-decoder-block LoRA delta =====
+      // If any adapter is currently loaded via /v1/load_lora_adapter,
+      // LoRARuntime hands us its device-resident A/B pair and we apply
+      //   h = h + (h @ A^T) @ B^T * scaling
+      // after every layer. No adapter loaded -> no delta, cost is one
+      // atomic-load + branch.
+      if (auto ad = LoRARuntime::instance().active_delta(); ad.has_value()) {
+        auto tmp = torch::matmul(h, ad->A.transpose(0, 1));
+        auto delta = torch::matmul(tmp, ad->B.transpose(0, 1));
+        h = h + delta * ad->scaling;
+        static bool path_c_logged = false;
+        if (!path_c_logged) {
+          LOG(INFO) << "[Path C] delta applied at layer " << i
+                    << " adapter=" << ad->name << " id=" << ad->int_id
                     << " h.sizes=" << h.sizes() << " tmp.sizes=" << tmp.sizes()
-                    << " delta.sizes=" << delta.sizes();
-          spike_delta_logged = true;
+                    << " delta.sizes=" << delta.sizes()
+                    << " scaling=" << ad->scaling;
+          path_c_logged = true;
         }
       }
 
@@ -322,11 +302,6 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
   std::unordered_set<int32_t> layers_to_capture_set_;
   bool capture_aux_hidden_states_ = false;
   torch::Tensor aux_output_buffer_;
-  // Spike Path C: hardcoded LoRA weights (whole-decoder-block delta).
-  torch::Tensor lora_A_;  // [rank, hidden]
-  torch::Tensor lora_B_;  // [hidden, rank]
-  int64_t lora_rank_{0};
-  double lora_scale_{0.0};
 };
 TORCH_MODULE(QWen3Model);
 

@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/common/types.h"
 #include "core/distributed_runtime/dit_master.h"
 #include "core/distributed_runtime/master.h"
+#include "core/framework/lora/lora_runtime.h"
 #include "core/framework/xtensor/global_xtensor.h"
 #include "core/framework/xtensor/options.h"
 #include "core/framework/xtensor/xtensor_allocator.h"
@@ -367,6 +368,15 @@ int main(int argc, char** argv) {
   google::ParseCommandLineFlags(&argc, &argv, true);
 
   google::InitGoogleLogging("xllm");
+
+  // Bootstrap the LoRA runtime from CLI flags. When --enable-lora=false
+  // (default) this only stores the config; no adapters get loaded and the
+  // model forward path skips the delta step for zero cost.
+  {
+    xllm::LoRAConfig lora_cfg;
+    lora_cfg.load_from_flags();
+    xllm::LoRARuntime::instance().init(lora_cfg);
+  }
 
   // Check if model path is provided
   if (FLAGS_model.empty()) {
