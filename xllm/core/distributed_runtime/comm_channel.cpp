@@ -440,6 +440,38 @@ bool CommChannel::wakeup(const WakeupOptions& options) {
   return true;
 }
 
+bool CommChannel::load_lora_adapter(const std::string& lora_name,
+                                    const std::string& lora_path,
+                                    const std::string& base_model_name) {
+  proto::Status s;
+  brpc::Controller cntl;
+  proto::LoadLoraAdapterRequest req;
+  req.set_lora_name(lora_name);
+  req.set_lora_path(lora_path);
+  req.set_base_model_name(base_model_name);
+  stub_->LoadLoraAdapter(&cntl, &req, &s, nullptr);
+  if (cntl.Failed() || !s.ok()) {
+    LOG(ERROR) << "LoadLoraAdapter failed for '" << lora_name
+               << "': " << cntl.ErrorText();
+    return false;
+  }
+  return true;
+}
+
+bool CommChannel::unload_lora_adapter(const std::string& lora_name) {
+  proto::Status s;
+  brpc::Controller cntl;
+  proto::UnloadLoraAdapterRequest req;
+  req.set_lora_name(lora_name);
+  stub_->UnloadLoraAdapter(&cntl, &req, &s, nullptr);
+  if (cntl.Failed() || !s.ok()) {
+    LOG(ERROR) << "UnloadLoraAdapter failed for '" << lora_name
+               << "': " << cntl.ErrorText();
+    return false;
+  }
+  return true;
+}
+
 class ClientStreamReceiver : public brpc::StreamInputHandler {
  private:
   std::shared_ptr<std::atomic<int32_t>> termination_flag_;

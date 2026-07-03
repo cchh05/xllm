@@ -379,4 +379,32 @@ folly::SemiFuture<bool> RemoteWorker::wakeup_async(
   return future;
 }
 
+folly::SemiFuture<bool> RemoteWorker::load_lora_adapter_async(
+    const std::string& lora_name,
+    const std::string& lora_path,
+    const std::string& base_model_name) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        lora_name,
+                        lora_path,
+                        base_model_name,
+                        promise = std::move(promise)]() mutable {
+    promise.setValue(
+        channel_->load_lora_adapter(lora_name, lora_path, base_model_name));
+  });
+  return future;
+}
+
+folly::SemiFuture<bool> RemoteWorker::unload_lora_adapter_async(
+    const std::string& lora_name) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule(
+      [this, lora_name, promise = std::move(promise)]() mutable {
+        promise.setValue(channel_->unload_lora_adapter(lora_name));
+      });
+  return future;
+}
+
 }  // namespace xllm

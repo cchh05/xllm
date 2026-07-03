@@ -1303,6 +1303,52 @@ bool LLMEngine::sleep(MasterStatus master_status) {
   return true;
 }
 
+bool LLMEngine::load_lora_broadcast(const std::string& lora_name,
+                                    const std::string& lora_path,
+                                    const std::string& base_model_name) {
+  if (worker_clients_.empty()) {
+    LOG(ERROR) << "No worker clients available for LoRA load broadcast.";
+    return false;
+  }
+  LOG(INFO) << "Broadcasting LoadLoraAdapter '" << lora_name
+            << "' path=" << lora_path << " to " << worker_clients_num_
+            << " worker(s)";
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(worker_clients_num_);
+  for (auto& worker : worker_clients_) {
+    futures.push_back(
+        worker->load_lora_adapter_async(lora_name, lora_path, base_model_name));
+  }
+  auto results = folly::collectAll(futures).get();
+  for (const auto& r : results) {
+    if (!r.value()) {
+      LOG(ERROR) << "LoadLoraAdapter broadcast failed on at least one worker";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool LLMEngine::unload_lora_broadcast(const std::string& lora_name) {
+  if (worker_clients_.empty()) {
+    LOG(ERROR) << "No worker clients available for LoRA unload broadcast.";
+    return false;
+  }
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(worker_clients_num_);
+  for (auto& worker : worker_clients_) {
+    futures.push_back(worker->unload_lora_adapter_async(lora_name));
+  }
+  auto results = folly::collectAll(futures).get();
+  for (const auto& r : results) {
+    if (!r.value()) {
+      LOG(ERROR) << "UnloadLoraAdapter broadcast failed on at least one worker";
+      return false;
+    }
+  }
+  return true;
+}
+
 bool LLMEngine::wakeup(const WakeupOptions& options) {
   // sleep/wakeup/fork_master requires FLAGS_enable_xtensor
   if (!FLAGS_enable_xtensor) {

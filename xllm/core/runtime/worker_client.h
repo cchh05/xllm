@@ -47,6 +47,13 @@ class WorkerClient {
   virtual folly::SemiFuture<bool> sleep_async(MasterStatus master_status);
 
   virtual folly::SemiFuture<bool> wakeup_async(const WakeupOptions& options);
+  virtual folly::SemiFuture<bool> load_lora_adapter_async(
+      const std::string& lora_name,
+      const std::string& lora_path,
+      const std::string& base_model_name);
+
+  virtual folly::SemiFuture<bool> unload_lora_adapter_async(
+      const std::string& lora_name);
 
   virtual std::tuple<int64_t, int64_t> estimate_kv_cache_capacity();
 

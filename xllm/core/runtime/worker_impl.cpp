@@ -46,6 +46,7 @@ limitations under the License.
 #endif
 #include "core/distributed_runtime/master.h"
 #include "framework/kv_cache/kv_cache.h"
+#include "framework/lora/lora_runtime.h"
 #include "framework/model/model_input_params.h"
 #include "framework/model/npu_cp_ep_padding.h"
 #include "framework/model_loader.h"
@@ -795,6 +796,24 @@ bool WorkerImpl::sleep(MasterStatus master_status) {
   }
 
   return true;
+}
+
+bool WorkerImpl::load_lora_adapter(const std::string& lora_name,
+                                   const std::string& lora_path,
+                                   const std::string& base_model_name) {
+  // Runs on this worker's threadpool_. That is the same executor as
+  // ExecuteModel / model init, which means torch_npu's opapi memcpy
+  // stream is primed for this thread and .to(device) succeeds. This is
+  // the whole point of routing the load through a worker RPC rather
+  // than doing it in the API handler thread (where CPU->NPU copy fails
+  // with aclrtMemcpy 107017 on this CANN 8.5 stack).
+  auto id_opt = LoRARuntime::instance().load_and_activate(
+      lora_name, lora_path, base_model_name);
+  return id_opt.has_value();
+}
+
+bool WorkerImpl::unload_lora_adapter(const std::string& lora_name) {
+  return LoRARuntime::instance().unload(lora_name);
 }
 
 bool WorkerImpl::wakeup(const WakeupOptions& options) {

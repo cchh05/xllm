@@ -57,7 +57,9 @@ std::optional<uint64_t> LoRARegistry::register_adapter(const LoRARequest& req) {
 
   const uint64_t id = next_id_.fetch_add(1);
   name_to_id_[req.lora_name] = id;
-  id_to_entry_[id] = Entry{req, /*pin_count=*/0, /*unloading=*/false};
+  LoRARequest stored = req;
+  stored.lora_int_id = id;
+  id_to_entry_[id] = Entry{stored, /*pin_count=*/0, /*unloading=*/false};
   LOG(INFO) << "[LoRARegistry] registered '" << req.lora_name << "' id=" << id
             << " path=" << req.lora_path;
   return id;

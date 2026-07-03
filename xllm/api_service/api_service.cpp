@@ -1342,19 +1342,45 @@ void APIService::LoadLoraAdapterHttp(
   const std::string base_model_name =
       j.value("base_model_name", std::string(""));
 
-  auto id_opt =
-      runtime.load_and_activate(lora_name, lora_path, base_model_name);
-  if (!id_opt) {
+  // Broadcast to all workers so the CPU->NPU copy runs on each worker's
+  // own thread (which has torch_npu's opapi memcpy stream primed).
+  // Doing the load inline in this API handler thread reproducibly
+  // crashes with aclrtMemcpy 107017 on CANN 8.5 -- see the P0-B
+  // rationale in the commit message.
+  Master* master = master_;
+  if (master == nullptr) {
+    // Fall back to any registered per-model master.
+    for (const auto& [_, m] : masters_) {
+      master = m;
+      break;
+    }
+  }
+  if (master == nullptr) {
+    write_json_response(
+        ctrl,
+        500,
+        {{"error", "no master registered"}, {"lora_name", lora_name}});
+    return;
+  }
+  const bool broadcast_ok =
+      master->load_lora_broadcast(lora_name, lora_path, base_model_name);
+  if (!broadcast_ok) {
     write_json_response(ctrl,
                         400,
                         {{"error", "load failed; see server log for details"},
                          {"lora_name", lora_name}});
     return;
   }
+  // Register in the API-side registry so /v1/lora_adapters lists it.
+  // This is a bookkeeping-only entry; the real weights live inside each
+  // worker's own LoRARuntime.
+  LoRARequest api_req{lora_name, /*int_id=*/0, lora_path, base_model_name};
+  auto id_opt = LoRARuntime::instance().registry().register_adapter(api_req);
+  const uint64_t int_id = id_opt.value_or(0);
   write_json_response(
       ctrl,
       200,
-      {{"status", "ok"}, {"lora_name", lora_name}, {"lora_int_id", *id_opt}});
+      {{"status", "ok"}, {"lora_name", lora_name}, {"lora_int_id", int_id}});
 }
 
 void APIService::UnloadLoraAdapterHttp(
@@ -1383,6 +1409,16 @@ void APIService::UnloadLoraAdapterHttp(
     return;
   }
   const std::string lora_name = j["lora_name"].get<std::string>();
+  Master* master = master_;
+  if (master == nullptr) {
+    for (const auto& [_, m] : masters_) {
+      master = m;
+      break;
+    }
+  }
+  if (master != nullptr) {
+    (void)master->unload_lora_broadcast(lora_name);
+  }
   const bool ok = LoRARuntime::instance().unload(lora_name);
   if (!ok) {
     write_json_response(

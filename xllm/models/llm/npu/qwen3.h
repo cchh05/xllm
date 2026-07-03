@@ -126,8 +126,8 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
       // Non-zero init so any load registration produces a visible delta
       // in chat output. Values are stable across restarts (manual_seed
       // in xllm.cpp before entering this ctor gives determinism).
-      cached_lora_A_ = torch::randn({max_r, hidden}, options) * 0.01f;
-      cached_lora_B_ = torch::randn({hidden, max_r}, options) * 0.01f;
+      cached_lora_A_ = torch::randn({max_r, hidden}, options) * 0.005f;
+      cached_lora_B_ = torch::randn({hidden, max_r}, options) * 0.005f;
       LOG(INFO) << "[Path C] pre-allocated LoRA slots max_r=" << max_r
                 << " hidden=" << hidden << " device=" << cached_lora_A_.device()
                 << " dtype=" << cached_lora_A_.dtype()

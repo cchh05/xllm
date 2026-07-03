@@ -124,6 +124,11 @@ class LLMEngine : public Engine {
   bool sleep(MasterStatus master_status) override;
 
   bool wakeup(const WakeupOptions& options) override;
+  bool load_lora_broadcast(const std::string& lora_name,
+                           const std::string& lora_path,
+                           const std::string& base_model_name) override;
+
+  bool unload_lora_broadcast(const std::string& lora_name) override;
 
   // XTensor mode: get GlobalXTensor offsets for allocated blocks via RPC
   // Calls worker in the specified DP group to compute offsets

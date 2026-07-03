@@ -87,6 +87,11 @@ class LLMMaster : public Master {
   bool wakeup() override;
 
   bool wakeup(const WakeupOptions& options) override;
+  bool load_lora_broadcast(const std::string& lora_name,
+                           const std::string& lora_path,
+                           const std::string& base_model_name) override;
+
+  bool unload_lora_broadcast(const std::string& lora_name) override;
 
   bool link_d2d(const std::vector<std::string>& device_ips) override;
 

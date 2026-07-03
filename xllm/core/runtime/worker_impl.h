@@ -140,6 +140,11 @@ class WorkerImpl {
   virtual bool sleep(MasterStatus master_status);
 
   virtual bool wakeup(const WakeupOptions& options);
+  virtual bool load_lora_adapter(const std::string& lora_name,
+                                 const std::string& lora_path,
+                                 const std::string& base_model_name);
+
+  virtual bool unload_lora_adapter(const std::string& lora_name);
 
   virtual folly::SemiFuture<bool> pull_kv_blocks_async(
       uint64_t src_cluster_id,
