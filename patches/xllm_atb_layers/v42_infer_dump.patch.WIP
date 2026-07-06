@@ -1,0 +1,42 @@
+diff --git a/operations/fusion/linear/linear.cpp b/operations/fusion/linear/linear.cpp
+index 9aedeee..1315eb3 100755
+--- a/operations/fusion/linear/linear.cpp
++++ b/operations/fusion/linear/linear.cpp
+@@ -28,6 +28,8 @@
+ #include "operations/aclnn/utils/utils.h"
+ #include "operations/fusion/utils.h"
+ #include "operations/fusion/linear/linear.h"
++#include <sstream>
++#include <cstdio>
+ 
+ namespace atb_speed {
+ namespace common {
+@@ -542,6 +544,28 @@ atb::Status CreateFusionLinear(const FusionLinearParam &param, atb::Operation **
+         } else {
+             outTensorDescs.at(0).shape.dims[outDimSize - 1] = inTensorDescs.at(weightIdx).shape.dims[nDim];
+         }
++        // V42_INFER_DUMP: emit final computed out desc
++        {
++            std::stringstream ss;
++            ss << "op=" << opGraph.name << " out.format=" << (int)outTensorDescs.at(0).format
++               << " out.dtype=" << (int)outTensorDescs.at(0).dtype
++               << " out.dimNum=" << outTensorDescs.at(0).shape.dimNum << " out.dims=[";
++            for (uint64_t i = 0; i < outTensorDescs.at(0).shape.dimNum; ++i) {
++                if (i) ss << ",";
++                ss << outTensorDescs.at(0).shape.dims[i];
++            }
++            ss << "] weight.format=" << (int)inTensorDescs.at(weightIdx).format
++               << " weight.dimNum=" << inTensorDescs.at(weightIdx).shape.dimNum
++               << " weight.dims=[";
++            for (uint64_t i = 0; i < inTensorDescs.at(weightIdx).shape.dimNum; ++i) {
++                if (i) ss << ",";
++                ss << inTensorDescs.at(weightIdx).shape.dims[i];
++            }
++            ss << "]";
++            ATB_SPEED_LOG_ERROR("[V42_INFER_DUMP] " << ss.str());
++            fprintf(stderr, "[V42_INFER_DUMP] %s\n", ss.str().c_str());
++            fflush(stderr);
++        }
+         return atb::NO_ERROR;
+     };
+ 

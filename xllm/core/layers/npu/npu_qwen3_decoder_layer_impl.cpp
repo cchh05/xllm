@@ -18,7 +18,9 @@ limitations under the License.
 #include <glog/logging.h>
 #include <mstx/ms_tools_ext.h>
 
+#include <atomic>
 #include <map>
+#include <sstream>
 
 #include "common/global_flags.h"
 #include "common/rec_model_utils.h"
@@ -512,6 +514,35 @@ void NpuQwen3DecoderLayerImpl::build_node_variant_pack(
     lora_B_mlp_gu_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_mlp_gu_);
     lora_A_mlp_down_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_mlp_down_);
     lora_B_mlp_down_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_mlp_down_);
+
+    // V42_DUMP_KWEIGHT_LORA: emit only from layer 0 first forward
+    // (avoid 36x noise). Compare base K weight (post-loader NZ cast)
+    // vs lora_B_kv_ (post-Step2 NZ cast) desc as atb sees them.
+    static std::atomic<bool> dumped{false};
+    if (!dumped.exchange(true)) {
+      const auto& kw = atb_weight_tensors_[10];  // IN_K_WEIGHT
+      auto dumpDesc = [](const char* name, const atb::Tensor& t) {
+        std::stringstream ss;
+        ss << name << " format=" << (int)t.desc.format
+           << " dtype=" << (int)t.desc.dtype
+           << " dimNum=" << t.desc.shape.dimNum << " dims=[";
+        for (uint64_t i = 0; i < t.desc.shape.dimNum; ++i) {
+          if (i) ss << ",";
+          ss << t.desc.shape.dims[i];
+        }
+        ss << "] deviceData=" << t.deviceData;
+        LOG(ERROR) << "[V42_DUMP_KWEIGHT_LORA] " << ss.str();
+      };
+      dumpDesc("input_x (activation)", internal_tensors_);
+      dumpDesc("IN_K_WEIGHT (base)", kw);
+      dumpDesc("lora_A_qkv (LoRA A shared)", lora_A_qkv_);
+      dumpDesc("lora_B_kv (LoRA B for K/V)", lora_B_kv_);
+      dumpDesc("lora_B_q (LoRA B for Q)", lora_B_q_);
+      // Also raw at:: sizes (torch view)
+      LOG(ERROR) << "[V42_DUMP_KWEIGHT_LORA] at_lora_A_qkv_.sizes()="
+                 << at_lora_A_qkv_.sizes()
+                 << " at_lora_B_kv_.sizes()=" << at_lora_B_kv_.sizes();
+    }
 
     // Q proj: A_qkv, B_q
     node.variantPack.inTensors.at(input_idx++) = lora_A_qkv_;
