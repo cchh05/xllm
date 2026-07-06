@@ -52,9 +52,12 @@ void NpuQwen3DecoderLayerImpl::param_from_args(
   param.loraEnableGMM = false;
   param.enableXattention = is_rec_multi_round_mode();
 
+  // Path B: K (slot 1) and V (slot 2) linears actually execute in NoPack,
+  // so their transposeType must be NOT_TRANSPOSE (matching Q). Prior INVALID
+  // was a placeholder valid only for the Pack path where K/V slots were unused.
   param.linearTransposeType = {static_cast<int>(TransposeType::NOT_TRANSPOSE),
-                               static_cast<int>(TransposeType::INVALID),
-                               static_cast<int>(TransposeType::INVALID),
+                               static_cast<int>(TransposeType::NOT_TRANSPOSE),
+                               static_cast<int>(TransposeType::NOT_TRANSPOSE),
                                static_cast<int>(TransposeType::NOT_TRANSPOSE),
                                static_cast<int>(TransposeType::NOT_TRANSPOSE),
                                static_cast<int>(TransposeType::INVALID),
@@ -114,15 +117,25 @@ void NpuQwen3DecoderLayerImpl::initialize_parallel_parameters(
 void NpuQwen3DecoderLayerImpl::initialize_quantization_parameters(
     atb_speed::qwen::QwenLayerParam& param) {
   if (quantize_type_.empty()) {
+    // Path B: K (slot 1) and V (slot 2) linears actually execute in
+    // NoPack, so their descs must reflect BF16 -- not INVALID -- to
+    // route them to GetLinearQuantType's NO_QUANT branch. Slot 5
+    // (mlp gate/up second half) stays INVALID because the current
+    // MLP fusion still packs gate+up.
     param.linearDescs = {static_cast<int>(LinearTypeV2::BFLOAT16),
-                         static_cast<int>(LinearTypeV2::INVALID),
-                         static_cast<int>(LinearTypeV2::INVALID),
+                         static_cast<int>(LinearTypeV2::BFLOAT16),
+                         static_cast<int>(LinearTypeV2::BFLOAT16),
                          static_cast<int>(LinearTypeV2::BFLOAT16),
                          static_cast<int>(LinearTypeV2::BFLOAT16),
                          static_cast<int>(LinearTypeV2::INVALID),
                          static_cast<int>(LinearTypeV2::BFLOAT16)};
-    param.packQuantType = {static_cast<int>(PackType::PACK_QUANT_UNDEFINED),
-                           static_cast<int>(PackType::PACK_QUANT_UNDEFINED)};
+    // Path B: force atb_speed NoPack branch. CheckPack returns false when
+    // packQuantType is not in the pack allowlist (ALL_FP/ALL_W8A8/...);
+    // MIX_W8A8 is the smallest lie that keeps BF16 quant math untouched
+    // (the actual dtype comes from linearDescs above), while forcing the
+    // three-linear NoPack QKV path so LoRA slots line up.
+    param.packQuantType = {static_cast<int>(PackType::MIX_W8A8),
+                           static_cast<int>(PackType::MIX_W8A8)};
     param.linearQuantType = {static_cast<int>(LinearType::INVALID),
                              static_cast<int>(LinearType::INVALID),
                              static_cast<int>(LinearType::INVALID),

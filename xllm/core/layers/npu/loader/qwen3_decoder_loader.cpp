@@ -218,29 +218,22 @@ void Qwen3DecoderLoader::merge_loaded_weights() {
   if (quantize_type_.compare("w8a8") == 0) {
     at_weight_tensors_[IN_ATTENTION_OUT_DEQSCALE] =
         at_weight_tensors_[IN_ATTENTION_OUT_DEQSCALE].to(torch::kFloat32);
+    // Path B W8A8: skip the QKV dequant/bias fuse. atb NoPack path reads
+    // per-linear dequant/bias/offset/scale from in_qkv_*_1/2 slots.
+    // Convert types in-place instead of via cat.
     at_weight_tensors_[IN_Q_DEQSCALE] =
-        torch::cat({at_weight_tensors_[IN_Q_DEQSCALE],
-                    at_weight_tensors_[IN_K_DEQSCALE],
-                    at_weight_tensors_[IN_V_DEQSCALE]},
-                   0)
-            .to(torch::kFloat32);
-
-    at_weight_tensors_[IN_Q_BIAS] = torch::cat({at_weight_tensors_[IN_Q_BIAS],
-                                                at_weight_tensors_[IN_K_BIAS],
-                                                at_weight_tensors_[IN_V_BIAS]},
-                                               0)
-                                        .to(torch::kInt32);
-
-    for (auto idx : {IN_K_DEQSCALE,
-                     IN_V_DEQSCALE,
-                     IN_K_BIAS,
-                     IN_V_BIAS,
-                     IN_K_OFFSET,
-                     IN_V_OFFSET,
-                     IN_K_SCALE,
-                     IN_V_SCALE}) {
-      at_weight_tensors_[idx] = at_placeholder_;
-    }
+        at_weight_tensors_[IN_Q_DEQSCALE].to(torch::kFloat32);
+    at_weight_tensors_[IN_K_DEQSCALE] =
+        at_weight_tensors_[IN_K_DEQSCALE].to(torch::kFloat32);
+    at_weight_tensors_[IN_V_DEQSCALE] =
+        at_weight_tensors_[IN_V_DEQSCALE].to(torch::kFloat32);
+    at_weight_tensors_[IN_Q_BIAS] =
+        at_weight_tensors_[IN_Q_BIAS].to(torch::kInt32);
+    at_weight_tensors_[IN_K_BIAS] =
+        at_weight_tensors_[IN_K_BIAS].to(torch::kInt32);
+    at_weight_tensors_[IN_V_BIAS] =
+        at_weight_tensors_[IN_V_BIAS].to(torch::kInt32);
+    // Path B: no wipe of K/V dequant/bias/offset/scale.
 
     at_weight_tensors_[IN_MLP_W2_BIAS] =
         torch::cat({at_weight_tensors_[IN_MLP_W2_BIAS],
@@ -280,14 +273,20 @@ void Qwen3DecoderLoader::merge_loaded_weights() {
     }
   }
 
-  auto new_q_weight = torch::cat({at_weight_tensors_[IN_Q_WEIGHT],
-                                  at_weight_tensors_[IN_K_WEIGHT],
-                                  at_weight_tensors_[IN_V_WEIGHT]},
-                                 0)
-                          .transpose(0, 1);
-
+  // Path B: NoPack branch keeps Q/K/V as three independent weights so
+  // atb_speed's AddQNormLinearNode/AddKNormLinearNode/AddVNormLinearNode
+  // each get their own weight slot (in_qkv_weight_0/1/2). Each is NZ
+  // format cast independently, mirroring what the pack path does for
+  // the fused slot but three times.
   at_weight_tensors_[IN_Q_WEIGHT] = at_npu::native::npu_format_cast(
-      new_q_weight.contiguous(), ACL_FORMAT_FRACTAL_NZ);
+      at_weight_tensors_[IN_Q_WEIGHT].transpose(0, 1).contiguous(),
+      ACL_FORMAT_FRACTAL_NZ);
+  at_weight_tensors_[IN_K_WEIGHT] = at_npu::native::npu_format_cast(
+      at_weight_tensors_[IN_K_WEIGHT].transpose(0, 1).contiguous(),
+      ACL_FORMAT_FRACTAL_NZ);
+  at_weight_tensors_[IN_V_WEIGHT] = at_npu::native::npu_format_cast(
+      at_weight_tensors_[IN_V_WEIGHT].transpose(0, 1).contiguous(),
+      ACL_FORMAT_FRACTAL_NZ);
 
   at_weight_tensors_[IN_ATTENTION_OUT_WEIGHT] = at_npu::native::npu_format_cast(
       at_weight_tensors_[IN_ATTENTION_OUT_WEIGHT].transpose(0, 1).contiguous(),
@@ -305,8 +304,11 @@ void Qwen3DecoderLoader::merge_loaded_weights() {
       at_weight_tensors_[IN_MLP_CPROJ_WEIGHT].transpose(0, 1).contiguous(),
       ACL_FORMAT_FRACTAL_NZ);
 
-  for (auto idx :
-       {IN_MLP_W1_WEIGHT, IN_K_WEIGHT, IN_V_WEIGHT, IN_K_BIAS, IN_V_BIAS}) {
+  // Path B: keep IN_K_WEIGHT / IN_V_WEIGHT / IN_K_BIAS / IN_V_BIAS
+  // populated -- atb_speed NoPack path will read them from
+  // in_qkv_weight_1 / in_qkv_weight_2 slots. Only IN_MLP_W1_WEIGHT is
+  // still fused into IN_MLP_W2_WEIGHT above and therefore wiped.
+  for (auto idx : {IN_MLP_W1_WEIGHT}) {
     at_weight_tensors_[idx] = at_placeholder_;
   }
 

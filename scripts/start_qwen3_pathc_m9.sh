@@ -8,6 +8,7 @@ rm -f core.*
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
+export LD_LIBRARY_PATH=/export/home/caihao.40/xllm_multilora/third_party/xllm_ops/build:${LD_LIBRARY_PATH:-}
 export ASCEND_RT_VISIBLE_DEVICES=0
 export HCCL_IF_BASE_PORT=43432
 
