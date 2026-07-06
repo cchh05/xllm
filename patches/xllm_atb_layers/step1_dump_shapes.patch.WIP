@@ -1,0 +1,71 @@
+diff --git a/operations/fusion/linear/linear.cpp b/operations/fusion/linear/linear.cpp
+index 9aedeee..aa1c379 100755
+--- a/operations/fusion/linear/linear.cpp
++++ b/operations/fusion/linear/linear.cpp
+@@ -28,6 +28,7 @@
+ #include "operations/aclnn/utils/utils.h"
+ #include "operations/fusion/utils.h"
+ #include "operations/fusion/linear/linear.h"
++#include <sstream>
+ 
+ namespace atb_speed {
+ namespace common {
+@@ -694,6 +695,58 @@ atb::Status CreateFusionLinearWithLora(const FusionLinearParam &param, atb::Oper
+     addNode.outTensorIds = {GetTensorIdx(tensorMap, "out")};
+     opGraph.nodes.push_back(addNode);
+ 
++    // step1_dump_shapes: outer inferShapeFunc that logs the input desc
++    // of CreateFusionLinearWithLora (before sub-op InferShapes run) and
++    // is called at the outer level once atb's shape propagation reaches
++    // us. Note that inTensorDescs here are the OUTER graph's input, not
++    // the base_linear_out / lora_b_out we care about. So instead we
++    // rely on atb's existing sub-op InferShapes and just add a static
++    // log that prints tensorMap indices we bind.
++    ATB_SPEED_LOG_ERROR("[step1_dump] LinearWithLora tensorMap:"
++        " in_input=" << GetTensorIdx(tensorMap, "in_input")
++        << " in_weight=" << GetTensorIdx(tensorMap, "in_weight")
++        << " in_lora_a=" << GetTensorIdx(tensorMap, "in_lora_a")
++        << " in_lora_b=" << GetTensorIdx(tensorMap, "in_lora_b")
++        << " intermediate_base_linear_out=" << GetTensorIdx(tensorMap, "intermediate_base_linear_out")
++        << " intermediate_lora_a_out=" << GetTensorIdx(tensorMap, "intermediate_lora_a_out")
++        << " intermediate_lora_b_out=" << GetTensorIdx(tensorMap, "intermediate_lora_b_out")
++        << " out=" << GetTensorIdx(tensorMap, "out"));
++
++    opGraph.inferShapeFunc = [=](const atb::SVector<atb::TensorDesc> &inTensorDescs,
++                                 atb::SVector<atb::TensorDesc> &outTensorDescs) {
++        uint32_t inputIdx = GetTensorIdx(tensorMap, "in_input");
++        uint32_t weightIdx = GetTensorIdx(tensorMap, "in_weight");
++        uint32_t loraAIdx = GetTensorIdx(tensorMap, "in_lora_a");
++        uint32_t loraBIdx = GetTensorIdx(tensorMap, "in_lora_b");
++
++        auto dumpDesc = [](const atb::TensorDesc& d) {
++            std::stringstream ss;
++            ss << "format=" << (int)d.format << " dtype=" << (int)d.dtype
++               << " dimNum=" << d.shape.dimNum << " dims=[";
++            for (uint64_t i = 0; i < d.shape.dimNum; ++i) {
++                if (i) ss << ",";
++                ss << d.shape.dims[i];
++            }
++            ss << "]";
++            return ss.str();
++        };
++        ATB_SPEED_LOG_ERROR("[step1_dump] in_input " << dumpDesc(inTensorDescs.at(inputIdx)));
++        ATB_SPEED_LOG_ERROR("[step1_dump] in_weight " << dumpDesc(inTensorDescs.at(weightIdx)));
++        ATB_SPEED_LOG_ERROR("[step1_dump] in_lora_a " << dumpDesc(inTensorDescs.at(loraAIdx)));
++        ATB_SPEED_LOG_ERROR("[step1_dump] in_lora_b " << dumpDesc(inTensorDescs.at(loraBIdx)));
++
++        // Compute out shape same as CreateFusionLinear (this satisfies the
++        // outer graph requirement introduced in Method C).
++        outTensorDescs.at(0).format = inTensorDescs.at(inputIdx).format;
++        outTensorDescs.at(0).dtype = param.isBF16 ? ACL_BF16 : ACL_FLOAT16;
++        outTensorDescs.at(0).shape = inTensorDescs.at(inputIdx).shape;
++        auto outDimSize = outTensorDescs.at(0).shape.dimNum;
++        int nDim = param.transposeType == TransposeType::TRANSPOSE ? 0 : 1;
++        outTensorDescs.at(0).shape.dims[outDimSize - 1] =
++            inTensorDescs.at(weightIdx).shape.dims[nDim];
++        return atb::NO_ERROR;
++    };
++
+     CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(opGraph, operation));
+     return atb::NO_ERROR;
+ }

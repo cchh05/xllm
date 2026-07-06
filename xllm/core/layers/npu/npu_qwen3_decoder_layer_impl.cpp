@@ -222,6 +222,11 @@ NpuQwen3DecoderLayerImpl::NpuQwen3DecoderLayerImpl(const ModelContext& context)
     // Note: forward crashes with err 8 in ElewiseOperation node[3] of
     // LinearWithLora K linear regardless of these shape choices.
     // Root cause remains under investigation.
+    // atb LinearOperation reads weight.shape[1] as "k" (input dim), so B
+    // must be [n, k] = [out_features, rank] = PEFT-standard storage,
+    // NOT [r, n] as the xllm_atb_layers doc claims. Confirmed by Step 1
+    // shape dump: activation_last_dim=32 (rank) but weight.shape[1]=1024
+    // (kv_hidden) triggered "inTensor0 k = 32, inTensor1 k = 1024" err 8.
     at_lora_A_qkv_ = torch::zeros({rank, hidden}, lora_opts);       // [r, k]
     at_lora_B_q_ = torch::zeros({rank, hidden}, lora_opts);         // [r, n]
     at_lora_B_kv_ = torch::zeros({rank, kv_hidden}, lora_opts);     // [r, n]
