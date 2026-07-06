@@ -104,6 +104,38 @@ class NpuQwen3DecoderLayerImpl : public BaseLayer {
 
   at::Tensor at_placeholder_;
 
+  // Path B Week 3: LoRA A/B zero tensors, correctly shaped so atb graph
+  // inference-shape check passes when enableLora=true. Real per-adapter
+  // weights (Week 3-5) will replace these tensors' storage in-place via
+  // aten::copy_. Shapes assume rank=max_lora_rank (32), TP=1.
+  //   *_A: [rank, in_features]        (transpose=TRANSPOSE for LoRA A)
+  //   *_B: [rank, out_features]       (transpose=NOT_TRANSPOSE)
+  at::Tensor at_lora_A_qkv_;       // [rank, hidden]        Q/K/V input dim
+  at::Tensor at_lora_B_q_;         // [rank, hidden]        Q output dim
+  at::Tensor at_lora_B_kv_;        // [rank, kv_hidden]     K/V output dim
+  at::Tensor at_lora_A_dense_;     // [rank, hidden]        o_proj input
+  at::Tensor at_lora_B_dense_;     // [rank, hidden]        o_proj output
+  at::Tensor at_lora_A_mlp_gu_;    // [rank, hidden]        gate/up input
+  at::Tensor at_lora_B_mlp_gu_;    // [rank, intermediate]  gate/up output
+  at::Tensor at_lora_A_mlp_down_;  // [rank, intermediate]  down input
+  at::Tensor at_lora_B_mlp_down_;  // [rank, hidden]        down output
+
+  atb::Tensor lora_A_qkv_;
+  atb::Tensor lora_B_q_;
+  atb::Tensor lora_B_kv_;
+  atb::Tensor lora_A_dense_;
+  atb::Tensor lora_B_dense_;
+  atb::Tensor lora_A_mlp_gu_;
+  atb::Tensor lora_B_mlp_gu_;
+  atb::Tensor lora_A_mlp_down_;
+  atb::Tensor lora_B_mlp_down_;
+
+  // int64 [num_seq] host tensor for atb GroupMatmul boundary. Set to a
+  // single-element {batch_tokens} placeholder in single-adapter mode.
+  at::Tensor at_seq_len_cum_sum_;
+  atb::Tensor seq_len_cum_sum_;
+  std::vector<int64_t> seq_len_cum_sum_vec_;
+
   int device_id_;
   int32_t layer_id_;
   int rank_id_;

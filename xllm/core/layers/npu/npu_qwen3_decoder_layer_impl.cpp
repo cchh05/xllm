@@ -22,6 +22,7 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "common/rec_model_utils.h"
+#include "core/framework/lora/lora_config.h"
 
 // #include "attn_mask.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
@@ -49,6 +50,15 @@ void NpuQwen3DecoderLayerImpl::param_from_args(
   param.isPrefill = isPrefill;
   param.isBF16 = args.dtype() == "bfloat16";
   param.enableSplitFuse = FLAGS_enable_chunked_prefill && isPrefill;
+  // Path B Week 3: enable atb native LoRA channel. Even without any real
+  // adapter loaded, this attaches 15 additional runtime tensor slots
+  // (in_seq_len_cum_sum + 8 attn A/B + 6 mlp A/B) which we bind to
+  // placeholder tensors in build_node_variant_pack. AddQNormLinearNode /
+  // AddKNormLinearNode / AddVNormLinearNode etc. add optional lora
+  // sub-nodes when supportLora=true (=enableLora). GMM = false for now:
+  // MVP is single adapter per batch; multi-adapter mixed batching (which
+  // needs GroupMatmul) is P0-C1 stage 3.
+  param.enableLora = FLAGS_enable_lora;
   param.loraEnableGMM = false;
   param.enableXattention = is_rec_multi_round_mode();
 
@@ -187,6 +197,51 @@ NpuQwen3DecoderLayerImpl::NpuQwen3DecoderLayerImpl(const ModelContext& context)
   placeholder_ = atb_speed::Utils::AtTensor2Tensor(
       torch::zeros({1}).to(device_).to(dtype_));
   at_placeholder_ = torch::zeros({1}).to(device_).to(dtype_);
+
+  // Path B Week 3: pre-allocate correctly-shaped zero tensors for LoRA
+  // A/B slots. When enableLora=true and no real adapter loaded, these
+  // are all zero -> lora_delta = 0 -> baseline preserved.
+  {
+    const int64_t rank = FLAGS_max_lora_rank > 0 ? FLAGS_max_lora_rank : 32;
+    const int64_t hidden = model_args.hidden_size();
+    const int64_t inter = model_args.intermediate_size();
+    // Compute kv_hidden per rank based on TP world_size and n_kv_heads.
+    const auto kv_head_opt = model_args.n_kv_heads();
+    const int64_t n_kv_heads =
+        static_cast<int64_t>(kv_head_opt.value()) / parallel_args.world_size();
+    const int64_t head_dim = model_args.head_dim();
+    const int64_t kv_hidden = n_kv_heads * head_dim;
+
+    auto lora_opts = torch::TensorOptions().dtype(dtype_).device(device_);
+    at_lora_A_qkv_ = torch::zeros({rank, hidden}, lora_opts);
+    at_lora_B_q_ = torch::zeros({rank, hidden}, lora_opts);
+    at_lora_B_kv_ = torch::zeros({rank, kv_hidden}, lora_opts);
+    at_lora_A_dense_ = torch::zeros({rank, hidden}, lora_opts);
+    at_lora_B_dense_ = torch::zeros({rank, hidden}, lora_opts);
+    at_lora_A_mlp_gu_ = torch::zeros({rank, hidden}, lora_opts);
+    at_lora_B_mlp_gu_ = torch::zeros({rank, inter}, lora_opts);
+    at_lora_A_mlp_down_ = torch::zeros({rank, inter}, lora_opts);
+    at_lora_B_mlp_down_ = torch::zeros({rank, hidden}, lora_opts);
+
+    lora_A_qkv_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_qkv_);
+    lora_B_q_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_q_);
+    lora_B_kv_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_kv_);
+    lora_A_dense_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_dense_);
+    lora_B_dense_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_dense_);
+    lora_A_mlp_gu_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_mlp_gu_);
+    lora_B_mlp_gu_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_mlp_gu_);
+    lora_A_mlp_down_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_mlp_down_);
+    lora_B_mlp_down_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_mlp_down_);
+
+    // seq_len_cum_sum: atb reads value from hostData (int64 pointer);
+    // tensor itself lives on device just as shape/dtype descriptor.
+    // Follow the kv_seq_lens pattern: device tensor + parallel std::vector
+    // updated at forward time (avoids CPU->NPU copy in forward).
+    at_seq_len_cum_sum_ = torch::ones(
+        {1}, torch::TensorOptions().dtype(torch::kInt64).device(device_));
+    seq_len_cum_sum_ = atb_speed::Utils::AtTensor2Tensor(at_seq_len_cum_sum_);
+    seq_len_cum_sum_vec_.assign(1, 1);
+  }
   if (FLAGS_enable_manual_loader) {
     loader_ = std::make_unique<Qwen3DecoderManualLoader>(
         WEIGHT_COUNT_PER_LAYER,
@@ -376,6 +431,55 @@ void NpuQwen3DecoderLayerImpl::build_node_variant_pack(
     node.variantPack.inTensors.at(input_idx++) =
         atb_speed::Utils::AtTensor2Tensor(
             input_params.graph_buffer.tiling_data);
+  }
+
+  // Path B Week 3: bind LoRA runtime tensors after the default runtime
+  // block. When enableLora=true, atb qwen3 layer expects 15 additional
+  // slots at [input_idx..input_idx+14]:
+  //   +0: in_seq_len_cum_sum      (int64 host tensor)
+  //   +1..+2: in_qkv_lora_a_0/b_0 (Q proj)
+  //   +3..+4: in_qkv_lora_a_1/b_1 (K proj)
+  //   +5..+6: in_qkv_lora_a_2/b_2 (V proj)
+  //   +7..+8: in_qkv_dense_lora_a/b (o proj)
+  //   +9..+10: in_mlp_lora_a_0/b_0 (gate proj)
+  //   +11..+12: in_mlp_lora_a_1/b_1 (up proj)
+  //   +13..+14: in_mlp_down_lora_a/b (down proj)
+  //
+  // MVP first pass: bind everything to `placeholder_` (torch::zeros({1}))
+  // so atb graph can build. When atb sees a placeholder shape [1] it
+  // still reads through the LoRA sub-graph nodes but their contribution
+  // is effectively zero (matmul(x, zeros) = 0). Semantically identical
+  // to base model. Real per-adapter tensor binding follows in a later
+  // commit once M2 loader emits per-proj A/B pairs and LoRARuntime
+  // exposes them here.
+  if (prefill_param_.enableLora) {
+    // seq_len_cum_sum: single-element {n_tokens} for single-adapter mode.
+    const int64_t n_tokens = x.size(0);
+    seq_len_cum_sum_vec_[0] = n_tokens;
+    seq_len_cum_sum_.hostData = seq_len_cum_sum_vec_.data();
+    node.variantPack.inTensors.at(input_idx++) = seq_len_cum_sum_;
+
+    // Q proj: A_qkv, B_q
+    node.variantPack.inTensors.at(input_idx++) = lora_A_qkv_;
+    node.variantPack.inTensors.at(input_idx++) = lora_B_q_;
+    // K proj: A_qkv, B_kv
+    node.variantPack.inTensors.at(input_idx++) = lora_A_qkv_;
+    node.variantPack.inTensors.at(input_idx++) = lora_B_kv_;
+    // V proj: A_qkv, B_kv
+    node.variantPack.inTensors.at(input_idx++) = lora_A_qkv_;
+    node.variantPack.inTensors.at(input_idx++) = lora_B_kv_;
+    // o proj (dense)
+    node.variantPack.inTensors.at(input_idx++) = lora_A_dense_;
+    node.variantPack.inTensors.at(input_idx++) = lora_B_dense_;
+    // MLP gate
+    node.variantPack.inTensors.at(input_idx++) = lora_A_mlp_gu_;
+    node.variantPack.inTensors.at(input_idx++) = lora_B_mlp_gu_;
+    // MLP up
+    node.variantPack.inTensors.at(input_idx++) = lora_A_mlp_gu_;
+    node.variantPack.inTensors.at(input_idx++) = lora_B_mlp_gu_;
+    // MLP down
+    node.variantPack.inTensors.at(input_idx++) = lora_A_mlp_down_;
+    node.variantPack.inTensors.at(input_idx++) = lora_B_mlp_down_;
   }
 
   for (size_t i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {

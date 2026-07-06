@@ -129,6 +129,7 @@ cc_library(
   DEPS
     "-Wl,--whole-archive"
     "-Wl,--no-whole-archive"
+    :lora
     :attention_mask
     :kv_cache
     :prefix_cache
