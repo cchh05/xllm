@@ -213,15 +213,19 @@ NpuQwen3DecoderLayerImpl::NpuQwen3DecoderLayerImpl(const ModelContext& context)
     const int64_t kv_hidden = n_kv_heads * head_dim;
 
     auto lora_opts = torch::TensorOptions().dtype(dtype_).device(device_);
-    at_lora_A_qkv_ = torch::zeros({rank, hidden}, lora_opts);
-    at_lora_B_q_ = torch::zeros({rank, hidden}, lora_opts);
-    at_lora_B_kv_ = torch::zeros({rank, kv_hidden}, lora_opts);
-    at_lora_A_dense_ = torch::zeros({rank, hidden}, lora_opts);
-    at_lora_B_dense_ = torch::zeros({rank, hidden}, lora_opts);
-    at_lora_A_mlp_gu_ = torch::zeros({rank, hidden}, lora_opts);
-    at_lora_B_mlp_gu_ = torch::zeros({rank, inter}, lora_opts);
-    at_lora_A_mlp_down_ = torch::zeros({rank, inter}, lora_opts);
-    at_lora_B_mlp_down_ = torch::zeros({rank, hidden}, lora_opts);
+    // Path B Week 3 empirical: try PEFT-standard B layout [n, r]. Real
+    // PEFT adapter (adamkarvonen taboo-ship) stores B as [out_features,
+    // rank] = e.g. [4096, 32] for q_proj. atb doc says [r, n] but real
+    // adapter shape suggests atb accepts PEFT storage as-is.
+    at_lora_A_qkv_ = torch::zeros({hidden, rank}, lora_opts);       // [k, r]
+    at_lora_B_q_ = torch::zeros({rank, hidden}, lora_opts);         // [r, n]
+    at_lora_B_kv_ = torch::zeros({rank, kv_hidden}, lora_opts);     // [r, n]
+    at_lora_A_dense_ = torch::zeros({hidden, rank}, lora_opts);     // [k, r]
+    at_lora_B_dense_ = torch::zeros({rank, hidden}, lora_opts);     // [r, n]
+    at_lora_A_mlp_gu_ = torch::zeros({hidden, rank}, lora_opts);    // [k, r]
+    at_lora_B_mlp_gu_ = torch::zeros({rank, inter}, lora_opts);     // [r, n]
+    at_lora_A_mlp_down_ = torch::zeros({inter, rank}, lora_opts);   // [k, r]
+    at_lora_B_mlp_down_ = torch::zeros({rank, hidden}, lora_opts);  // [r, n]
 
     // Path B Week 3: keep LoRA tensors in ND (default) format. FRACTAL_NZ
     // padding rewrites shape to [in/16, out/16, 16, 16], which breaks atb's
@@ -452,8 +456,22 @@ void NpuQwen3DecoderLayerImpl::build_node_variant_pack(
     // seq_len_cum_sum: single-element {n_tokens} for single-adapter mode.
     const int64_t n_tokens = x.size(0);
     seq_len_cum_sum_vec_[0] = n_tokens;
+    // Regenerate atb tensor descriptors every forward. atb tensor descs
+    // seem to get zeroed after graph setup, so re-materialize from the
+    // at::Tensor storage each time.
+    seq_len_cum_sum_ = atb_speed::Utils::AtTensor2Tensor(at_seq_len_cum_sum_);
     seq_len_cum_sum_.hostData = seq_len_cum_sum_vec_.data();
     node.variantPack.inTensors.at(input_idx++) = seq_len_cum_sum_;
+
+    lora_A_qkv_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_qkv_);
+    lora_B_q_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_q_);
+    lora_B_kv_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_kv_);
+    lora_A_dense_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_dense_);
+    lora_B_dense_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_dense_);
+    lora_A_mlp_gu_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_mlp_gu_);
+    lora_B_mlp_gu_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_mlp_gu_);
+    lora_A_mlp_down_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_mlp_down_);
+    lora_B_mlp_down_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_mlp_down_);
 
     // Q proj: A_qkv, B_q
     node.variantPack.inTensors.at(input_idx++) = lora_A_qkv_;
