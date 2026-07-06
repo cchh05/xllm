@@ -79,6 +79,7 @@ class LoRARuntime {
   // Deactivate an adapter by name. If it was the active one, active_delta
   // will subsequently return std::nullopt.
   bool unload(const std::string& lora_name);
+  const LoRAConfig& config_snapshot() const { return config_; }
 
   LoRARegistry& registry() { return registry_; }
   const LoRARegistry& registry() const { return registry_; }

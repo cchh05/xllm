@@ -8,6 +8,7 @@ rm -f core.*
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
+export LD_LIBRARY_PATH=/export/home/caihao.40/xllm_multilora/third_party/xllm_ops/build:${LD_LIBRARY_PATH:-}
 export ASCEND_RT_VISIBLE_DEVICES=0
 export HCCL_IF_BASE_PORT=43432
 
@@ -43,7 +44,7 @@ nohup "$XLLM_BIN" \
   --enable_shm=true \
   --enable_lora \
   --max_loras=16 \
-  --max_lora_rank=32 \
+  --max_lora_rank=32 --lora_modules=biz-A-v1=/tmp/dummy_adapter \
   --node_rank=0 > "$LOG_FILE" 2>&1 &
 
 echo "[OK] xllm launched, PID=$!"

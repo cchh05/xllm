@@ -133,6 +133,64 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
                 << " dtype=" << cached_lora_A_.dtype()
                 << " (dummy content, per-adapter fill deferred to P0-B)";
     }
+
+    // ===== Route F: static --lora-modules preload =====
+    // At this point we're inside QWen3ModelImpl ctor, which runs on the
+    // WorkerImpl::threadpool_ init task. That is the exact thread that
+    // calls set_device()/init_device_context() at line 137-138 of
+    // worker_impl.cpp -- the ONE thread whose CANN device context and
+    // torch_npu opapi memcpy stream are wired up. .to(device) on this
+    // thread is safe.
+    //
+    // Business tenants list adapters via --lora-modules NAME=PATH on
+    // the CLI. We drain that list synchronously so /v1/lora_adapters
+    // returns them from the moment HTTP starts serving. This mirrors
+    // vLLM's --lora-modules static preload semantics.
+    {
+      const auto& cfg = LoRARuntime::instance().config_snapshot();
+      if (cfg.enable_lora && !cfg.lora_modules.empty()) {
+        LOG(INFO) << "[Route F] preloading " << cfg.lora_modules.size()
+                  << " static adapter(s) from --lora-modules";
+        for (const auto& [name, path] : cfg.lora_modules) {
+          auto id = LoRARuntime::instance().load_and_activate(name, path, "");
+          if (!id.has_value()) {
+            LOG(ERROR) << "[Route F] preload FAILED '" << name
+                       << "' path=" << path;
+            continue;
+          }
+          // load_and_activate leaves the tensors on CPU as pending. Call
+          // active_delta() to promote them, then migrate to device on
+          // this thread (which owns the correct NPU context).
+          auto ad_opt = LoRARuntime::instance().active_delta();
+          if (!ad_opt.has_value()) {
+            LOG(ERROR) << "[Route F] no active_delta after load '" << name
+                       << "'";
+            continue;
+          }
+          try {
+            auto A_dev = ad_opt->A.to(options.device()).contiguous();
+            auto B_dev = ad_opt->B.to(options.device()).contiguous();
+            const int64_t r = A_dev.size(0);
+            if (r > cached_lora_A_.size(0)) {
+              LOG(ERROR) << "[Route F] adapter '" << name << "' rank " << r
+                         << " exceeds max_r " << cached_lora_A_.size(0);
+              continue;
+            }
+            // Copy real weights into pre-allocated slot [0:r]. Values
+            // beyond r are still random but are never read (forward
+            // slices to r).
+            cached_lora_A_.slice(0, 0, r).copy_(A_dev);
+            cached_lora_B_.slice(1, 0, r).copy_(B_dev);
+            LOG(INFO) << "[Route F] preload OK '" << name << "' id=" << *id
+                      << " r=" << r << " scaling=" << ad_opt->scaling
+                      << " (real PEFT weights baked into slot [0:" << r << "])";
+          } catch (const std::exception& e) {
+            LOG(ERROR) << "[Route F] .to(device) failed for '" << name
+                       << "': " << e.what();
+          }
+        }
+      }
+    }
   }
 
   torch::Tensor deepstack_process(torch::Tensor hidden_states,
