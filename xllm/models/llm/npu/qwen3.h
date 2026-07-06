@@ -133,6 +133,44 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
                 << " dtype=" << cached_lora_A_.dtype()
                 << " (dummy content, per-adapter fill deferred to P0-B)";
     }
+
+    // ================== V60_CTOR_TO_DEVICE experiment ==================
+    // Question: can the model-ctor thread perform an actual CPU->NPU
+    // .to() copy? Prior experiments showed forward-thread and API-thread
+    // .to() crash with aclrtMemcpy 107017. Route F showed the model-init
+    // stage AFTER layer construction also crashes. But this is BEFORE any
+    // decoder layer is built (we are inside the model ctor immediately
+    // after cache slot pre-allocation via device allocator).
+    //
+    // Success criterion: log both markers V60_ENTER and V60_EXIT.
+    // Failure criterion: crash on the .to() line -> V60_ENTER logs but
+    // V60_EXIT never logs.
+    try {
+      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] ENTER: creating CPU tensor "
+                    "[32, 4096] float32";
+      auto cpu_opts =
+          torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+      torch::Tensor cpu_tensor = torch::randn({32, 4096}, cpu_opts);
+      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] cpu_tensor.device="
+                 << cpu_tensor.device() << " dtype=" << cpu_tensor.dtype()
+                 << " sizes=" << cpu_tensor.sizes();
+
+      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] BEFORE .to(" << options.device()
+                 << ", " << options.dtype() << ")";
+      torch::Tensor npu_tensor =
+          cpu_tensor.to(options.device(), options.dtype().toScalarType());
+      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] AFTER .to(): npu_tensor.device="
+                 << npu_tensor.device() << " dtype=" << npu_tensor.dtype()
+                 << " sizes=" << npu_tensor.sizes();
+
+      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] EXIT: SUCCESS -- ctor thread "
+                    "CAN do CPU->NPU .to()";
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] EXIT: EXCEPTION: " << e.what();
+    } catch (...) {
+      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] EXIT: UNKNOWN EXCEPTION";
+    }
+    // ================== end V60_CTOR_TO_DEVICE ==================
   }
 
   torch::Tensor deepstack_process(torch::Tensor hidden_states,
