@@ -217,14 +217,19 @@ NpuQwen3DecoderLayerImpl::NpuQwen3DecoderLayerImpl(const ModelContext& context)
     // PEFT adapter (adamkarvonen taboo-ship) stores B as [out_features,
     // rank] = e.g. [4096, 32] for q_proj. atb doc says [r, n] but real
     // adapter shape suggests atb accepts PEFT storage as-is.
-    at_lora_A_qkv_ = torch::zeros({hidden, rank}, lora_opts);       // [k, r]
+    // Path B Week 3: pre-alloc zero LoRA tensors matching atb doc layout.
+    // A: [r, k] (transposeB=true), B: [r, n] (transposeB=false).
+    // Note: forward crashes with err 8 in ElewiseOperation node[3] of
+    // LinearWithLora K linear regardless of these shape choices.
+    // Root cause remains under investigation.
+    at_lora_A_qkv_ = torch::zeros({rank, hidden}, lora_opts);       // [r, k]
     at_lora_B_q_ = torch::zeros({rank, hidden}, lora_opts);         // [r, n]
     at_lora_B_kv_ = torch::zeros({rank, kv_hidden}, lora_opts);     // [r, n]
-    at_lora_A_dense_ = torch::zeros({hidden, rank}, lora_opts);     // [k, r]
+    at_lora_A_dense_ = torch::zeros({rank, hidden}, lora_opts);     // [r, k]
     at_lora_B_dense_ = torch::zeros({rank, hidden}, lora_opts);     // [r, n]
-    at_lora_A_mlp_gu_ = torch::zeros({hidden, rank}, lora_opts);    // [k, r]
+    at_lora_A_mlp_gu_ = torch::zeros({rank, hidden}, lora_opts);    // [r, k]
     at_lora_B_mlp_gu_ = torch::zeros({rank, inter}, lora_opts);     // [r, n]
-    at_lora_A_mlp_down_ = torch::zeros({inter, rank}, lora_opts);   // [k, r]
+    at_lora_A_mlp_down_ = torch::zeros({rank, inter}, lora_opts);   // [r, k]
     at_lora_B_mlp_down_ = torch::zeros({rank, hidden}, lora_opts);  // [r, n]
 
     // Path B Week 3: keep LoRA tensors in ND (default) format. FRACTAL_NZ

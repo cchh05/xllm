@@ -1,0 +1,46 @@
+diff --git a/operations/fusion/linear/linear.cpp b/operations/fusion/linear/linear.cpp
+index 9aedeee..5d4aca0 100755
+--- a/operations/fusion/linear/linear.cpp
++++ b/operations/fusion/linear/linear.cpp
+@@ -682,7 +682,8 @@ atb::Status CreateFusionLinearWithLora(const FusionLinearParam &param, atb::Oper
+         CHECK_OPERATION_STATUS_RETURN(AddImMask(opGraph, tensorMap));
+     }
+     CHECK_OPERATION_STATUS_RETURN(AddLoraA(opGraph, loraLinearParam, tensorMap));
+-    loraLinearParam.transposeType = NOT_TRANSPOSE;
++    // Method B: change B transposeType to TRANSPOSE so B is [n, r] (PEFT)
++    loraLinearParam.transposeType = TRANSPOSE;
+     CHECK_OPERATION_STATUS_RETURN(AddLoraB(opGraph, loraLinearParam, tensorMap));
+ 
+     // translatedBasetranslatedLineartranslatedLora Lineartranslated
+@@ -694,6 +695,31 @@ atb::Status CreateFusionLinearWithLora(const FusionLinearParam &param, atb::Oper
+     addNode.outTensorIds = {GetTensorIdx(tensorMap, "out")};
+     opGraph.nodes.push_back(addNode);
+ 
++    // Path B Method C: CreateFusionLinearWithLora inferShape.
++    // When enableLora=true and this graph is embedded inside a bigger
++    // graph (like NormLinear -> LinearWithLora -> ...), the outer
++    // graph builds its InferShape by delegating to sub-op InferShapes
++    // via tensorDescs propagation. Without an explicit inferShapeFunc
++    // the outer graph gets zero-length shape metadata for our "out"
++    // tensor, and downstream ElewiseAdd shape check fails with err 8.
++    //
++    // Compute output shape identically to CreateFusionLinear's
++    // inferShape: dims copied from in_input, last dim replaced with
++    // in_weight.dims[nDim] (where nDim = param.transposeType == TRANSPOSE ? 0 : 1).
++    opGraph.inferShapeFunc = [=](const atb::SVector<atb::TensorDesc> &inTensorDescs,
++                                 atb::SVector<atb::TensorDesc> &outTensorDescs) {
++        uint32_t inputIdx = GetTensorIdx(tensorMap, "in_input");
++        uint32_t weightIdx = GetTensorIdx(tensorMap, "in_weight");
++        outTensorDescs.at(0).format = inTensorDescs.at(inputIdx).format;
++        outTensorDescs.at(0).dtype = param.isBF16 ? ACL_BF16 : ACL_FLOAT16;
++        outTensorDescs.at(0).shape = inTensorDescs.at(inputIdx).shape;
++        auto outDimSize = outTensorDescs.at(0).shape.dimNum;
++        int nDim = param.transposeType == TransposeType::TRANSPOSE ? 0 : 1;
++        outTensorDescs.at(0).shape.dims[outDimSize - 1] =
++            inTensorDescs.at(weightIdx).shape.dims[nDim];
++        return atb::NO_ERROR;
++    };
++
+     CHECK_OPERATION_STATUS_RETURN(atb::CreateOperation(opGraph, operation));
+     return atb::NO_ERROR;
+ }
