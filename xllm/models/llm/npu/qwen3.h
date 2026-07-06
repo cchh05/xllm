@@ -134,43 +134,50 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
                 << " (dummy content, per-adapter fill deferred to P0-B)";
     }
 
-    // ================== V60_CTOR_TO_DEVICE experiment ==================
-    // Question: can the model-ctor thread perform an actual CPU->NPU
-    // .to() copy? Prior experiments showed forward-thread and API-thread
-    // .to() crash with aclrtMemcpy 107017. Route F showed the model-init
-    // stage AFTER layer construction also crashes. But this is BEFORE any
-    // decoder layer is built (we are inside the model ctor immediately
-    // after cache slot pre-allocation via device allocator).
+    // ================== Path C prod v3: static adapter preload ==============
+    // The V60 experiment (2026-07-06 22:34, commit c98a22fa) proved that
+    // this ctor thread has a valid NPU context and CPU->NPU .to() works
+    // here (the same call from forward or the API thread crashes with
+    // aclrtMemcpy 107017). We use that window to load any --lora-modules
+    // adapters end-to-end and place their real weights on device.
     //
-    // Success criterion: log both markers V60_ENTER and V60_EXIT.
-    // Failure criterion: crash on the .to() line -> V60_ENTER logs but
-    // V60_EXIT never logs.
-    try {
-      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] ENTER: creating CPU tensor "
-                    "[32, 4096] float32";
-      auto cpu_opts =
-          torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
-      torch::Tensor cpu_tensor = torch::randn({32, 4096}, cpu_opts);
-      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] cpu_tensor.device="
-                 << cpu_tensor.device() << " dtype=" << cpu_tensor.dtype()
-                 << " sizes=" << cpu_tensor.sizes();
-
-      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] BEFORE .to(" << options.device()
-                 << ", " << options.dtype() << ")";
-      torch::Tensor npu_tensor =
-          cpu_tensor.to(options.device(), options.dtype().toScalarType());
-      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] AFTER .to(): npu_tensor.device="
-                 << npu_tensor.device() << " dtype=" << npu_tensor.dtype()
-                 << " sizes=" << npu_tensor.sizes();
-
-      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] EXIT: SUCCESS -- ctor thread "
-                    "CAN do CPU->NPU .to()";
-    } catch (const std::exception& e) {
-      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] EXIT: EXCEPTION: " << e.what();
-    } catch (...) {
-      LOG(ERROR) << "[V60_CTOR_TO_DEVICE] EXIT: UNKNOWN EXCEPTION";
+    // Result: /v1/models lists them at boot, requests routed by
+    // model="adapter-name" pick up real deltas immediately, and the
+    // dynamic /v1/load_lora_adapter path is left as a P0-C follow-up
+    // (needs a pinned executor thread from ctor to accept post-init
+    // load tasks).
+    if (LoRARuntime::instance().enabled()) {
+      const auto& modules = LoRARuntime::instance().config().lora_modules;
+      if (modules.empty()) {
+        LOG(INFO)
+            << "[Path C prod v3] --lora-modules empty; skipping static preload";
+      } else {
+        LOG(INFO) << "[Path C prod v3] preloading " << modules.size()
+                  << " static adapter(s) on " << options.device()
+                  << " dtype=" << options.dtype();
+        int ok = 0, failed = 0;
+        for (const auto& [name, path] : modules) {
+          auto id = LoRARuntime::instance().install_static_adapter_on_device(
+              name,
+              path,
+              /*base_model_name=*/"",  // caller trusts the map, no cross-check
+              options.device(),
+              options.dtype().toScalarType());
+          if (id.has_value()) {
+            ++ok;
+            LOG(INFO) << "[Path C prod v3] preloaded '" << name
+                      << "' id=" << *id << " from " << path;
+          } else {
+            ++failed;
+            LOG(ERROR) << "[Path C prod v3] failed to preload '" << name
+                       << "' from " << path;
+          }
+        }
+        LOG(INFO) << "[Path C prod v3] preload done: ok=" << ok
+                  << " failed=" << failed;
+      }
     }
-    // ================== end V60_CTOR_TO_DEVICE ==================
+    // ================== end Path C prod v3 static preload ==================
   }
 
   torch::Tensor deepstack_process(torch::Tensor hidden_states,
@@ -350,10 +357,26 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
                     << " (using pre-allocated dummy weights until real"
                        " weight-fill lands in P0-B)";
         }
-        auto A_view = cached_lora_A_.slice(0, 0, cached_lora_r_);
-        auto B_view = cached_lora_B_.slice(1, 0, cached_lora_r_);
-        auto tmp = torch::matmul(h, A_view.transpose(0, 1));
-        auto delta = torch::matmul(tmp, B_view.transpose(0, 1));
+        // Path C prod v3: prefer real device tensors from active_delta().
+        // ad->A is [rank, hidden] on device, ad->B is [hidden, rank] on
+        // device (either from install_static_adapter_on_device at ctor
+        // time or a legacy dummy fill). Use them directly, not the
+        // cached_lora_A_/B_ slice which was sized for the max_r pool.
+        const auto& real_A = ad->A;
+        const auto& real_B = ad->B;
+        // Guard: if for some reason the tensors are still on CPU (legacy
+        // dummy path) fall back to the cached device pool so we don't
+        // crash trying to do matmul across device boundaries.
+        torch::Tensor A_use, B_use;
+        if (real_A.defined() && real_A.device() == h.device()) {
+          A_use = real_A;
+          B_use = real_B;
+        } else {
+          A_use = cached_lora_A_.slice(0, 0, cached_lora_r_);
+          B_use = cached_lora_B_.slice(1, 0, cached_lora_r_);
+        }
+        auto tmp = torch::matmul(h, A_use.transpose(0, 1));
+        auto delta = torch::matmul(tmp, B_use.transpose(0, 1));
         h = h + delta * cached_lora_scaling_;
       }
 

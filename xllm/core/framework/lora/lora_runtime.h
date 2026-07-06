@@ -76,12 +76,33 @@ class LoRARuntime {
                                             const std::string& lora_path,
                                             const std::string& base_model_name);
 
+  // Path C prod v3 static preload path.
+  //
+  // Load a PEFT adapter from disk, pick a whole-block A/B pair, cast to
+  // the given dtype, .to(device) IN THIS THREAD, register it with the
+  // registry, and install it as the currently active adapter with
+  // *device-side* tensors. Callable ONLY from a thread with a valid NPU
+  // context (in practice: QWen3ModelImpl ctor). If called after
+  // model init has completed the .to(device) will crash with
+  // aclrtMemcpy 107017 -- see docs/lora_investigation.
+  //
+  // Distinct from load_and_activate() which keeps tensors on CPU and
+  // defers migration; that path is broken on CANN 8.5 + torch_npu 2.7.1
+  // and only survives via ctor-time dummy fill.
+  std::optional<uint64_t> install_static_adapter_on_device(
+      const std::string& lora_name,
+      const std::string& lora_path,
+      const std::string& base_model_name,
+      torch::Device device,
+      torch::ScalarType dtype);
+
   // Deactivate an adapter by name. If it was the active one, active_delta
   // will subsequently return std::nullopt.
   bool unload(const std::string& lora_name);
 
   LoRARegistry& registry() { return registry_; }
   const LoRARegistry& registry() const { return registry_; }
+  const LoRAConfig& config() const { return config_; }
 
   // The active whole-block delta tensors. std::nullopt = no adapter, the
   // forward path should just skip its delta step.

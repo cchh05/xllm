@@ -90,11 +90,10 @@ bool LoRARuntime::pick_whole_block_ab(const LoRAAdapter& adapter,
     }
   }
 
-  // Cast to model dtype but STAY ON CPU. The NPU migration is deferred to
-  // active_delta() so it runs on the model forward thread with the
-  // correct aclrtSetDevice context.
-  *A_out = A_out->to(dtype).contiguous();
-  *B_out = B_out->to(dtype).contiguous();
+  // PICK_NO_CAST_APPLIED: skipping in-place .to(dtype) here — safetensors
+  // mmap tensor + torch::to on CPU crashes torch_npu's opapi allocator on
+  // ctor thread. Callers (install_static / load_and_activate) do their
+  // own clone + cast now.
   return true;
 }
 
@@ -148,6 +147,98 @@ std::optional<uint64_t> LoRARuntime::load_and_activate(
             << " B_cpu.shape=" << B_cpu.sizes()
             << " scaling=" << adapter_opt->scaling
             << " (device migration deferred to first forward)";
+  return id_opt;
+}
+
+std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device(
+    const std::string& lora_name,
+    const std::string& lora_path,
+    const std::string& base_model_name,
+    torch::Device device,
+    torch::ScalarType dtype) {
+  if (!enabled()) {
+    LOG(ERROR) << "[LoRARuntime] not enabled; refuse to install '" << lora_name
+               << "'";
+    return std::nullopt;
+  }
+  if (!loader_) {
+    LOG(ERROR) << "[LoRARuntime] loader not initialised";
+    return std::nullopt;
+  }
+
+  LoRARequest req{lora_name, /*int_id=*/0, lora_path, base_model_name};
+  auto adapter_opt = loader_->load(req);
+  if (!adapter_opt) return std::nullopt;
+
+  // PICK_BRACKET_APPLIED: log before/after to isolate the crash location.
+  LOG(INFO) << "[LoRARuntime] BEFORE pick_whole_block_ab for '" << lora_name
+            << "'";
+  torch::Tensor A_cpu, B_cpu;
+  if (!pick_whole_block_ab(*adapter_opt, dtype, &A_cpu, &B_cpu)) {
+    LOG(ERROR) << "[LoRARuntime] pick_whole_block_ab returned false";
+    return std::nullopt;
+  }
+  LOG(INFO) << "[LoRARuntime] AFTER pick_whole_block_ab: A=" << A_cpu.sizes()
+            << " B=" << B_cpu.sizes() << " A.dtype=" << A_cpu.dtype()
+            << " A.device=" << A_cpu.device();
+
+  // KEY DIFFERENCE vs load_and_activate: perform the CPU->NPU migration
+  // on this thread, which is the model ctor thread and thus has a valid
+  // NPU context (V60 experiment 2026-07-06 confirmed).
+  // STATIC_TO_CLONE_APPLIED: safetensors-loaded tensors have mmap backing
+  // that crashes torch_npu's opapi copy from ctor thread. Clone to a fresh
+  // cpu allocator buffer, then .to(device).
+  LOG(INFO) << "[LoRARuntime] static preload '" << lora_name
+            << "' A_cpu.dtype=" << A_cpu.dtype() << " sizes=" << A_cpu.sizes()
+            << " storage=" << A_cpu.storage().nbytes() << "B";
+  // DIRECT_TO_APPLIED: even .clone() crashes on safetensors mmap tensors on
+  // ctor thread. Try single-step .to(device, dtype).
+  //
+  // Strategy: build a fresh CPU tensor via torch::empty (same allocator as
+  // V60 randn) and copy_ from mmap tensor - this materializes into normal
+  // heap. Then .to(device) proceeds.
+  torch::Tensor A_dev, B_dev;
+  try {
+    LOG(INFO) << "[LoRARuntime] materializing A_cpu via torch::empty+copy_";
+    auto cpu_opts =
+        torch::TensorOptions().dtype(A_cpu.dtype()).device(torch::kCPU);
+    torch::Tensor A_cpu_owned = torch::empty(A_cpu.sizes(), cpu_opts);
+    A_cpu_owned.copy_(A_cpu);
+    torch::Tensor B_cpu_owned = torch::empty(B_cpu.sizes(), cpu_opts);
+    B_cpu_owned.copy_(B_cpu);
+    LOG(INFO) << "[LoRARuntime] materialized; casting + moving to " << device;
+    A_dev = A_cpu_owned.to(device, dtype);
+    LOG(INFO) << "[LoRARuntime] A_dev on " << A_dev.device()
+              << " dtype=" << A_dev.dtype() << " sizes=" << A_dev.sizes();
+    B_dev = B_cpu_owned.to(device, dtype);
+    LOG(INFO) << "[LoRARuntime] B_dev on " << B_dev.device()
+              << " dtype=" << B_dev.dtype() << " sizes=" << B_dev.sizes();
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "[LoRARuntime] .to(device) failed for static adapter '"
+               << lora_name << "': " << e.what();
+    return std::nullopt;
+  }
+
+  const auto id_opt = registry_.register_adapter(req);
+  if (!id_opt) return std::nullopt;
+
+  {
+    std::lock_guard g(materialise_mu_);
+    ActiveDelta ad;
+    ad.A = A_dev;
+    ad.B = B_dev;
+    ad.scaling = adapter_opt->scaling;
+    ad.name = lora_name;
+    ad.int_id = *id_opt;
+    active_ = std::move(ad);
+    // Static preload wins over any pending -- unload() and future
+    // load_and_activate() calls behave normally.
+    pending_.reset();
+  }
+  LOG(INFO) << "[LoRARuntime] installed static adapter '" << lora_name
+            << "' id=" << *id_opt << " A_device=" << A_dev.device()
+            << " A.shape=" << A_dev.sizes() << " B.shape=" << B_dev.sizes()
+            << " scaling=" << adapter_opt->scaling;
   return id_opt;
 }
 
