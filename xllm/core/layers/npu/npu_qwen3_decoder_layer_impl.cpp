@@ -211,6 +211,9 @@ NpuQwen3DecoderLayerImpl::NpuQwen3DecoderLayerImpl(const ModelContext& context)
         static_cast<int64_t>(kv_head_opt.value()) / parallel_args.world_size();
     const int64_t head_dim = model_args.head_dim();
     const int64_t kv_hidden = n_kv_heads * head_dim;
+    LOG(ERROR) << "[V42_MARKER_LORA_CTOR] enable_lora=" << FLAGS_enable_lora
+               << " kv_hidden=" << kv_hidden << " rank=" << rank
+               << " hidden=" << hidden;
 
     auto lora_opts = torch::TensorOptions().dtype(dtype_).device(device_);
     // Path B Week 3 empirical: try PEFT-standard B layout [n, r]. Real
@@ -227,6 +230,11 @@ NpuQwen3DecoderLayerImpl::NpuQwen3DecoderLayerImpl(const ModelContext& context)
     // NOT [r, n] as the xllm_atb_layers doc claims. Confirmed by Step 1
     // shape dump: activation_last_dim=32 (rank) but weight.shape[1]=1024
     // (kv_hidden) triggered "inTensor0 k = 32, inTensor1 k = 1024" err 8.
+    // atb LinearOperation reads weight.shape[1] as "k" (input dim), so B
+    // must be [n, k] = [out_features, rank] = PEFT-standard storage,
+    // NOT [r, n] as the xllm_atb_layers doc claims. Confirmed by Step 1
+    // shape dump: activation_last_dim=32 (rank) but weight.shape[1]=1024
+    // (kv_hidden) triggered "inTensor0 k = 32, inTensor1 k = 1024" err 8.
     at_lora_A_qkv_ = torch::zeros({rank, hidden}, lora_opts);       // [r, k]
     at_lora_B_q_ = torch::zeros({rank, hidden}, lora_opts);         // [r, n]
     at_lora_B_kv_ = torch::zeros({rank, kv_hidden}, lora_opts);     // [r, n]
@@ -236,6 +244,28 @@ NpuQwen3DecoderLayerImpl::NpuQwen3DecoderLayerImpl(const ModelContext& context)
     at_lora_B_mlp_gu_ = torch::zeros({rank, inter}, lora_opts);     // [r, n]
     at_lora_A_mlp_down_ = torch::zeros({rank, inter}, lora_opts);   // [r, k]
     at_lora_B_mlp_down_ = torch::zeros({rank, hidden}, lora_opts);  // [r, n]
+
+    // Path B Week 3 Step 2 test: cast LoRA weights to FRACTAL_NZ so
+    // that lora_b_out has same format as base_out during ElewiseAdd.
+    // Base weights are all NZ-cast in loader (qwen3_decoder_loader.cpp).
+    at_lora_A_qkv_ =
+        at_npu::native::npu_format_cast(at_lora_A_qkv_, ACL_FORMAT_FRACTAL_NZ);
+    at_lora_B_q_ =
+        at_npu::native::npu_format_cast(at_lora_B_q_, ACL_FORMAT_FRACTAL_NZ);
+    at_lora_B_kv_ =
+        at_npu::native::npu_format_cast(at_lora_B_kv_, ACL_FORMAT_FRACTAL_NZ);
+    at_lora_A_dense_ = at_npu::native::npu_format_cast(at_lora_A_dense_,
+                                                       ACL_FORMAT_FRACTAL_NZ);
+    at_lora_B_dense_ = at_npu::native::npu_format_cast(at_lora_B_dense_,
+                                                       ACL_FORMAT_FRACTAL_NZ);
+    at_lora_A_mlp_gu_ = at_npu::native::npu_format_cast(at_lora_A_mlp_gu_,
+                                                        ACL_FORMAT_FRACTAL_NZ);
+    at_lora_B_mlp_gu_ = at_npu::native::npu_format_cast(at_lora_B_mlp_gu_,
+                                                        ACL_FORMAT_FRACTAL_NZ);
+    at_lora_A_mlp_down_ = at_npu::native::npu_format_cast(
+        at_lora_A_mlp_down_, ACL_FORMAT_FRACTAL_NZ);
+    at_lora_B_mlp_down_ = at_npu::native::npu_format_cast(
+        at_lora_B_mlp_down_, ACL_FORMAT_FRACTAL_NZ);
 
     // Path B Week 3: keep LoRA tensors in ND (default) format. FRACTAL_NZ
     // padding rewrites shape to [in/16, out/16, 16, 16], which breaks atb's
