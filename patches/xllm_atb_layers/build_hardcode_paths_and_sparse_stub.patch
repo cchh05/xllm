@@ -1,0 +1,78 @@
+From 602e3a8f34f636444914b948f8369b604ea28eda Mon Sep 17 00:00:00 2001
+From: cchh05 <cchh05@example.com>
+Date: Mon, 6 Jul 2026 23:48:39 +0800
+Subject: [PATCH] build fix: hardcode PYTHON/NPU/ATB paths + stub
+ sparse_flash_attention API mismatch
+
+CMakeLists.txt used $ENV{PYTHON_INCLUDE_PATH} and $ENV{NPU_HOME_PATH}
+which are unset in this container. Result: Python.h not found for
+pytorch/atb_torch/*.cpp, and -I/opp/vendors resolves to nothing so
+xllm_ops aclnn headers are missing. Hardcode the four paths that
+work in this container so cmake regen produces valid -I flags.
+
+sparse_flash_attention_operation.cpp calls the CANN 8.5
+aclnnSparseFlashAttentionGetWorkspaceSize signature that no longer
+matches what libcust_opapi provides -- 22 args but with different
+types (int64_t vs pointers). Qwen3-8B does not use sparse attention;
+stub SetAclNNWorkspaceExecutor to return -1 so the linker keeps the
+symbol but runtime never calls the broken API.
+---
+ CMakeLists.txt                                        |  8 ++++----
+ .../aclnn/ops/sparse_flash_attention_operation.cpp    | 11 +++++++++++
+ 2 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 092fdac..ee5443c 100755
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -50,13 +50,13 @@ endif()
+ 
+ target_include_directories(xllm_atb_layers PRIVATE
+   ${PROJECT_SOURCE_DIR}/third_party/spdlog/include
+-  $ENV{PYTHON_INCLUDE_PATH}
++  /usr/include/python3.11
+   $ENV{PYTORCH_INSTALL_PATH}/include
+   $ENV{PYTORCH_INSTALL_PATH}/include/torch/csrc/api/include
+   $ENV{PYTORCH_NPU_INSTALL_PATH}/include
+-  $ENV{NPU_HOME_PATH}/include
+-  $ENV{ATB_HOME_PATH}/include
+-  $ENV{NPU_HOME_PATH}/opp/vendors/xllm/op_api/include/
++  /usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/include
++  /usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/include
++  /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/xllm/op_api/include/
+ )
+ 
+ if(DEFINED VCPKG_TARGET_TRIPLET)
+diff --git a/operations/aclnn/ops/sparse_flash_attention_operation.cpp b/operations/aclnn/ops/sparse_flash_attention_operation.cpp
+index 370fa3a..3e0b642 100644
+--- a/operations/aclnn/ops/sparse_flash_attention_operation.cpp
++++ b/operations/aclnn/ops/sparse_flash_attention_operation.cpp
+@@ -83,7 +83,16 @@ atb::Status SparseFlashAttentionOperation::CreateAclNNOutTensorVariantPack(const
+     return atb::NO_ERROR;
+ }
+ 
++// SPARSE_STUB_APPLIED: signature mismatch with CANN 8.5.0. Qwen3-8B doesn't
++// use sparse attention; stub the body to return error so linker keeps the
++// symbol but runtime never calls broken API.
+ int SparseFlashAttentionOperation::SetAclNNWorkspaceExecutor()
++{
++    ATB_SPEED_LOG_ERROR(opName_ << " SetAclNNWorkspaceExecutor stubbed (build-time API mismatch)");
++    return -1;
++}
++#if 0  // stub_original_body_disabled
++int SparseFlashAttentionOperation::SetAclNNWorkspaceExecutor_ORIG()
+ {
+     ATB_SPEED_LOG_DEBUG(opName_ << " SetAclNNWorkspaceExecutor start");
+     AclNNVariantPack &aclnnVariantPack = this->aclnnOpCache_->aclnnVariantPack;
+@@ -109,6 +118,8 @@ int SparseFlashAttentionOperation::SetAclNNWorkspaceExecutor()
+     return ret;
+ }
+ 
++#endif  // stub_original_body_disabled
++
+ int SparseFlashAttentionOperation::ExecuteAclNNOp(uint8_t *workspace, aclrtStream &stream)
+ {
+     ATB_SPEED_LOG_DEBUG(opName_ << " ExecuteAclNNOp start");
+-- 
+2.43.0
+

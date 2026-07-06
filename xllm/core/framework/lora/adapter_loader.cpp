@@ -223,7 +223,15 @@ bool LoRAAdapterLoader::load_weights(const std::string& safetensors_path,
                  << "' second dim=" << sizes[1] << " != r=" << out->r;
       return false;
     }
-    out->tensors.emplace(*canon, tensor);
+    // MMAP_CLONE_APPLIED: `tensor` is at::from_blob(mmap_ptr,...) — the mmap
+    // is owned by `sd` which is a local unique_ptr. Once this function
+    // returns and sd destructs, the mmap is unmapped and `tensor` points
+    // into freed memory. Materialize a heap-allocated copy right now.
+    auto owned = torch::empty(
+        tensor.sizes(),
+        torch::TensorOptions().dtype(tensor.dtype()).device(torch::kCPU));
+    owned.copy_(tensor);
+    out->tensors.emplace(*canon, std::move(owned));
     ++taken;
   }
 
