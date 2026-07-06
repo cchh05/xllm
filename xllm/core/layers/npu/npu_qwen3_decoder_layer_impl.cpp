@@ -223,15 +223,11 @@ NpuQwen3DecoderLayerImpl::NpuQwen3DecoderLayerImpl(const ModelContext& context)
     at_lora_A_mlp_down_ = torch::zeros({rank, inter}, lora_opts);
     at_lora_B_mlp_down_ = torch::zeros({rank, hidden}, lora_opts);
 
-    lora_A_qkv_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_qkv_);
-    lora_B_q_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_q_);
-    lora_B_kv_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_kv_);
-    lora_A_dense_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_dense_);
-    lora_B_dense_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_dense_);
-    lora_A_mlp_gu_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_mlp_gu_);
-    lora_B_mlp_gu_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_mlp_gu_);
-    lora_A_mlp_down_ = atb_speed::Utils::AtTensor2Tensor(at_lora_A_mlp_down_);
-    lora_B_mlp_down_ = atb_speed::Utils::AtTensor2Tensor(at_lora_B_mlp_down_);
+    // Path B Week 3: keep LoRA tensors in ND (default) format. FRACTAL_NZ
+    // padding rewrites shape to [in/16, out/16, 16, 16], which breaks atb's
+    // 2-dim shape check on the lora sub-graph InferShape (base_out is 2-dim
+    // [batch, hidden] and expects lora_b_out to be exactly 2-dim). ND format
+    // preserves [rank, hidden] as-reported.
 
     // seq_len_cum_sum: atb reads value from hostData (int64 pointer);
     // tensor itself lives on device just as shape/dtype descriptor.
