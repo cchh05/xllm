@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "lora_runtime.h"
 
+#include <acl/acl.h>
 #include <glog/logging.h>
 
 #include <mutex>
@@ -90,11 +91,57 @@ bool LoRARuntime::pick_whole_block_ab(const LoRAAdapter& adapter,
     }
   }
 
-  // Cast to model dtype but STAY ON CPU. The NPU migration is deferred to
-  // active_delta() so it runs on the model forward thread with the
-  // correct aclrtSetDevice context.
+  // Cast to model dtype but STAY ON CPU. HtoD copy happens below via
+  // raw aclrtMemcpy (Route B).
   *A_out = A_out->to(dtype).contiguous();
   *B_out = B_out->to(dtype).contiguous();
+  return true;
+}
+
+// Route B helper: raw aclrtMemcpy from a contiguous CPU tensor into a
+// freshly-allocated NPU tensor. Bypasses torch_npu's opapi memcpy stream
+// (which is per-thread) so this works from any thread that has run
+// aclrtSetDevice for the target device. Mirrors vLLM's use of raw
+// cudaMemcpy on CUDA.
+static bool cpu_to_npu_via_aclrt(const torch::Tensor& cpu_src,
+                                 torch::Device device,
+                                 torch::ScalarType dtype,
+                                 torch::Tensor* dev_out,
+                                 std::string* err_out) {
+  if (!cpu_src.is_contiguous()) {
+    *err_out = "source tensor not contiguous";
+    return false;
+  }
+  aclError set_err = aclrtSetDevice(static_cast<int32_t>(device.index()));
+  if (set_err != ACL_ERROR_NONE) {
+    *err_out = "aclrtSetDevice(" + std::to_string(device.index()) +
+               ") failed: " + std::to_string(set_err);
+    return false;
+  }
+  auto opts = torch::TensorOptions().dtype(dtype).device(device);
+  torch::Tensor dst;
+  try {
+    dst = torch::empty(cpu_src.sizes(), opts);
+  } catch (const std::exception& e) {
+    *err_out = std::string("torch::empty on device failed: ") + e.what();
+    return false;
+  }
+  const size_t nbytes = static_cast<size_t>(cpu_src.nbytes());
+  aclError err = aclrtMemcpy(dst.data_ptr(),
+                             nbytes,
+                             cpu_src.data_ptr(),
+                             nbytes,
+                             ACL_MEMCPY_HOST_TO_DEVICE);
+  if (err != ACL_ERROR_NONE) {
+    *err_out = "aclrtMemcpy H2D failed: " + std::to_string(err);
+    return false;
+  }
+  aclError sync_err = aclrtSynchronizeDevice();
+  if (sync_err != ACL_ERROR_NONE) {
+    *err_out = "aclrtSynchronizeDevice failed: " + std::to_string(sync_err);
+    return false;
+  }
+  *dev_out = dst;
   return true;
 }
 
@@ -108,15 +155,17 @@ std::optional<uint64_t> LoRARuntime::load_and_activate(
     return std::nullopt;
   }
   torch::ScalarType dtype = torch::kFloat32;
+  torch::Device device = torch::kCPU;
   {
     std::lock_guard g(materialise_mu_);
-    if (!model_dtype_.has_value()) {
-      LOG(ERROR) << "[LoRARuntime] model has not registered dtype yet; "
-                    "reject load '"
+    if (!model_dtype_.has_value() || !model_device_.has_value()) {
+      LOG(ERROR) << "[LoRARuntime] model has not registered device/dtype yet;"
+                    " reject load '"
                  << lora_name << "'";
       return std::nullopt;
     }
     dtype = *model_dtype_;
+    device = *model_device_;
   }
 
   LoRARequest req{lora_name, /*int_id=*/0, lora_path, base_model_name};
@@ -132,22 +181,37 @@ std::optional<uint64_t> LoRARuntime::load_and_activate(
     return std::nullopt;
   }
 
+  // Route B: raw aclrtMemcpy. Works from any thread (worker threadpool,
+  // API handler, model-init) as long as aclrtSetDevice has been called.
+  // This is the community-aligned pattern -- vLLM uses cudaMemcpy for
+  // adapter uploads on CUDA for exactly the same reason.
+  torch::Tensor A_dev, B_dev;
+  {
+    std::string err_a, err_b;
+    if (!cpu_to_npu_via_aclrt(A_cpu, device, dtype, &A_dev, &err_a)) {
+      LOG(ERROR) << "[LoRARuntime] Route B copy A failed for '" << lora_name
+                 << "': " << err_a;
+      return std::nullopt;
+    }
+    if (!cpu_to_npu_via_aclrt(B_cpu, device, dtype, &B_dev, &err_b)) {
+      LOG(ERROR) << "[LoRARuntime] Route B copy B failed for '" << lora_name
+                 << "': " << err_b;
+      return std::nullopt;
+    }
+  }
+
   const auto id_opt = registry_.register_adapter(req);
   if (!id_opt) return std::nullopt;
 
   {
     std::lock_guard g(materialise_mu_);
-    pending_ =
-        PendingDelta{A_cpu, B_cpu, adapter_opt->scaling, lora_name, *id_opt};
-    // Clear the previous active adapter -- next forward will materialise
-    // the new one on device.
-    active_.reset();
+    active_ =
+        ActiveDelta{A_dev, B_dev, adapter_opt->scaling, lora_name, *id_opt};
   }
-  LOG(INFO) << "[LoRARuntime] queued '" << lora_name << "' id=" << *id_opt
-            << " A_cpu.shape=" << A_cpu.sizes()
-            << " B_cpu.shape=" << B_cpu.sizes()
+  LOG(INFO) << "[LoRARuntime] activated '" << lora_name << "' id=" << *id_opt
+            << " A.shape=" << A_dev.sizes() << " B.shape=" << B_dev.sizes()
             << " scaling=" << adapter_opt->scaling
-            << " (device migration deferred to first forward)";
+            << " device=" << A_dev.device() << " (Route B / aclrtMemcpy)";
   return id_opt;
 }
 
@@ -159,42 +223,12 @@ bool LoRARuntime::unload(const std::string& lora_name) {
       active_.reset();
       LOG(INFO) << "[LoRARuntime] deactivated active '" << lora_name << "'";
     }
-    if (pending_ && pending_->name == lora_name) {
-      pending_.reset();
-      LOG(INFO) << "[LoRARuntime] deactivated pending '" << lora_name << "'";
-    }
   }
   return ok;
 }
 
 std::optional<LoRARuntime::ActiveDelta> LoRARuntime::active_delta() {
   std::lock_guard g(materialise_mu_);
-
-  // Fast path: nothing to do.
-  if (!pending_ && !active_) return std::nullopt;
-
-  // Promote pending -> active. We DELIBERATELY leave the tensors on CPU
-  // here even though the model wants them on device: the actual .to(npu)
-  // has to happen on the worker's forward thread AND under the atb path
-  // which has aclrtSetDevice set. Doing it here (from the LoRARuntime
-  // mutex) even on the forward thread crashes with aclrtMemcpy 107017
-  // because torch_npu's opapi copy stream is not attached.
-  //
-  // The caller (qwen3.h forward loop) does the .to(h.device()) inline:
-  // that copy runs in the atb-managed NPU stream and works.
-  if (pending_) {
-    ActiveDelta ad;
-    ad.A = pending_->A_cpu;  // still on CPU
-    ad.B = pending_->B_cpu;  // still on CPU
-    ad.scaling = pending_->scaling;
-    ad.name = pending_->name;
-    ad.int_id = pending_->int_id;
-    active_ = std::move(ad);
-    pending_.reset();
-    LOG(INFO) << "[LoRARuntime] promoted '" << active_->name
-              << "' id=" << active_->int_id
-              << " (CPU-side; caller performs .to(device))";
-  }
   return active_;
 }
 
