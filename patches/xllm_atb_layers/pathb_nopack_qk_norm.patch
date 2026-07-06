@@ -1,0 +1,61 @@
+diff --git a/operations/fusion/attention/qkv_linear_split.cpp b/operations/fusion/attention/qkv_linear_split.cpp
+index fc1d4b7..7c586db 100755
+--- a/operations/fusion/attention/qkv_linear_split.cpp
++++ b/operations/fusion/attention/qkv_linear_split.cpp
+@@ -99,10 +99,15 @@ std::map<std::string, uint32_t> ConstructQKVTensorMap(
+     }
+     if (isPack && !param.enableRopeQuantKvcache) {
+         AddTensorToList(qkvIntermediateTensorCandidates, "qkv_pack", intermediateTensorList);
+-        if (param.useQKNorm) {
+-            AddTensorToList(qkvIntermediateTensorCandidates, "qk_norm", intermediateTensorList);
+-            AddTensorToList(qkvInTensorCandidates, "qk_norm", inTensorList);
+-        }
++    }
++    // Path B fix: NoPack + useQKNorm previously left qk_norm slots unregistered.
++    // Register qk_norm inTensor + intermediate slots regardless of pack mode
++    // whenever useQKNorm=true (for both pack path where intermediate_q/k are
++    // internally split from intermediate_qkv, and NoPack path where they come
++    // from AddQNormLinearNode / AddKNormLinearNode outputs).
++    if (param.useQKNorm && !param.enableRopeQuantKvcache) {
++        AddTensorToList(qkvIntermediateTensorCandidates, "qk_norm", intermediateTensorList);
++        AddTensorToList(qkvInTensorCandidates, "qk_norm", inTensorList);
+     }
+ 
+     // translatedLoratranslatedTensor
+@@ -213,7 +218,10 @@ atb::Status AddQNormLinearNode(const FusionAttentionParam<NormParamType> &param,
+     if (param.enableRopeQuantKvcache) {
+         qOutTensor = {"intermediate_qkv_rope"};
+     } else {
+-        qOutTensor = {isPack ? "intermediate_qkv" : "out_q"};
++        // Path B fix: NoPack + useQKNorm needs Q linear output routed to
++        // intermediate_q so AddQKNormNode can consume it before final out_q.
++        qOutTensor = {isPack ? "intermediate_qkv" :
++            (param.useQKNorm ? "intermediate_q" : "out_q")};
+     }
+     if (param.enableAddNorm) {
+         qOutTensor.push_back("out_add");
+@@ -324,7 +332,10 @@ atb::Status AddKNormLinearNode(const FusionAttentionParam<NormParamType> &param,
+         kInTensor.push_back("in_qkv_lora_b_1");
+     }
+     kNormLinearNode.inTensorIds = GetTensorIdxList(tensorMap, kInTensor);
+-    kNormLinearNode.outTensorIds = {GetTensorIdx(tensorMap, "out_k")};
++    // Path B fix: NoPack + useQKNorm needs K linear output routed to
++    // intermediate_k so AddQKNormNode can consume it before final out_k.
++    kNormLinearNode.outTensorIds = {GetTensorIdx(tensorMap,
++        param.useQKNorm ? "intermediate_k" : "out_k")};
+     opGraph.nodes.push_back(kNormLinearNode);
+     return atb::NO_ERROR;
+ }
+@@ -512,6 +523,12 @@ atb::Status QKVLinearSplit(const FusionAttentionParam<NormParamType> &param, atb
+             }
+             CHECK_OPERATION_STATUS_RETURN(AddKNormLinearNode(param, opGraph, tensorMap, isAntiOutlier));
+             CHECK_OPERATION_STATUS_RETURN(AddVNormLinearNode(param, opGraph, tensorMap, isAntiOutlier));
++            // Path B fix: NoPack path was silently dropping QK Norm even when
++            // useQKNorm=true. Add the AddQKNormNode call here so
++            // intermediate_q/intermediate_k -> out_q/out_k gets applied.
++            if (param.useQKNorm) {
++                CHECK_OPERATION_STATUS_RETURN(AddQKNormNode(param, opGraph, tensorMap));
++            }
+         }
+ 
+         uint32_t inQKVInputIdx = GetTensorIdx(tensorMap, "in_qkv_input");

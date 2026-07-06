@@ -134,8 +134,12 @@ void NpuQwen3DecoderLayerImpl::initialize_quantization_parameters(
     // MIX_W8A8 is the smallest lie that keeps BF16 quant math untouched
     // (the actual dtype comes from linearDescs above), while forcing the
     // three-linear NoPack QKV path so LoRA slots line up.
+    // Path B: only attention QKV needs NoPack (MIX_W8A8). MLP gate+up are
+    // still fused into IN_MLP_W2_WEIGHT by the loader, so MLP must stay in
+    // its Pack path -- keep [1] = PACK_QUANT_UNDEFINED so CheckPack picks up
+    // the linearDescs single-BF16 rule and returns true for MLP.
     param.packQuantType = {static_cast<int>(PackType::MIX_W8A8),
-                           static_cast<int>(PackType::MIX_W8A8)};
+                           static_cast<int>(PackType::PACK_QUANT_UNDEFINED)};
     param.linearQuantType = {static_cast<int>(LinearType::INVALID),
                              static_cast<int>(LinearType::INVALID),
                              static_cast<int>(LinearType::INVALID),
