@@ -807,7 +807,7 @@ bool WorkerImpl::load_lora_adapter(const std::string& lora_name,
   // the whole point of routing the load through a worker RPC rather
   // than doing it in the API handler thread (where CPU->NPU copy fails
   // with aclrtMemcpy 107017 on this CANN 8.5 stack).
-  auto id_opt = LoRARuntime::instance().load_and_activate(
+  auto id_opt = LoRARuntime::instance().load_and_activate_hotswap(
       lora_name, lora_path, base_model_name);
   return id_opt.has_value();
 }

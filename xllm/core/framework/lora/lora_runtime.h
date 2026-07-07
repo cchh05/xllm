@@ -17,10 +17,15 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <atomic>
+#include <condition_variable>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include "adapter_loader.h"
@@ -103,6 +108,15 @@ class LoRARuntime {
   // Populated by install_static_adapter_on_device when it succeeds.
   bool unload(const std::string& lora_name);
 
+  // Path C prod v3 hot-swap: enqueue a load task to the pinned executor
+  // thread which owns the NPU device context. Blocks until the executor
+  // completes the install. Returns the assigned int_id, or nullopt on
+  // failure. Callable from any thread (HTTP handler etc.).
+  std::optional<uint64_t> load_and_activate_hotswap(
+      const std::string& lora_name,
+      const std::string& lora_path,
+      const std::string& base_model_name);
+
   LoRARegistry& registry() { return registry_; }
   const LoRARegistry& registry() const { return registry_; }
   const LoRAConfig& config() const { return config_; }
@@ -167,6 +181,22 @@ class LoRARuntime {
 
   // Currently-active adapter's device tensors. Guarded by materialise_mu_.
   std::optional<ActiveDelta> active_;
+
+  // Path C prod v3 hot-swap: pinned executor thread + task queue.
+  struct LoadTask {
+    std::string name;
+    std::string path;
+    std::string base_model_name;
+    std::promise<std::optional<uint64_t>> result;
+  };
+  std::mutex task_mu_;
+  std::condition_variable task_cv_;
+  std::queue<LoadTask> task_queue_;
+  std::atomic<bool> executor_stop_{false};
+  std::thread executor_thread_;
+  bool executor_started_ = false;
+
+  void executor_loop(int32_t device_index, torch::ScalarType dtype);
 
   // Path C prod v3 multi-adapter: int_id -> device-resident A/B/scaling.
   // Written by install_static_adapter_on_device from ctor thread.

@@ -19,6 +19,10 @@ limitations under the License.
 
 #include <mutex>
 
+#if defined(USE_NPU)
+#include <acl/acl.h>
+#endif
+
 namespace xllm {
 
 LoRARuntime& LoRARuntime::instance() {
@@ -37,11 +41,92 @@ bool LoRARuntime::enabled() const { return config_.enable_lora; }
 
 void LoRARuntime::set_model_device_dtype(torch::Device device,
                                          torch::ScalarType dtype) {
-  std::lock_guard g(materialise_mu_);
-  model_device_ = device;
-  model_dtype_ = dtype;
+  {
+    std::lock_guard g(materialise_mu_);
+    model_device_ = device;
+    model_dtype_ = dtype;
+  }
   LOG(INFO) << "[LoRARuntime] model registered device=" << device
             << " dtype=" << dtype;
+
+  // Path C prod v3 hot-swap: spawn the pinned executor thread here so it
+  // inherits our aclrtSetDevice state (ModelContext ctor called
+  // aclrtSetDevice(device_id) earlier on this same thread).
+  if (!executor_started_) {
+    executor_started_ = true;
+    const int32_t device_index = device.index();
+    executor_thread_ =
+        std::thread(&LoRARuntime::executor_loop, this, device_index, dtype);
+    LOG(INFO) << "[LoRARuntime] spawned hot-swap executor thread for "
+              << device;
+  }
+}
+
+void LoRARuntime::executor_loop(int32_t device_index, torch::ScalarType dtype) {
+#if defined(USE_NPU)
+  aclError ret = aclrtSetDevice(device_index);
+  if (ret != 0) {
+    LOG(ERROR) << "[LoRARuntime] executor_loop aclrtSetDevice(" << device_index
+               << ") failed, err=" << ret;
+    return;
+  }
+#endif
+  LOG(INFO) << "[LoRARuntime] executor_loop entered on device=" << device_index;
+
+  while (!executor_stop_.load()) {
+    LoadTask task;
+    {
+      std::unique_lock<std::mutex> lk(task_mu_);
+      task_cv_.wait(
+          lk, [this] { return executor_stop_.load() || !task_queue_.empty(); });
+      if (executor_stop_.load() && task_queue_.empty()) break;
+      task = std::move(task_queue_.front());
+      task_queue_.pop();
+    }
+
+    LOG(INFO) << "[LoRARuntime] executor picked up task name='" << task.name
+              << "'";
+    torch::Device dev(torch::kPrivateUse1, device_index);
+    auto id_opt = install_static_adapter_on_device(
+        task.name, task.path, task.base_model_name, dev, dtype);
+    task.result.set_value(id_opt);
+  }
+
+  LOG(INFO) << "[LoRARuntime] executor_loop exiting";
+}
+
+std::optional<uint64_t> LoRARuntime::load_and_activate_hotswap(
+    const std::string& lora_name,
+    const std::string& lora_path,
+    const std::string& base_model_name) {
+  if (!enabled()) {
+    LOG(ERROR) << "[LoRARuntime] not enabled; refuse hot-swap for '"
+               << lora_name << "'";
+    return std::nullopt;
+  }
+  if (!executor_started_) {
+    LOG(ERROR) << "[LoRARuntime] executor not started; the model has not "
+                  "called set_model_device_dtype yet";
+    return std::nullopt;
+  }
+
+  LoadTask task;
+  task.name = lora_name;
+  task.path = lora_path;
+  task.base_model_name = base_model_name;
+  auto fut = task.result.get_future();
+
+  {
+    std::lock_guard<std::mutex> lk(task_mu_);
+    task_queue_.push(std::move(task));
+  }
+  task_cv_.notify_one();
+
+  LOG(INFO) << "[LoRARuntime] hot-swap enqueued '" << lora_name << "', waiting";
+  auto id_opt = fut.get();
+  LOG(INFO) << "[LoRARuntime] hot-swap completed '" << lora_name << "' id="
+            << (id_opt.has_value() ? std::to_string(*id_opt) : "nullopt");
+  return id_opt;
 }
 
 bool LoRARuntime::pick_whole_block_ab(const LoRAAdapter& adapter,
