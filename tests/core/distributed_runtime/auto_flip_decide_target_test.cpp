@@ -53,9 +53,12 @@ struct DecideTargetKnobs {
 
 // Mirror of AutoFlipController::heal_active. Kept as a free function so
 // the two callers (DecideTarget below, tests) share a single definition.
+// In v21 this reads max_pending_in_window instead of instantaneous
+// pending; verify_switch 11/18 PARTIAL on 2026-07-07 proved that using
+// the instant sample triggers spurious heal during short-request bursts.
 bool HealActive(int8_t cur_mode,
                 int32_t active_dp_size,
-                size_t pending_requests,
+                size_t max_pending_in_window,
                 const DecideTargetKnobs& k) {
   if (cur_mode != 1 || active_dp_size <= 1 ||
       k.min_pending_per_dp_rank <= 0.0) {
@@ -65,7 +68,7 @@ bool HealActive(int8_t cur_mode,
       k.min_pending_per_dp_rank * static_cast<double>(active_dp_size);
   const size_t min_pending =
       static_cast<size_t>(std::ceil(min_pending_double));
-  return pending_requests < min_pending;
+  return max_pending_in_window < min_pending;
 }
 
 // Mirror of AutoFlipController::decide_target. Kept intentionally free of
@@ -74,9 +77,9 @@ int8_t DecideTarget(int8_t cur_mode,
                     double long_ratio,
                     uint64_t total_in_window,
                     int32_t active_dp_size,
-                    size_t pending_requests,
+                    size_t max_pending_in_window,
                     const DecideTargetKnobs& k = DecideTargetKnobs()) {
-  if (HealActive(cur_mode, active_dp_size, pending_requests, k)) {
+  if (HealActive(cur_mode, active_dp_size, max_pending_in_window, k)) {
     return 0;
   }
   if (total_in_window < k.min_samples) {
@@ -84,6 +87,16 @@ int8_t DecideTarget(int8_t cur_mode,
   }
   if (cur_mode == 0) {
     if (long_ratio < k.long_ratio_deactivate) {
+      // v22: CP -> DP requires enough pending to justify the flip.
+      // Same threshold as heal, using the projected DP dp_size = 2
+      // as a conservative constant (see decide_target comment).
+      if (k.min_pending_per_dp_rank > 0.0) {
+        const size_t min_pending =
+            static_cast<size_t>(std::ceil(k.min_pending_per_dp_rank * 2.0));
+        if (max_pending_in_window < min_pending) {
+          return 0;  // stay CP; not enough concurrency
+        }
+      }
       return 1;
     }
     return 0;
@@ -155,8 +168,29 @@ TEST(AutoFlipDecideTargetTest, DpToCpOnHighLongRatio) {
 }
 
 TEST(AutoFlipDecideTargetTest, CpToDpOnLowLongRatio) {
-  // In CP mode, long_ratio < deactivate flips to DP.
-  EXPECT_EQ(DecideTarget(0, 0.1, 50, 1, 100), 1);
+  // In CP mode, long_ratio < deactivate flips to DP -- but only when
+  // max_pending is high enough to justify DP (v22 CP->DP pending gate).
+  EXPECT_EQ(DecideTarget(0, 0.1, 50, 1, /*max_pending=*/100), 1);
+}
+
+TEST(AutoFlipDecideTargetTest, CpToDpGateBlocksLowPending) {
+  // v22: CP -> DP requires enough concurrency to fill DP dp_ranks.
+  // With low long_ratio (would normally flip to DP) but no concurrency,
+  // stay in CP to avoid ping-pong with the heal path.
+  //
+  // Gate threshold = ceil(min_pending_per_dp_rank * 2) = ceil(2.0 * 2) = 4.
+  // max_pending=3 must NOT flip; max_pending=4 SHOULD flip.
+  EXPECT_EQ(DecideTarget(0, 0.0, 50, 1, /*max_pending=*/0), 0);
+  EXPECT_EQ(DecideTarget(0, 0.0, 50, 1, /*max_pending=*/3), 0);
+  EXPECT_EQ(DecideTarget(0, 0.0, 50, 1, /*max_pending=*/4), 1);
+}
+
+TEST(AutoFlipDecideTargetTest, CpToDpGateDisabled) {
+  // Setting min_pending_per_dp_rank=0 disables both heal and the CP->DP
+  // gate; legacy behavior applies (flip on long_ratio alone).
+  DecideTargetKnobs k;
+  k.min_pending_per_dp_rank = 0.0;
+  EXPECT_EQ(DecideTarget(0, 0.0, 50, 1, 0, k), 1);
 }
 
 TEST(AutoFlipDecideTargetTest, HysteresisBandKeepsMode) {
@@ -214,6 +248,24 @@ TEST(AutoFlipHealActiveTest, RespectsFlagDisable) {
   k.min_pending_per_dp_rank = 0.0;
   EXPECT_FALSE(HealActive(1, 4, 0, k));
   EXPECT_FALSE(HealActive(1, 2, 0, k));
+}
+
+TEST(AutoFlipHealActiveTest, WindowPeakGatesShortBurst) {
+  // v21 regression: heal must gate on the peak of the sliding pending
+  // history, not the instant sample. This is the case that caused
+  // verify_switch 11/18 PARTIAL on 2026-07-07 (short bursts with
+  // max_tokens=6 finish between ticks, instant pending sees 0, heal
+  // triggers spuriously, races with in-flight requests).
+  //
+  // With dp=2 and min_pending_per_dp_rank=2.0 the heal threshold is 4.
+  // Simulating a burst that peaked at 6 within the window but is
+  // currently 0 -- heal MUST NOT fire because we call HealActive
+  // with max_in_window=6, not pending=0.
+  DecideTargetKnobs k;
+  EXPECT_FALSE(HealActive(1, 2, /*max_pending_in_window=*/6, k));
+  // Same instant state but window peak was only 1 (thin all along).
+  // Heal MUST fire.
+  EXPECT_TRUE(HealActive(1, 2, /*max_pending_in_window=*/1, k));
 }
 
 TEST(AutoFlipHealActiveTest, CpModeNeverHeals) {

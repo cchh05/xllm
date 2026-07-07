@@ -16,8 +16,10 @@ limitations under the License.
 #pragma once
 
 #include <atomic>
+#include <deque>
 #include <memory>
 #include <thread>
+#include <utility>
 
 namespace xllm {
 
@@ -64,28 +66,44 @@ class AutoFlipController {
   // colocate + disagg deployments produce the same policy.
   //
   // active_dp_size is the scheduler's live dp_size (post-flip);
-  // pending_requests is the current queued+in-flight request count.
-  // Together they gate the DP-side lopsided-hang mitigation: a DP burst
-  // that starves one dp_rank drives step() into the >100ms backdoor and
-  // the fake-input path in worker_impl (v14 traced this to an ATB
-  // placeholder hang inside the shared decoder layer's DP decode node,
-  // not fixable from xllm). To avoid falling into that path we heal DP
-  // -> CP as soon as concurrency drops below what fills every dp_rank.
+  // max_pending_in_window is the peak pending across the recent heal
+  // window (see record_pending_and_max). Together they gate the DP-side
+  // lopsided-hang mitigation: a DP burst that starves one dp_rank drives
+  // step() into the >100ms backdoor and the fake-input path in
+  // worker_impl (v14 traced this to an ATB placeholder hang inside the
+  // shared decoder layer's DP decode node, not fixable from xllm). To
+  // avoid falling into that path we heal DP -> CP as soon as concurrency
+  // drops below what fills every dp_rank. Using max-in-window rather
+  // than instant pending (v20 -> v21) prevents spurious heal when a
+  // burst briefly drains between ticks.
   int8_t decide_target(int8_t cur_mode,
                        double long_ratio,
                        double pool_pressure,
                        uint64_t total_in_window,
                        int32_t active_dp_size,
-                       size_t pending_requests) const;
+                       size_t max_pending_in_window) const;
 
   // Heal path predicate shared with decide_target. Returns true when we're
   // in DP_DECODE with a lopsided dp layout that would drive step() into the
   // fake-input hang. The tick loop also uses this to bypass the dwell-time
   // gate: waiting out the dwell window during a hang would leave the
   // instance dark.
+  //
+  // max_pending_in_window: peak pending across the last few ticks (see
+  // pending_history_). We heal only when the WHOLE window has been thin,
+  // not just the instantaneous sample -- otherwise a request burst that
+  // completes in <tick_interval leaves pending==0 at sample time and
+  // triggers a spurious heal that races with in-flight requests
+  // (verify_switch 11/18 PARTIAL, 2026-07-07). If the peak in the window
+  // was tall enough to fill every dp_rank, the instance is healthy.
   static bool heal_active(int8_t cur_mode,
                           int32_t active_dp_size,
-                          size_t pending_requests);
+                          size_t max_pending_in_window);
+
+  // Push a (now, pending) sample into pending_history_ and prune anything
+  // older than heal_window_ms. Returns the peak pending in the pruned
+  // history. Called once per tick from run_loop.
+  size_t record_pending_and_max(size_t current_pending);
 
   LLMEngine* engine_ = nullptr;
   ContinuousScheduler* scheduler_ = nullptr;
@@ -97,6 +115,13 @@ class AutoFlipController {
   // Timestamp (absl millis-since-epoch) of the last successful flip.
   // Used to enforce FLAGS_auto_flip_persist_ms minimum dwell time.
   int64_t last_flip_ms_ = 0;
+
+  // Sliding window of (timestamp_ms, pending) samples pushed once per
+  // tick. Used to compute max_pending_in_window for the heal path so
+  // brief request-burst gaps (pending==0 for one tick between a burst
+  // of finished requests and the next arrivals) don't trigger a
+  // spurious heal. Bounded by FLAGS_auto_flip_heal_window_ms.
+  std::deque<std::pair<int64_t, size_t>> pending_history_;
 };
 
 }  // namespace xllm
