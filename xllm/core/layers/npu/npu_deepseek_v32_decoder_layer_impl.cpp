@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "npu_deepseek_v32_decoder_layer_impl.h"
 
+#include <acl/acl.h>  // MEMPROBE: aclrtGetMemInfo for per-layer HBM sampling
 #include <gflags/gflags.h>
 
 #include <algorithm>
@@ -790,8 +791,33 @@ void NpuDeepseekV32DecoderLayerImpl::update_expert_weight() {
 int64_t NpuDeepseekV32DecoderLayerImpl::init_layer() {
   name_ = "deepseek_v2_decoder_layer " + std::to_string(layer_id_);
   model_name_ = "DeepSeek_V2";
+
+  // MEMPROBE: sample NPU HBM before/after this layer's ATB nodes are built.
+  // Both dual-mode and single-mode go through init_layer once per layer;
+  // logging free HBM per layer lets us tell whether the dual-mode overhead
+  // is per-layer (each of the 4 nodes carves its own workspace) or a
+  // one-shot cost. Feature-gated with LOG_FIRST_N so we don't spam the
+  // steady state; each layer prints exactly one before + one after entry.
+  size_t mem_before_free = 0, mem_before_total = 0;
+  aclrtGetMemInfo(ACL_HBM_MEM, &mem_before_free, &mem_before_total);
+  LOG(INFO) << "MEMPROBE v32 layer " << layer_id_
+            << " init_layer BEFORE: free_MiB="
+            << (mem_before_free / (1024 * 1024))
+            << " total_MiB=" << (mem_before_total / (1024 * 1024))
+            << " dual=" << (dual_parallel_args_ != nullptr ? 1 : 0);
+
   CHECK_OPERATION_STATUS_RETURN(init_node(prefill_node_, prefill_param_));
   CHECK_OPERATION_STATUS_RETURN(init_node(decode_node_, decode_param_));
+
+  size_t mem_mid_free = 0, mem_mid_total = 0;
+  aclrtGetMemInfo(ACL_HBM_MEM, &mem_mid_free, &mem_mid_total);
+  LOG(INFO) << "MEMPROBE v32 layer " << layer_id_
+            << " init_layer AFTER_2NODES: free_MiB="
+            << (mem_mid_free / (1024 * 1024))
+            << " delta_MiB="
+            << ((int64_t)mem_before_free - (int64_t)mem_mid_free)
+                   / (1024 * 1024);
+
   // Dual-mode: also init the OTHER side's nodes if a DualParallelArgs is
   // attached. atb_speed::deepseekV2::DecoderLayer creates a fresh
   // atb::Operation graph per call so distinct mappings produce distinct
@@ -803,6 +829,19 @@ int64_t NpuDeepseekV32DecoderLayerImpl::init_layer() {
         init_node(dp_prefill_node_, dp_prefill_param_));
     CHECK_OPERATION_STATUS_RETURN(
         init_node(dp_decode_node_, dp_decode_param_));
+
+    size_t mem_after_free = 0, mem_after_total = 0;
+    aclrtGetMemInfo(ACL_HBM_MEM, &mem_after_free, &mem_after_total);
+    LOG(INFO) << "MEMPROBE v32 layer " << layer_id_
+              << " init_layer AFTER_4NODES: free_MiB="
+              << (mem_after_free / (1024 * 1024))
+              << " delta_since_2nodes_MiB="
+              << ((int64_t)mem_mid_free - (int64_t)mem_after_free)
+                     / (1024 * 1024)
+              << " delta_total_MiB="
+              << ((int64_t)mem_before_free - (int64_t)mem_after_free)
+                     / (1024 * 1024);
+
     LOG_FIRST_N(INFO, 1)
         << "DeepSeek V32 layer " << layer_id_
         << " init_layer: 4 ATB nodes ready (cp_prefill, cp_decode, "
