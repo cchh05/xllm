@@ -89,6 +89,10 @@ struct SequenceParams {
 
   int32_t bos_token_id = 0;
 
+  // LoRA adapter int_id (0 = base only). Propagated to Sequence, then
+  // reported via BatchInputBuilder into ModelInputParams::adapter_ids.
+  uint64_t adapter_id = 0;
+
   // request id for suffix-decoding request identity
   std::string request_id;
 
@@ -196,6 +200,8 @@ class Sequence final {
   }
   Block reset_embedding_block() { return std::move(embedding_block_); }
   const std::string& request_id() const { return request_id_; }
+  uint64_t adapter_id() const { return adapter_id_; }
+  void set_adapter_id(uint64_t v) { adapter_id_ = v; }
   // get input embedding
   torch::Tensor get_input_embedding() const { return input_embedding_; }
 
@@ -535,6 +541,7 @@ class Sequence final {
   std::atomic<bool> last_token_handled_{false};
 
   std::string request_id_;
+  uint64_t adapter_id_ = 0;
 
   // Multi-round beam search result caching
   int32_t beam_width_cached_ = 0;

@@ -96,8 +96,11 @@ class LoRARuntime {
       torch::Device device,
       torch::ScalarType dtype);
 
-  // Deactivate an adapter by name. If it was the active one, active_delta
-  // will subsequently return std::nullopt.
+  // Path C prod v3 multi-adapter: look up the device-resident A/B for a
+  // specific adapter by its int_id. Returns std::nullopt if int_id unknown
+  // or the adapter was installed without a device pool entry.
+  //
+  // Populated by install_static_adapter_on_device when it succeeds.
   bool unload(const std::string& lora_name);
 
   LoRARegistry& registry() { return registry_; }
@@ -121,6 +124,13 @@ class LoRARuntime {
     uint64_t int_id;
   };
   std::optional<ActiveDelta> active_delta();
+
+  // Path C prod v3 multi-adapter: look up the device-resident A/B for a
+  // specific adapter by its int_id. Populated by
+  // install_static_adapter_on_device on ctor thread. Returns nullopt if the
+  // int_id is not known (base-model request or adapter installed without
+  // device weights).
+  std::optional<ActiveDelta> get_delta_by_int_id(uint64_t int_id);
 
  private:
   LoRARuntime() = default;
@@ -157,6 +167,12 @@ class LoRARuntime {
 
   // Currently-active adapter's device tensors. Guarded by materialise_mu_.
   std::optional<ActiveDelta> active_;
+
+  // Path C prod v3 multi-adapter: int_id -> device-resident A/B/scaling.
+  // Written by install_static_adapter_on_device from ctor thread.
+  // Read by get_delta_by_int_id from forward thread. Guarded by
+  // materialise_mu_.
+  std::unordered_map<uint64_t, ActiveDelta> device_pool_;
 };
 
 }  // namespace xllm

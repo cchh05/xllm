@@ -350,6 +350,7 @@ struct ModelInputParams {
     params.dp_global_token_nums = dp_global_token_nums;
     params.dp_is_decode = dp_is_decode;
     params.embedding_ids = std::move(embedding_ids);
+    params.adapter_ids = adapter_ids;
     params.request_ids = std::move(request_ids);
     params.extra_token_ids = std::move(extra_token_ids);
     params.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
@@ -532,6 +533,11 @@ struct ModelInputParams {
 
   // embedding ids of each sequence
   std::vector<int32_t> embedding_ids;
+
+  // LoRA adapter int_id for each sequence, index-aligned with request_ids.
+  // 0 = no adapter (base model). Populated by BatchInputBuilder from
+  // Sequence::adapter_id(). Consumed by model forward to route LoRA delta.
+  std::vector<uint64_t> adapter_ids;
 
   // request ids of each sequence, used by suffix decoding request identity
   std::vector<std::string> request_ids;

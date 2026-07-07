@@ -36,6 +36,7 @@ limitations under the License.
 #include "core/distributed_runtime/llm_master.h"
 #include "core/distributed_runtime/rec_master.h"
 #include "core/distributed_runtime/vlm_master.h"
+#include "core/framework/lora/lora_runtime.h"
 #include "core/framework/request/rec_type.h"
 #include "core/framework/request/request_params.h"
 #include "core/util/utils.h"
@@ -661,7 +662,10 @@ void ChatServiceImpl::process_async_rpc_impl(
   // check if model is supported
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
-  if (unlikely(!models_.contains(model))) {
+  auto lora_pinned = LoRARuntime::instance().enabled()
+                         ? LoRARuntime::instance().registry().lookup(model)
+                         : std::nullopt;
+  if (!lora_pinned.has_value() && unlikely(!models_.contains(model))) {
     CALLBACK_WITH_ERROR(StatusCode::UNKNOWN,
                         "Model not supported",
                         service_request_id,
@@ -670,6 +674,10 @@ void ChatServiceImpl::process_async_rpc_impl(
   }
 
   RequestParams request_params(rpc_request, "", "");
+  if (lora_pinned.has_value()) {
+    request_params.adapter_id = lora_pinned->lora_int_id;
+    request_params.adapter_name = lora_pinned->lora_name;
+  }
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
   for (const auto& message : rpc_request.messages()) {
@@ -733,10 +741,18 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
     return;
   }
 
+  auto lora_pinned_async =
+      LoRARuntime::instance().enabled()
+          ? LoRARuntime::instance().registry().lookup(model)
+          : std::nullopt;
   LLMMaster* master = get_model_master(model);
-  if (unlikely(master == nullptr)) {
+  if (unlikely(master == nullptr) && !lora_pinned_async.has_value()) {
     call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
     return;
+  }
+  if (master == nullptr && lora_pinned_async.has_value()) {
+    master = master_;  // adapter routing: reuse the default master with a
+                       // tagged request
   }
   // LLMMaster path (existing logic)
   // Check if the request is being rate-limited or model is sleeping.
@@ -755,6 +771,10 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
+  if (lora_pinned_async.has_value()) {
+    request_params.adapter_id = lora_pinned_async->lora_int_id;
+    request_params.adapter_name = lora_pinned_async->lora_name;
+  }
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
   for (const auto& message : rpc_request.messages()) {
@@ -902,7 +922,6 @@ void MMChatServiceImpl::process_async_impl(std::shared_ptr<MMChatCall> call) {
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
-
   std::vector<Message> messages;
   if (!mm_service_utils::build_messages<MMChatCall>(
           req_messages, messages, call, master_->get_image_limit())) {

@@ -230,6 +230,7 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device(
     ad.scaling = adapter_opt->scaling;
     ad.name = lora_name;
     ad.int_id = *id_opt;
+    device_pool_[*id_opt] = ad;
     active_ = std::move(ad);
     // Static preload wins over any pending -- unload() and future
     // load_and_activate() calls behave normally.
@@ -287,6 +288,15 @@ std::optional<LoRARuntime::ActiveDelta> LoRARuntime::active_delta() {
               << " (CPU-side; caller performs .to(device))";
   }
   return active_;
+}
+
+std::optional<LoRARuntime::ActiveDelta> LoRARuntime::get_delta_by_int_id(
+    uint64_t int_id) {
+  if (int_id == 0) return std::nullopt;
+  std::lock_guard g(materialise_mu_);
+  auto it = device_pool_.find(int_id);
+  if (it == device_pool_.end()) return std::nullopt;
+  return it->second;
 }
 
 }  // namespace xllm

@@ -339,45 +339,54 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
             event,
             event_flag);
 
-      // ===== Path C: whole-decoder-block LoRA delta =====
-      // If an adapter is loaded via /v1/load_lora_adapter, LoRARuntime
-      // hands us its rank/scaling metadata; we pretend the pre-allocated
-      // dummy A/B are that adapter's weights (see ctor for why real
-      // per-adapter fill is deferred). This is enough to demonstrate
-      // the full pipeline: HTTP call -> registry -> forward-time delta
-      // -> visibly different chat output.
-      if (auto ad = LoRARuntime::instance().active_delta(); ad.has_value()) {
-        if (cached_lora_int_id_ != ad->int_id) {
-          cached_lora_r_ = ad->A.size(0);
-          cached_lora_scaling_ = ad->scaling;
-          cached_lora_int_id_ = ad->int_id;
-          LOG(INFO) << "[Path C] activated adapter '" << ad->name
-                    << "' id=" << ad->int_id << " r=" << cached_lora_r_
-                    << " scaling=" << cached_lora_scaling_
-                    << " (using pre-allocated dummy weights until real"
-                       " weight-fill lands in P0-B)";
+      // ===== Path C prod v3: per-seq LoRA delta routing =====
+      // input_params.adapter_ids is index-aligned with q_seq_lens_vec:
+      // seq i uses adapter_ids[i] (0 = base only, no delta). h is the
+      // concatenated per-token hidden state [num_tokens, hidden]. Slice
+      // by seq boundary and apply the right delta per seq. Sequences with
+      // the same adapter share the same A/B — the LoRARuntime device pool
+      // dedup happens at install time.
+      //
+      // Fast path when the whole batch has adapter_id == 0 (base only,
+      // no LoRA): skip everything.
+      if (i == 0) {
+        // V70_MULTI_ADAPTER: emit once per forward, layer 0 only, so we can
+        // see whether adapter_ids arrives populated from the request path.
+        std::stringstream ss;
+        ss << "[V70_MULTI_ADAPTER] adapter_ids.size="
+           << input_params.adapter_ids.size();
+        for (size_t k = 0; k < input_params.adapter_ids.size(); ++k) {
+          ss << " [" << k << "]=" << input_params.adapter_ids[k];
         }
-        // Path C prod v3: prefer real device tensors from active_delta().
-        // ad->A is [rank, hidden] on device, ad->B is [hidden, rank] on
-        // device (either from install_static_adapter_on_device at ctor
-        // time or a legacy dummy fill). Use them directly, not the
-        // cached_lora_A_/B_ slice which was sized for the max_r pool.
-        const auto& real_A = ad->A;
-        const auto& real_B = ad->B;
-        // Guard: if for some reason the tensors are still on CPU (legacy
-        // dummy path) fall back to the cached device pool so we don't
-        // crash trying to do matmul across device boundaries.
-        torch::Tensor A_use, B_use;
-        if (real_A.defined() && real_A.device() == h.device()) {
-          A_use = real_A;
-          B_use = real_B;
-        } else {
-          A_use = cached_lora_A_.slice(0, 0, cached_lora_r_);
-          B_use = cached_lora_B_.slice(1, 0, cached_lora_r_);
+        ss << " q_seq_lens_vec.size=" << input_params.q_seq_lens_vec.size();
+        for (size_t k = 0; k < input_params.q_seq_lens_vec.size(); ++k) {
+          ss << " q[" << k << "]=" << input_params.q_seq_lens_vec[k];
         }
-        auto tmp = torch::matmul(h, A_use.transpose(0, 1));
-        auto delta = torch::matmul(tmp, B_use.transpose(0, 1));
-        h = h + delta * cached_lora_scaling_;
+        LOG(ERROR) << ss.str();
+      }
+      if (!input_params.adapter_ids.empty()) {
+        const auto& adapter_ids = input_params.adapter_ids;
+        const auto& q_seq_lens_vec_ref = input_params.q_seq_lens_vec;
+        CHECK_EQ(adapter_ids.size(), q_seq_lens_vec_ref.size())
+            << "adapter_ids and q_seq_lens_vec must be index-aligned";
+        int64_t token_offset = 0;
+        for (size_t seq_idx = 0; seq_idx < adapter_ids.size(); ++seq_idx) {
+          const int32_t seq_len = q_seq_lens_vec_ref[seq_idx];
+          if (seq_len <= 0) continue;
+          const uint64_t aid = adapter_ids[seq_idx];
+          if (aid != 0) {
+            auto ad = LoRARuntime::instance().get_delta_by_int_id(aid);
+            if (ad.has_value() && ad->A.defined() &&
+                ad->A.device() == h.device()) {
+              auto h_slice = h.slice(0, token_offset, token_offset + seq_len);
+              auto tmp = torch::matmul(h_slice, ad->A.transpose(0, 1));
+              auto delta = torch::matmul(tmp, ad->B.transpose(0, 1));
+              h.slice(0, token_offset, token_offset + seq_len)
+                  .add_(delta, ad->scaling);
+            }
+          }
+          token_offset += seq_len;
+        }
       }
 
       rolling_guard.after_layer(layer_index);

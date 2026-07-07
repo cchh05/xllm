@@ -237,6 +237,9 @@ void BatchInputBuilder::process_sequences_multithreaded() {
     state_.embedding_ids.insert(state_.embedding_ids.end(),
                                 state.embedding_ids.begin(),
                                 state.embedding_ids.end());
+    state_.adapter_ids.insert(state_.adapter_ids.end(),
+                              state.adapter_ids.begin(),
+                              state.adapter_ids.end());
     state_.request_ids.insert(state_.request_ids.end(),
                               state.request_ids.begin(),
                               state.request_ids.end());
@@ -311,9 +314,16 @@ void BatchInputBuilder::process_single_sequence(
   state.q_max_seq_len = std::max(state.q_max_seq_len, padded_q_seq_len);
   state.kv_cache_tokens_nums.emplace_back(n_kv_cache_tokens);
 #if defined(USE_NPU)
+  state.adapter_ids.push_back(sequence->adapter_id());
+  LOG_EVERY_N(ERROR, 10) << "[V71_ADAPTER_ID] seq_index=" << seq_index
+                         << " req_id=" << sequence->request_id()
+                         << " adapter_id=" << sequence->adapter_id()
+                         << " state.adapter_ids.size="
+                         << state.adapter_ids.size();
   state.seq_lens.push_back(seq_len);
   state.q_seq_lens.push_back(padded_q_seq_len);
 #elif defined(USE_MLU) || defined(USE_CUDA) || defined(USE_ILU)
+  state.adapter_ids.push_back(sequence->adapter_id());
   state.seq_lens.push_back(state.seq_lens.back() + seq_len);
   state.q_seq_lens.push_back(state.q_seq_lens.back() + padded_q_seq_len);
 #endif
@@ -407,6 +417,7 @@ void BatchInputBuilder::extract_tokens_and_positions(Sequence* sequence,
     state.extra_token_ids.emplace_back(-1);
     state.embedding_ids.emplace_back(sequence->get_embedding_id());
     state.request_ids.emplace_back(sequence->request_id());
+    state.adapter_ids.emplace_back(sequence->adapter_id());
   } else {
     extra_token_id = token_ids[seq_len];
     state.extra_token_ids.emplace_back(extra_token_id);
@@ -612,6 +623,10 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
 
   input_params.embedding_ids = std::move(state_.embedding_ids);
   input_params.request_ids = std::move(state_.request_ids);
+  LOG(ERROR) << "[V72_STATE_TO_INPUT] state_.adapter_ids.size="
+             << state_.adapter_ids.size()
+             << " state_.q_seq_lens.size=" << state_.q_seq_lens.size();
+  input_params.adapter_ids = std::move(state_.adapter_ids);
   input_params.extra_token_ids = std::move(state_.extra_token_ids);
   if (!state_.mtp_shifted_token_ids.empty()) {
     input_params.mtp_shifted_token_ids =
