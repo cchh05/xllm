@@ -246,6 +246,10 @@ struct RawForwardInput {
   std::vector<int32_t> mtp_shifted_token_ids;
   // embedding ids of each sequence
   std::vector<int> embedding_ids;
+  // LoRA adapter int_id for each sequence (0 = base only). Populated by
+  // batch_input_builder from Sequence::adapter_id() and carried through
+  // shm_channel to worker where it is unpacked into ModelInputParams.
+  std::vector<uint64_t> adapter_ids;
   // request ids of each sequence
   std::vector<std::string> request_ids;
   // swap

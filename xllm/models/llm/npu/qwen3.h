@@ -364,11 +364,11 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
         }
         LOG(ERROR) << ss.str();
       }
-      if (!input_params.adapter_ids.empty()) {
+      if (!input_params.adapter_ids.empty() &&
+          input_params.adapter_ids.size() ==
+              input_params.q_seq_lens_vec.size()) {
         const auto& adapter_ids = input_params.adapter_ids;
         const auto& q_seq_lens_vec_ref = input_params.q_seq_lens_vec;
-        CHECK_EQ(adapter_ids.size(), q_seq_lens_vec_ref.size())
-            << "adapter_ids and q_seq_lens_vec must be index-aligned";
         int64_t token_offset = 0;
         for (size_t seq_idx = 0; seq_idx < adapter_ids.size(); ++seq_idx) {
           const int32_t seq_len = q_seq_lens_vec_ref[seq_idx];
