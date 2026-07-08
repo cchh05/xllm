@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/nn/functional/normalization.h>
 
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -315,6 +316,9 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
 
       auto& layer = layers_[i];
       const int32_t layer_index = i;
+      if (i == 0 && lora_adapter_cache_) {
+        lora_adapter_cache_->clear();
+      }
       if (capture_aux_hidden_states_ &&
           layers_to_capture_set_.count(layer_index) != 0) {
         aux_output_buffer_.slice(0, 0, num_tokens)
@@ -339,53 +343,91 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
             event,
             event_flag);
 
-      // ===== Path C prod v3: per-seq LoRA delta routing =====
-      // input_params.adapter_ids is index-aligned with q_seq_lens_vec:
-      // seq i uses adapter_ids[i] (0 = base only, no delta). h is the
-      // concatenated per-token hidden state [num_tokens, hidden]. Slice
-      // by seq boundary and apply the right delta per seq. Sequences with
-      // the same adapter share the same A/B — the LoRARuntime device pool
-      // dedup happens at install time.
+      // ===== Path C prod v3: per-seq LoRA delta routing (optimized) =====
+      // adapter_ids[seq_i] gives the adapter for sequence i. Sequences
+      // with adapter_id==0 get the identity delta (skip). Sequences with
+      // the same adapter share the same A/B. We compute one matmul per
+      // *distinct adapter present in the batch*, not per seq, by
+      // concatenating the affected token rows.
       //
-      // Fast path when the whole batch has adapter_id == 0 (base only,
-      // no LoRA): skip everything.
-      if (i == 0) {
-        // V70_MULTI_ADAPTER: emit once per forward, layer 0 only, so we can
-        // see whether adapter_ids arrives populated from the request path.
-        std::stringstream ss;
-        ss << "[V70_MULTI_ADAPTER] adapter_ids.size="
-           << input_params.adapter_ids.size();
-        for (size_t k = 0; k < input_params.adapter_ids.size(); ++k) {
-          ss << " [" << k << "]=" << input_params.adapter_ids[k];
-        }
-        ss << " q_seq_lens_vec.size=" << input_params.q_seq_lens_vec.size();
-        for (size_t k = 0; k < input_params.q_seq_lens_vec.size(); ++k) {
-          ss << " q[" << k << "]=" << input_params.q_seq_lens_vec[k];
-        }
-        LOG(ERROR) << ss.str();
+      // Fast paths:
+      //  (1) empty adapter_ids     -> skip
+      //  (2) size mismatch         -> skip (should not happen; guard)
+      //  (3) all adapter_ids == 0  -> skip (batch is pure-base)
+      //  (4) all same non-zero id  -> one contig matmul on full h
+      //
+      // Cached lookups: per-layer we still look up the same (int_id, A, B)
+      // as last time. LoRARuntime::get_delta_by_int_id takes a mutex; we
+      // amortize by hoisting the lookup out of the seq loop into a small
+      // int_id -> ActiveDelta map on the stack.
+      if (!lora_adapter_cache_) {
+        lora_adapter_cache_ = std::make_unique<
+            std::unordered_map<uint64_t, LoRARuntime::ActiveDelta>>();
       }
-      if (!input_params.adapter_ids.empty() &&
-          input_params.adapter_ids.size() ==
-              input_params.q_seq_lens_vec.size()) {
-        const auto& adapter_ids = input_params.adapter_ids;
-        const auto& q_seq_lens_vec_ref = input_params.q_seq_lens_vec;
-        int64_t token_offset = 0;
-        for (size_t seq_idx = 0; seq_idx < adapter_ids.size(); ++seq_idx) {
-          const int32_t seq_len = q_seq_lens_vec_ref[seq_idx];
-          if (seq_len <= 0) continue;
-          const uint64_t aid = adapter_ids[seq_idx];
+      const auto& adapter_ids = input_params.adapter_ids;
+      const auto& q_seq_lens_vec_ref = input_params.q_seq_lens_vec;
+      const bool routing_valid =
+          !adapter_ids.empty() &&
+          adapter_ids.size() == q_seq_lens_vec_ref.size();
+      if (routing_valid) {
+        // Collect distinct non-zero adapter ids in the batch.
+        bool any_nonzero = false;
+        for (const auto& aid : adapter_ids) {
           if (aid != 0) {
-            auto ad = LoRARuntime::instance().get_delta_by_int_id(aid);
-            if (ad.has_value() && ad->A.defined() &&
-                ad->A.device() == h.device()) {
-              auto h_slice = h.slice(0, token_offset, token_offset + seq_len);
-              auto tmp = torch::matmul(h_slice, ad->A.transpose(0, 1));
-              auto delta = torch::matmul(tmp, ad->B.transpose(0, 1));
-              h.slice(0, token_offset, token_offset + seq_len)
-                  .add_(delta, ad->scaling);
+            any_nonzero = true;
+            break;
+          }
+        }
+        if (any_nonzero) {
+          // Fast path (4): all same non-zero id.
+          const uint64_t first = adapter_ids[0];
+          bool all_same = true;
+          for (const auto& aid : adapter_ids) {
+            if (aid != first) {
+              all_same = false;
+              break;
             }
           }
-          token_offset += seq_len;
+
+          auto get_ad = [&](uint64_t id) -> const LoRARuntime::ActiveDelta* {
+            auto it = lora_adapter_cache_->find(id);
+            if (it != lora_adapter_cache_->end()) return &it->second;
+            auto ad = LoRARuntime::instance().get_delta_by_int_id(id);
+            if (!ad.has_value() || !ad->A.defined() ||
+                ad->A.device() != h.device()) {
+              return nullptr;
+            }
+            auto [ins, _] = lora_adapter_cache_->emplace(id, *ad);
+            return &ins->second;
+          };
+
+          if (all_same) {
+            const auto* ad = get_ad(first);
+            if (ad) {
+              auto tmp = torch::matmul(h, ad->A.transpose(0, 1));
+              auto delta = torch::matmul(tmp, ad->B.transpose(0, 1));
+              h.add_(delta, ad->scaling);
+            }
+          } else {
+            int64_t token_offset = 0;
+            for (size_t seq_idx = 0; seq_idx < adapter_ids.size(); ++seq_idx) {
+              const int32_t seq_len = q_seq_lens_vec_ref[seq_idx];
+              if (seq_len <= 0) continue;
+              const uint64_t aid = adapter_ids[seq_idx];
+              if (aid != 0) {
+                const auto* ad = get_ad(aid);
+                if (ad) {
+                  auto h_slice =
+                      h.slice(0, token_offset, token_offset + seq_len);
+                  auto tmp = torch::matmul(h_slice, ad->A.transpose(0, 1));
+                  auto delta = torch::matmul(tmp, ad->B.transpose(0, 1));
+                  h.slice(0, token_offset, token_offset + seq_len)
+                      .add_(delta, ad->scaling);
+                }
+              }
+              token_offset += seq_len;
+            }
+          }
         }
       }
 
@@ -420,6 +462,14 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
   int64_t cached_lora_hidden_ = 0;
   float cached_lora_scaling_ = 0.0f;
   uint64_t cached_lora_int_id_ = 0;  // 0 == no adapter cached yet
+
+  // Per-forward LoRA cache: int_id -> ActiveDelta. Populated on demand
+  // as the model traverses layers so we don't hit the LoRARuntime
+  // mutex 36 times per forward. Reset at the start of each forward
+  // (see below).
+  mutable std::unique_ptr<
+      std::unordered_map<uint64_t, LoRARuntime::ActiveDelta>>
+      lora_adapter_cache_;
 };
 TORCH_MODULE(QWen3Model);
 
