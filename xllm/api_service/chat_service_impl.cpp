@@ -741,18 +741,31 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
     return;
   }
 
-  auto lora_pinned_async =
-      LoRARuntime::instance().enabled()
-          ? LoRARuntime::instance().registry().lookup(model)
-          : std::nullopt;
+  // Two-field routing: lora_name field (老板 style) wins over model name.
+  const std::string lora_name_field_async =
+      rpc_request.has_lora_name() ? rpc_request.lora_name() : std::string();
+  std::optional<LoRARequest> lora_pinned_async;
+  if (LoRARuntime::instance().enabled()) {
+    if (!lora_name_field_async.empty()) {
+      lora_pinned_async =
+          LoRARuntime::instance().registry().lookup(lora_name_field_async);
+      if (!lora_pinned_async.has_value()) {
+        call->finish_with_error(
+            StatusCode::UNKNOWN,
+            "lora_name not registered: " + lora_name_field_async);
+        return;
+      }
+    } else {
+      lora_pinned_async = LoRARuntime::instance().registry().lookup(model);
+    }
+  }
   LLMMaster* master = get_model_master(model);
   if (unlikely(master == nullptr) && !lora_pinned_async.has_value()) {
     call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
     return;
   }
   if (master == nullptr && lora_pinned_async.has_value()) {
-    master = master_;  // adapter routing: reuse the default master with a
-                       // tagged request
+    master = master_;
   }
   // LLMMaster path (existing logic)
   // Check if the request is being rate-limited or model is sleeping.

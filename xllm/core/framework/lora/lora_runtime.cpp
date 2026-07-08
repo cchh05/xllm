@@ -328,6 +328,39 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device(
   return id_opt;
 }
 
+// TP-aware overload. For the current whole-block delta path we don't
+// actually shard the A/B tensors -- every rank keeps the full copy and
+// runs the delta locally on its own slice of h (which atb has already
+// all_reduce'd back to full hidden by the time we get here). The
+// TPInfo is stored on the resulting ActiveDelta so downstream code
+// (and future M10 per-proj work) can see it, but for now the code
+// path is identical to the non-TP overload.
+std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device(
+    const std::string& lora_name,
+    const std::string& lora_path,
+    const std::string& base_model_name,
+    torch::Device device,
+    torch::ScalarType dtype,
+    TPInfo tp) {
+  if (tp.tp_size > 1) {
+    LOG(WARNING) << "[LoRARuntime] TP shard skeleton engaged (tp_size="
+                 << tp.tp_size << " tp_rank=" << tp.tp_rank
+                 << ") but whole-block delta ignores it -- delta stays "
+                    "kReplicated. Per-proj sharding is P1 (M10).";
+  }
+  auto id = install_static_adapter_on_device(
+      lora_name, lora_path, base_model_name, device, dtype);
+  if (id.has_value()) {
+    std::lock_guard g(materialise_mu_);
+    auto it = device_pool_.find(*id);
+    if (it != device_pool_.end()) {
+      it->second.tp = tp;
+      it->second.shard = LoRAShardStrategy::kReplicated;
+    }
+  }
+  return id;
+}
+
 bool LoRARuntime::unload(const std::string& lora_name) {
   bool ok = registry_.unregister(lora_name);
   {

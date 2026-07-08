@@ -157,13 +157,20 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
                   << " static adapter(s) on " << options.device()
                   << " dtype=" << options.dtype();
         int ok = 0, failed = 0;
+        // Path C prod v3 M10 TP skel: pass tp_size/tp_rank so the runtime
+        // records the shard tag on ActiveDelta. Whole-block delta ignores
+        // it today (kReplicated). Per-proj sharding lights up in P1.
+        const int32_t tp_size =
+            std::max(1, parallel_args.world_size() / parallel_args.dp_size());
+        const int32_t tp_rank = parallel_args.rank() % tp_size;
         for (const auto& [name, path] : modules) {
           auto id = LoRARuntime::instance().install_static_adapter_on_device(
               name,
               path,
               /*base_model_name=*/"",  // caller trusts the map, no cross-check
               options.device(),
-              options.dtype().toScalarType());
+              options.dtype().toScalarType(),
+              TPInfo{tp_size, tp_rank});
           if (id.has_value()) {
             ++ok;
             LOG(INFO) << "[Path C prod v3] preloaded '" << name

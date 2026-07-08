@@ -51,6 +51,33 @@ namespace xllm {
 // only holds "the currently applied adapter" -- the last one loaded wins.
 // That's enough to prove the full end-to-end HTTP -> loader -> registry ->
 // forward path from a single curl call.
+// Path C prod v3 M10 TP shard skeleton. When TP > 1, per-proj LoRA deltas
+// need to shard A/B differently depending on which xllm Linear the delta
+// hooks into:
+//   - ColumnParallelLinear (Q/K/V/gate/up):
+//       A [rank, hidden]         replicated on every rank
+//       B [hidden/tp, rank]      column-sharded (each rank owns a slice)
+//   - RowParallelLinear (o_proj, down_proj):
+//       A [rank, hidden/tp]      row-sharded
+//       B [hidden, rank]         replicated, delta gets all_reduce'd
+//
+// Whole-block delta on the current NPU path (atb output is already all-
+// reduced back to full hidden) uses REPLICATED for both A and B; each
+// rank keeps the full tensor and computes the same delta locally. No
+// cross-rank comm needed.
+//
+// This enum is the skeleton; the actual per-proj sharding is P1 work.
+enum class LoRAShardStrategy {
+  kReplicated = 0,     // whole tensor on every rank (current whole-block)
+  kColumnSharded = 1,  // dim-shard on last dim (for Column-parallel proj)
+  kRowSharded = 2,     // dim-shard on second-to-last (for Row-parallel proj)
+};
+
+struct TPInfo {
+  int32_t tp_size = 1;
+  int32_t tp_rank = 0;
+};
+
 class LoRARuntime {
  public:
   static LoRARuntime& instance();
@@ -101,6 +128,20 @@ class LoRARuntime {
       torch::Device device,
       torch::ScalarType dtype);
 
+  // TP-aware overload. Same as above but the caller passes tp_size/tp_rank
+  // so we can (in future M10 work) shard A/B before .to(device). For the
+  // current whole-block delta path we ignore the info and store the full
+  // tensor on every rank (kReplicated). This overload exists so callers
+  // can start passing the info now and the internal sharding lights up
+  // when M10 lands, without another API break.
+  std::optional<uint64_t> install_static_adapter_on_device(
+      const std::string& lora_name,
+      const std::string& lora_path,
+      const std::string& base_model_name,
+      torch::Device device,
+      torch::ScalarType dtype,
+      TPInfo tp);
+
   // Path C prod v3 multi-adapter: look up the device-resident A/B for a
   // specific adapter by its int_id. Returns std::nullopt if int_id unknown
   // or the adapter was installed without a device pool entry.
@@ -131,11 +172,15 @@ class LoRARuntime {
   // aclrtMemcpy-invalid-handle failure you hit when a background thread
   // tries to allocate device memory it does not own.
   struct ActiveDelta {
-    torch::Tensor A;  // [rank, hidden] on model_device
-    torch::Tensor B;  // [hidden, rank] on model_device
+    torch::Tensor A;  // [rank, hidden] (or shard thereof) on model_device
+    torch::Tensor B;  // [hidden, rank] (or shard thereof) on model_device
     float scaling;
     std::string name;
     uint64_t int_id;
+    // TP shard tag. kReplicated is the current whole-block default; the
+    // sharded variants light up when M10 per-proj delta ships.
+    LoRAShardStrategy shard = LoRAShardStrategy::kReplicated;
+    TPInfo tp{};
   };
   std::optional<ActiveDelta> active_delta();
 

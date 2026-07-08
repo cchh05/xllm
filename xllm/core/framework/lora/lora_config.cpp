@@ -95,13 +95,22 @@ std::vector<std::pair<std::string, std::string>> LoRAConfig::parse_modules(
     const std::string& raw) {
   std::vector<std::pair<std::string, std::string>> out;
   for (const auto& tok : split_comma(raw)) {
-    const auto eq = tok.find('=');
-    if (eq == std::string::npos || eq == 0 || eq == tok.size() - 1) {
+    // Accept both name=path (vLLM style) and name:path (business style).
+    // Whichever separator appears FIRST wins so paths containing the other
+    // char still parse.
+    size_t sep = std::string::npos;
+    for (size_t i = 0; i < tok.size(); ++i) {
+      if (tok[i] == '=' || tok[i] == ':') {
+        sep = i;
+        break;
+      }
+    }
+    if (sep == std::string::npos || sep == 0 || sep == tok.size() - 1) {
       LOG(ERROR) << "[LoRAConfig] malformed --lora-modules entry '" << tok
-                 << "', expected name=path";
+                 << "', expected name=path or name:path";
       continue;
     }
-    out.emplace_back(tok.substr(0, eq), tok.substr(eq + 1));
+    out.emplace_back(tok.substr(0, sep), tok.substr(sep + 1));
   }
   return out;
 }

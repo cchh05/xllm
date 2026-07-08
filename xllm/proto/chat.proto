@@ -151,6 +151,12 @@ message ChatRequest {
   // request trace headers from client.
   optional string x_request_id = 43;
   optional string x_request_time = 44;
+
+  // LoRA adapter name for multi-tenant routing. If set, this request uses
+  // the given adapter delta on top of the base model named in "model". If
+  // unset, "model" is interpreted as either a base model name or an
+  // adapter name (looked up in the registry).
+  optional string lora_name = 45;
 }
 
 message ChatLogProbData {
