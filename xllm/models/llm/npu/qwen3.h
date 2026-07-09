@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/lora/lora_runtime.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/npu/npu_qwen3_decoder_layer_impl.h"
+#include "core/util/layer_dump.h"
 #include "llm_model_base.h"
 
 namespace xllm::npu::model {
@@ -349,6 +350,10 @@ class QWen3ModelImpl : public LlmModelImplBase<QWen3DecoderLayer> {
             input_params_new,
             event,
             event_flag);
+
+      // Diff hook (env XLLM_DUMP_LAYER=<dir>). Dumps BEFORE Path C LoRA
+      // delta so ATB summary reflects pure base output for TORCH diff.
+      layer_dump::dump_layer("atb", layer_index, h);
 
       // ===== Path C prod v3: per-seq LoRA delta routing (optimized) =====
       // adapter_ids[seq_i] gives the adapter for sequence i. Sequences
