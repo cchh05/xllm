@@ -62,6 +62,8 @@ std::optional<uint64_t> LoRARegistry::register_adapter(const LoRARequest& req) {
   id_to_entry_[id] = Entry{stored, /*pin_count=*/0, /*unloading=*/false};
   LOG(INFO) << "[LoRARegistry] registered '" << req.lora_name << "' id=" << id
             << " path=" << req.lora_path;
+  // P1-D: notify observability layer of the new adapter binding.
+  if (on_register_) on_register_(id, req.lora_name);
   return id;
 }
 

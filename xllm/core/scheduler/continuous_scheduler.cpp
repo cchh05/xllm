@@ -31,6 +31,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch_factory.h"
+#include "framework/lora/lora_metrics.h"
 #include "framework/request/priority_comparator.h"
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
@@ -1151,13 +1152,18 @@ void ContinuousScheduler::update_token_latency_metrics(
       continue;
     }
     int64_t tbt_milliseconds = sequence->tbt(now);
+    const uint64_t adapter_id = sequence->adapter_id();
     if (sequence->is_first_token()) {
       HISTOGRAM_OBSERVE(time_to_first_token_latency_milliseconds,
                         tbt_milliseconds);
+      // P1-D: per-adapter TTFT.
+      LoRAMetrics::instance().observe_ttft(adapter_id, tbt_milliseconds);
       sequence->set_time_to_first_token_latency_seconds(
           static_cast<double>(tbt_milliseconds) / 1000);
     } else {
       HISTOGRAM_OBSERVE(inter_token_latency_milliseconds, tbt_milliseconds);
+      // P1-D: per-adapter inter-token latency.
+      LoRAMetrics::instance().observe_inter_token(adapter_id, tbt_milliseconds);
     }
   }
 }

@@ -37,6 +37,7 @@ limitations under the License.
 #include "core/distributed_runtime/llm_master.h"
 #include "core/distributed_runtime/rec_master.h"
 #include "core/distributed_runtime/vlm_master.h"
+#include "core/framework/lora/lora_metrics.h"
 #include "core/framework/lora/lora_runtime.h"
 #include "core/util/closure_guard.h"
 #include "embedding.pb.h"
@@ -1498,6 +1499,46 @@ void APIService::ListLoraAdaptersHttp(
                    {"lora_int_id", a.lora_int_id},
                    {"lora_path", a.lora_path},
                    {"base_model_name", a.base_model_name}});
+  }
+  write_json_response(ctrl, 200, {{"data", arr}});
+}
+
+void APIService::ListLoraStatsHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = reinterpret_cast<brpc::Controller*>(controller);
+
+  const auto snapshots = LoRAMetrics::instance().snapshot_all();
+  nlohmann::json arr = nlohmann::json::array();
+  for (const auto& s : snapshots) {
+    // active_state legend: 0=pending, 1=active, 2=draining. Matches
+    // LoRAMetrics::set_state semantics.
+    const char* state_str = "pending";
+    if (s.active_state == 1)
+      state_str = "active";
+    else if (s.active_state == 2)
+      state_str = "draining";
+    arr.push_back({
+        {"lora_name", s.lora_name},
+        {"state", state_str},
+        {"requests_total", s.requests_total},
+        {"tokens_prompt_total", s.tokens_prompt_total},
+        {"tokens_generated_total", s.tokens_generated_total},
+        {"errors_total", s.errors_total},
+        {"device_slots", s.device_slots},
+        {"ttft_p50_ms", s.ttft_p50_ms},
+        {"ttft_p99_ms", s.ttft_p99_ms},
+        {"e2e_p50_ms", s.e2e_p50_ms},
+        {"e2e_p99_ms", s.e2e_p99_ms},
+        {"qps", s.qps},
+    });
   }
   write_json_response(ctrl, 200, {{"data", arr}});
 }

@@ -19,10 +19,12 @@ limitations under the License.
 #include <absl/time/clock.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <memory>
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#include "framework/lora/lora_metrics.h"
 #include "framework/request/finish_reason.h"
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
@@ -86,8 +88,26 @@ void AsyncResponseProcessor::process_completed_request(
 
     double end_2_end_latency_seconds = request->elapsed_seconds();
     // update the metrics for the request
-    HISTOGRAM_OBSERVE(end_2_end_latency_milliseconds,
-                      static_cast<int64_t>(end_2_end_latency_seconds * 1000.0));
+    const int64_t end_2_end_ms =
+        static_cast<int64_t>(end_2_end_latency_seconds * 1000.0);
+    HISTOGRAM_OBSERVE(end_2_end_latency_milliseconds, end_2_end_ms);
+    // P1-D: per-adapter E2E + request/token counters (adapter_id=0 no-op).
+    const uint64_t adapter_id = request->state().adapter_id;
+    LoRAMetrics::instance().observe_e2e(adapter_id, end_2_end_ms);
+    LoRAMetrics::instance().inc_requests(adapter_id);
+    if (adapter_id != 0) {
+      int64_t prompt_tokens = 0;
+      int64_t gen_tokens = 0;
+      for (const auto& seq : request->sequences()) {
+        if (!seq) continue;
+        const int64_t n_prompt = static_cast<int64_t>(seq->num_prompt_tokens());
+        const int64_t n_total = static_cast<int64_t>(seq->num_tokens());
+        prompt_tokens += n_prompt;
+        gen_tokens += std::max<int64_t>(0, n_total - n_prompt);
+      }
+      LoRAMetrics::instance().add_tokens_prompt(adapter_id, prompt_tokens);
+      LoRAMetrics::instance().add_tokens_generated(adapter_id, gen_tokens);
+    }
     RequestOutput req_output =
         request->generate_output(*tokenizer_, &generate_output_threadpool_);
     request->log_statistic(end_2_end_latency_seconds);

@@ -186,6 +186,12 @@ class APIService : public proto::XllmAPIService {
                             proto::HttpResponse* response,
                             ::google::protobuf::Closure* done) override;
 
+  // P1-D: snapshot per-adapter counters + latency percentiles.
+  void ListLoraStatsHttp(::google::protobuf::RpcController* controller,
+                         const proto::HttpRequest* request,
+                         proto::HttpResponse* response,
+                         ::google::protobuf::Closure* done) override;
+
  private:
   bool ParseForkMasterRequest(const proto::MasterInfos* request,
                               Options& options);

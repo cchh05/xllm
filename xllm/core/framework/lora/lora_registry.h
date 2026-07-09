@@ -105,6 +105,17 @@ class LoRARegistry {
     on_final_removal_ = std::move(cb);
   }
 
+  // P1-D: symmetric hook fired when register_adapter first creates an
+  // entry (idempotent no-ops on re-register skip the callback). Used by
+  // LoRAMetrics to allocate its per-adapter bvars. Called with the
+  // registry mutex held; keep the callback body short.
+  using RegisterCallback =
+      std::function<void(uint64_t int_id, const std::string& lora_name)>;
+  void set_on_register(RegisterCallback cb) {
+    std::unique_lock lock(mu_);
+    on_register_ = std::move(cb);
+  }
+
   // Enumerate currently-loaded adapter names. Used by /v1/models.
   std::vector<LoRARequest> list() const;
 
@@ -129,6 +140,7 @@ class LoRARegistry {
   std::unordered_map<uint64_t, Entry> id_to_entry_;
   std::atomic<uint64_t> next_id_{1};
   FinalRemovalCallback on_final_removal_;
+  RegisterCallback on_register_;
 };
 
 }  // namespace xllm

@@ -19,6 +19,8 @@ limitations under the License.
 
 #include <mutex>
 
+#include "lora_metrics.h"
+
 #if defined(USE_NPU)
 #include <acl/acl.h>
 #endif
@@ -40,20 +42,31 @@ void LoRARuntime::init(const LoRAConfig& config) {
   // its per-adapter tensors at the exact moment the registry drops the last
   // reference (either synchronous unregister with pin=0, or the deferred
   // unpin after a drain).
+  registry_.set_on_register([](uint64_t int_id, const std::string& lora_name) {
+    LoRAMetrics::instance().add_adapter(int_id, lora_name);
+    // Newly registered but not yet installed -> pending (0). Actual
+    // active_state flip to 1 happens when install_*_on_device succeeds.
+    LoRAMetrics::instance().set_state(int_id, 0);
+  });
   registry_.set_on_final_removal([this](uint64_t int_id) {
-    std::lock_guard g(materialise_mu_);
-    auto it = per_proj_device_pool_.find(int_id);
-    if (it != per_proj_device_pool_.end()) {
-      const size_t slot_count = it->second.size();
-      per_proj_device_pool_.erase(it);
-      LOG(INFO) << "[LoRARuntime] freed per_proj device pool for id=" << int_id
-                << " slots=" << slot_count;
+    {
+      std::lock_guard g(materialise_mu_);
+      auto it = per_proj_device_pool_.find(int_id);
+      if (it != per_proj_device_pool_.end()) {
+        const size_t slot_count = it->second.size();
+        per_proj_device_pool_.erase(it);
+        LOG(INFO) << "[LoRARuntime] freed per_proj device pool for id="
+                  << int_id << " slots=" << slot_count;
+      }
+      // Also drop legacy P0-A dummy pool entry if the same int_id sits there.
+      auto dp = device_pool_.find(int_id);
+      if (dp != device_pool_.end()) {
+        device_pool_.erase(dp);
+      }
     }
-    // Also drop legacy P0-A dummy pool entry if the same int_id sits there.
-    auto dp = device_pool_.find(int_id);
-    if (dp != device_pool_.end()) {
-      device_pool_.erase(dp);
-    }
+    // Drop metrics bvars AFTER releasing materialise_mu_ (LoRAMetrics
+    // takes its own shared_mutex; keep locks disjoint).
+    LoRAMetrics::instance().remove_adapter(int_id);
   });
   LOG(INFO) << "[LoRARuntime] initialised, enable=" << config_.enable_lora;
 }
@@ -575,6 +588,9 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
             << "' id=" << int_id << " slots=" << installed
             << " skipped=" << skipped << " r=" << adapter_opt->r
             << " scaling=" << adapter_opt->scaling;
+  // P1-D: adapter is now active on device.
+  LoRAMetrics::instance().set_state(int_id, 1);
+  LoRAMetrics::instance().set_device_slots(int_id, installed);
   return int_id;
 }
 

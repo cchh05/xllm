@@ -49,6 +49,7 @@ bool XllmServer::start(std::unique_ptr<APIService> service) {
                             "v1/load_lora_adapter => LoadLoraAdapterHttp,"
                             "v1/unload_lora_adapter => UnloadLoraAdapterHttp,"
                             "v1/lora_adapters => ListLoraAdaptersHttp,"
+                            "v1/lora_stats => ListLoraStatsHttp,"
                             "v2/repository/index => ModelVersionsHttp,"
                             "fork_master => ForkMasterHttp,"
                             "sleep => SleepHttp,"

@@ -103,4 +103,7 @@ service XllmAPIService {
   rpc LoadLoraAdapterHttp (HttpRequest) returns (HttpResponse);
   rpc UnloadLoraAdapterHttp (HttpRequest) returns (HttpResponse);
   rpc ListLoraAdaptersHttp (HttpRequest) returns (HttpResponse);
+  // P1-D: per-adapter observability snapshot (counters, latency percentiles).
+  // Full Prometheus scrape is available at brpc's built-in /vars endpoint.
+  rpc ListLoraStatsHttp (HttpRequest) returns (HttpResponse);
 }; 

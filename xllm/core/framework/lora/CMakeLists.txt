@@ -22,12 +22,14 @@ cc_library(
     adapter_loader.h
     lora_runtime.h
     lora_context.h
+    lora_metrics.h
   SRCS
     lora_config.cpp
     lora_registry.cpp
     adapter_loader.cpp
     lora_runtime.cpp
     lora_context.cpp
+    lora_metrics.cpp
   DEPS
     :state_dict
     glog::glog
