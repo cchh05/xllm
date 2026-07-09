@@ -18,6 +18,9 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include "framework/lora/lora_context.h"
+#include "framework/lora/lora_runtime.h"
+
 namespace xllm {
 namespace layer {
 
@@ -63,26 +66,85 @@ LoRAQKVParallelLinearImpl::LoRAQKVParallelLinearImpl(
 }
 
 torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
-  // Fast path: no active adapter, just return base output.
   auto y = base_->forward(input);
-  if (!lora_active_ || lora_rank_ == 0) {
+
+  // Legacy hardcoded path (Spike Day 5b). Kept behind lora_active_ so
+  // unit tests still work without a LoRARuntime. Real production path
+  // uses the per-request routing below.
+  if (lora_active_ && lora_rank_ > 0) {
+    auto lora_intermediate = torch::matmul(input, lora_a_.transpose(0, 1));
+    auto delta = torch::matmul(lora_intermediate, lora_b_.transpose(0, 1));
+    y = y + (delta * lora_scaling_).to(y.dtype());
+  }
+
+  // M10 per-request per-proj real LoRA. QKV wrapper concatenates Q/K/V
+  // deltas along the last dim to match the base's fused output.
+  const auto* ctx = current_lora_context();
+  if (ctx == nullptr || ctx->adapter_ids == nullptr ||
+      ctx->q_seq_lens_vec == nullptr || ctx->layer_index < 0) {
+    return y;
+  }
+  const auto& adapter_ids = *ctx->adapter_ids;
+  const auto& q_seq_lens = *ctx->q_seq_lens_vec;
+  if (adapter_ids.empty() || adapter_ids.size() != q_seq_lens.size()) {
     return y;
   }
 
-  // LoRA delta path.
-  //   input : [..., hidden_size]
-  //   lora_a: [rank, hidden]        replicated
-  //   lora_b: [out_local, rank]     col-shard (already sliced to this rank)
-  //
-  // We compute delta with plain matmuls; naive kernel, correct-first.
-  // shrink: input @ A^T -> [..., rank]
-  auto lora_intermediate = torch::matmul(input, lora_a_.transpose(0, 1));
-  // expand: intermediate @ B^T -> [..., out_local]
-  auto delta = torch::matmul(lora_intermediate, lora_b_.transpose(0, 1));
-  // Cast delta to base output dtype (base may be FP8/int8 quantized while
-  // LoRA is fp16/bf16); scale as alpha/rank (may be premultiplied into B
-  // for real adapter loads, in which case scaling=1.0 is passed).
-  return y + (delta * lora_scaling_).to(y.dtype());
+  // Fast path: batch is pure-base.
+  bool any_nonzero = false;
+  for (auto id : adapter_ids) {
+    if (id != 0) {
+      any_nonzero = true;
+      break;
+    }
+  }
+  if (!any_nonzero) return y;
+
+  // Per-seq apply: slice y along dim=0 by q_seq_lens, look up
+  // (int_id, layer, {q_proj,k_proj,v_proj}), stack Q/K/V deltas into
+  // one [seq_tokens, q_size + 2*kv_size] slab, add to that slice.
+  auto& runtime = LoRARuntime::instance();
+  int64_t tok_off = 0;
+  for (size_t seq_idx = 0; seq_idx < adapter_ids.size(); ++seq_idx) {
+    const int32_t seq_len = q_seq_lens[seq_idx];
+    if (seq_len <= 0) continue;
+    const uint64_t aid = adapter_ids[seq_idx];
+    if (aid == 0) {
+      tok_off += seq_len;
+      continue;
+    }
+
+    const auto* q_pd =
+        runtime.get_per_proj_delta(aid, ctx->layer_index, "q_proj");
+    const auto* k_pd =
+        runtime.get_per_proj_delta(aid, ctx->layer_index, "k_proj");
+    const auto* v_pd =
+        runtime.get_per_proj_delta(aid, ctx->layer_index, "v_proj");
+    if (q_pd == nullptr && k_pd == nullptr && v_pd == nullptr) {
+      tok_off += seq_len;
+      continue;
+    }
+
+    auto x_seq = input.slice(0, tok_off, tok_off + seq_len);
+    // Compute per-proj delta on the fused output. Use zeros as filler
+    // for missing proj slots so the concat shape stays correct.
+    auto make_delta = [&](const LoRARuntime::ProjDelta* pd, int64_t out_size) {
+      if (pd == nullptr) {
+        return torch::zeros({x_seq.size(0), out_size}, x_seq.options());
+      }
+      auto tmp = torch::matmul(x_seq, pd->A.transpose(0, 1));
+      auto d = torch::matmul(tmp, pd->B.transpose(0, 1));
+      return (d * pd->scaling).to(x_seq.dtype());
+    };
+    auto q_delta = make_delta(q_pd, q_size_local_);
+    auto k_delta = make_delta(k_pd, kv_size_local_);
+    auto v_delta = make_delta(v_pd, kv_size_local_);
+    auto qkv_delta = torch::cat({q_delta, k_delta, v_delta}, /*dim=*/-1);
+
+    y.slice(0, tok_off, tok_off + seq_len).add_(qkv_delta);
+    tok_off += seq_len;
+  }
+  return y;
 }
 
 void LoRAQKVParallelLinearImpl::load_state_dict(

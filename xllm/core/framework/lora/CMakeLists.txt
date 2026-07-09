@@ -21,11 +21,13 @@ cc_library(
     lora_registry.h
     adapter_loader.h
     lora_runtime.h
+    lora_context.h
   SRCS
     lora_config.cpp
     lora_registry.cpp
     adapter_loader.cpp
     lora_runtime.cpp
+    lora_context.cpp
   DEPS
     :state_dict
     glog::glog

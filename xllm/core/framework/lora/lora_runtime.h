@@ -191,6 +191,53 @@ class LoRARuntime {
   // device weights).
   std::optional<ActiveDelta> get_delta_by_int_id(uint64_t int_id);
 
+  // ---- M10 per-proj/per-layer delta support ----
+  //
+  // ProjKey identifies a specific weight in a decoder layer, e.g.
+  // (layer=5, proj="q_proj"). PEFT convention: proj is one of
+  // {q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}.
+  //
+  // ProjDelta holds the device-resident A/B for that specific slot.
+  // scaling is per-adapter (alpha/rank, or alpha/sqrt(rank) for rslora).
+  struct ProjKey {
+    int32_t layer_index;
+    std::string proj_name;
+    bool operator==(const ProjKey& other) const {
+      return layer_index == other.layer_index && proj_name == other.proj_name;
+    }
+  };
+  struct ProjKeyHash {
+    size_t operator()(const ProjKey& k) const noexcept {
+      return std::hash<int32_t>()(k.layer_index) ^
+             (std::hash<std::string>()(k.proj_name) << 1);
+    }
+  };
+  struct ProjDelta {
+    torch::Tensor A;  // [rank, in_features]  or shard thereof
+    torch::Tensor B;  // [out_features, rank]  or shard thereof
+    float scaling = 0.0f;
+    int32_t r = 0;
+  };
+
+  // Materialize every (layer, proj) tensor of the adapter onto device and
+  // register in the per-proj pool. Call from the model ctor thread (V60
+  // rules).
+  std::optional<uint64_t> install_static_adapter_on_device_per_proj(
+      const std::string& lora_name,
+      const std::string& lora_path,
+      const std::string& base_model_name,
+      torch::Device device,
+      torch::ScalarType dtype,
+      TPInfo tp);
+
+  // Look up a single per-proj delta. Called from the Linear wrapper
+  // forward path once per (batch, layer, proj). Returns nullptr if the
+  // adapter doesn't have anything at that slot (e.g. adapter only
+  // targets q_proj/k_proj/v_proj but not gate_proj).
+  const ProjDelta* get_per_proj_delta(uint64_t int_id,
+                                      int32_t layer_index,
+                                      const std::string& proj_name);
+
  private:
   LoRARuntime() = default;
 
@@ -248,6 +295,14 @@ class LoRARuntime {
   // Read by get_delta_by_int_id from forward thread. Guarded by
   // materialise_mu_.
   std::unordered_map<uint64_t, ActiveDelta> device_pool_;
+
+  // M10 per-proj device pool: int_id -> ((layer, proj) -> ProjDelta).
+  // Populated by install_static_adapter_on_device_per_proj at ctor time
+  // (V60 window). Read by get_per_proj_delta from Linear wrappers.
+  // Guarded by materialise_mu_.
+  std::unordered_map<uint64_t,
+                     std::unordered_map<ProjKey, ProjDelta, ProjKeyHash>>
+      per_proj_device_pool_;
 };
 
 }  // namespace xllm

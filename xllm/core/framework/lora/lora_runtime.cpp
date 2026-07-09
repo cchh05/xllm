@@ -417,4 +417,157 @@ std::optional<LoRARuntime::ActiveDelta> LoRARuntime::get_delta_by_int_id(
   return it->second;
 }
 
+// M10 per-proj installer. Loads full adapter, then walks every tensor in
+// adapter.tensors (canonicalized keys like "layers.5.self_attn.q_proj#A"),
+// parses (layer_index, proj_name), .to(device), and populates the pool.
+std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
+    const std::string& lora_name,
+    const std::string& lora_path,
+    const std::string& base_model_name,
+    torch::Device device,
+    torch::ScalarType dtype,
+    TPInfo tp) {
+  if (!enabled()) {
+    LOG(ERROR) << "[LoRARuntime] not enabled; refuse per-proj install '"
+               << lora_name << "'";
+    return std::nullopt;
+  }
+  if (!loader_) {
+    LOG(ERROR) << "[LoRARuntime] loader not initialised";
+    return std::nullopt;
+  }
+
+  LoRARequest req{lora_name, /*int_id=*/0, lora_path, base_model_name};
+  auto adapter_opt = loader_->load(req);
+  if (!adapter_opt) return std::nullopt;
+
+  const auto id_opt = registry_.register_adapter(req);
+  if (!id_opt) return std::nullopt;
+  const uint64_t int_id = *id_opt;
+
+  // Parse canonical keys "layers.{L}.{module_path}.{proj}#A|#B" into
+  // (layer_index, proj_name) and pair the A/B tensors up.
+  //
+  // For Qwen family, module_path values we care about are:
+  //   self_attn.q_proj / self_attn.k_proj / self_attn.v_proj / self_attn.o_proj
+  //   mlp.gate_proj    / mlp.up_proj      / mlp.down_proj
+  // We keep only the final proj token in the ProjKey; the parent
+  // (self_attn vs mlp) is implied by the proj name.
+  std::unordered_map<ProjKey,
+                     std::pair<torch::Tensor, torch::Tensor>,
+                     ProjKeyHash>
+      pairs;
+
+  auto parse_key = [](const std::string& canon)
+      -> std::optional<std::tuple<int32_t, std::string, bool /*is_a*/>> {
+    // Trailing "#A" / "#B"
+    if (canon.size() < 2) return std::nullopt;
+    const std::string tail = canon.substr(canon.size() - 2);
+    if (tail != "#A" && tail != "#B") return std::nullopt;
+    const bool is_a = (tail == "#A");
+    const std::string prefix = canon.substr(0, canon.size() - 2);
+    // Expect "layers.{L}.<module>.<proj>" or "model.layers.{L}.<module>.<proj>"
+    // (canonicalize_weight_name strips "base_model.model." but the
+    // remaining "model." from PEFT paths like
+    // "base_model.model.model.layers.5.self_attn.q_proj.lora_A.weight"
+    // is left as-is).
+    const std::string kLayersPrefix = "layers.";
+    const std::string kModelLayersPrefix = "model.layers.";
+    std::string after_layers;
+    if (prefix.rfind(kModelLayersPrefix, 0) == 0) {
+      after_layers = prefix.substr(kModelLayersPrefix.size());
+    } else if (prefix.rfind(kLayersPrefix, 0) == 0) {
+      after_layers = prefix.substr(kLayersPrefix.size());
+    } else {
+      return std::nullopt;
+    }
+    const auto dot = after_layers.find('.');
+    if (dot == std::string::npos) return std::nullopt;
+    int32_t layer_index;
+    try {
+      layer_index = std::stoi(after_layers.substr(0, dot));
+    } catch (...) {
+      return std::nullopt;
+    }
+    // last-dot split: proj is the tail after the final '.'
+    const auto last_dot = prefix.rfind('.');
+    if (last_dot == std::string::npos) return std::nullopt;
+    const std::string proj = prefix.substr(last_dot + 1);
+    return std::make_tuple(layer_index, proj, is_a);
+  };
+
+  for (const auto& [key, tensor] : adapter_opt->tensors) {
+    auto parsed = parse_key(key);
+    if (!parsed) continue;
+    auto [layer_index, proj_name, is_a] = *parsed;
+    ProjKey pk{layer_index, proj_name};
+    auto& slot = pairs[pk];
+    if (is_a)
+      slot.first = tensor;
+    else
+      slot.second = tensor;
+  }
+
+  // Materialize each (A, B) pair on device.
+  int32_t installed = 0, skipped = 0;
+  std::unordered_map<ProjKey, ProjDelta, ProjKeyHash> per_proj;
+  for (auto& [pk, ab] : pairs) {
+    if (!ab.first.defined() || !ab.second.defined()) {
+      ++skipped;
+      continue;
+    }
+    torch::Tensor A_cpu = ab.first;
+    torch::Tensor B_cpu = ab.second;
+
+    // TP-shard skeleton: for now we keep A/B replicated (whole hidden).
+    // Per-proj Column/Row sharding is a P1 optimization; the current
+    // ATB backend doesn't run per-proj anyway.
+    (void)tp;
+
+    // .to(device, dtype)
+    torch::Tensor A_dev, B_dev;
+    try {
+      A_dev = A_cpu.to(device, dtype).contiguous();
+      B_dev = B_cpu.to(device, dtype).contiguous();
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "[LoRARuntime] per-proj .to(device) failed for '"
+                 << lora_name << "' key=layers." << pk.layer_index << "."
+                 << pk.proj_name << ": " << e.what();
+      ++skipped;
+      continue;
+    }
+
+    ProjDelta pd;
+    pd.A = A_dev;
+    pd.B = B_dev;
+    pd.scaling = adapter_opt->scaling;
+    pd.r = adapter_opt->r;
+    per_proj.emplace(pk, std::move(pd));
+    ++installed;
+  }
+
+  {
+    std::lock_guard g(materialise_mu_);
+    per_proj_device_pool_[int_id] = std::move(per_proj);
+  }
+  LOG(INFO) << "[LoRARuntime] installed per-proj adapter '" << lora_name
+            << "' id=" << int_id << " slots=" << installed
+            << " skipped=" << skipped << " r=" << adapter_opt->r
+            << " scaling=" << adapter_opt->scaling;
+  return int_id;
+}
+
+const LoRARuntime::ProjDelta* LoRARuntime::get_per_proj_delta(
+    uint64_t int_id,
+    int32_t layer_index,
+    const std::string& proj_name) {
+  if (int_id == 0) return nullptr;
+  std::lock_guard g(materialise_mu_);
+  auto it = per_proj_device_pool_.find(int_id);
+  if (it == per_proj_device_pool_.end()) return nullptr;
+  auto pit = it->second.find(ProjKey{layer_index, proj_name});
+  if (pit == it->second.end()) return nullptr;
+  return &pit->second;
+}
+
 }  // namespace xllm

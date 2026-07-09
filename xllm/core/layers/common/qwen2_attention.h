@@ -26,6 +26,7 @@ limitations under the License.
 #include "layers/common/rms_norm.h"
 #include "linear.h"
 #include "lora/lora_qkv_parallel_linear.h"
+#include "lora/lora_row_parallel_linear.h"
 #include "rotary_embedding.h"
 
 namespace xllm {
@@ -58,7 +59,7 @@ class Qwen2AttentionImpl : public torch::nn::Module {
   bool can_use_fused_qk_norm_rope_;
 
   LoRAQKVParallelLinear qkv_proj_{nullptr};  // LoRA-wrapped, drop-in
-  RowParallelLinear o_proj_{nullptr};
+  LoRARowParallelLinear o_proj_{nullptr};
   RMSNorm q_norm_{nullptr};
   RMSNorm k_norm_{nullptr};
   Attention attn_{nullptr};

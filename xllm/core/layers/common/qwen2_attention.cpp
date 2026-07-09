@@ -91,15 +91,17 @@ Qwen2AttentionImpl::Qwen2AttentionImpl(const ModelContext& context) {
                                                     quant_args));
 
   // 2. Output projection
-  o_proj_ = register_module("o_proj",
-                            RowParallelLinear(total_num_heads * args.head_dim(),
-                                              args.hidden_size(),
-                                              /*bias=*/false,
-                                              /*input_is_parallelized=*/true,
-                                              /*enable_result_reduction=*/true,
-                                              quant_args,
-                                              parallel_args.tp_group_,
-                                              options));
+  o_proj_ =
+      register_module("o_proj",
+                      LoRARowParallelLinear(total_num_heads * args.head_dim(),
+                                            args.hidden_size(),
+                                            /*bias=*/false,
+                                            /*input_is_parallelized=*/true,
+                                            /*enable_result_reduction=*/true,
+                                            quant_args,
+                                            parallel_args.tp_group_,
+                                            options,
+                                            /*proj_name=*/"o_proj"));
 
   // 3. RMSNorm
   if (is_qwen3_style_) {
@@ -128,22 +130,10 @@ Qwen2AttentionImpl::Qwen2AttentionImpl(const ModelContext& context) {
                                     num_kv_heads_,
                                     args.sliding_window()));
 
-  // ==== SPIKE DAY 5b HARDCODED LORA ACTIVATION ====
-  // Sanity-check that the LoRA delta path is wired up end-to-end. This
-  // block will be removed once the real adapter manager (Week 1-2) lands.
-  {
-    const int64_t lora_rank = 8;
-    const double lora_scaling = 0.001;
-    const int64_t hidden = args.hidden_size();
-    const int64_t out_local = q_size_ + 2 * kv_size_;
-    torch::manual_seed(42);
-    auto lora_a = torch::randn({lora_rank, hidden}, options) * 0.02;
-    auto lora_b = torch::randn({out_local, lora_rank}, options) * 0.02;
-    qkv_proj_->set_lora_weights(lora_a, lora_b, lora_scaling);
-    LOG(INFO) << "[SPIKE Day 5b] activated dummy LoRA on qkv_proj, rank="
-              << lora_rank << ", scaling=" << lora_scaling
-              << ", hidden=" << hidden << ", out_local=" << out_local;
-  }
+  // Spike Day 5b hardcoded dummy LoRA block removed. Real per-proj LoRA
+  // delta is now applied by LoRAQKVParallelLinearImpl::forward, which
+  // reads (adapter_id, layer_index) from the thread-local LoRAContext
+  // set up by LlmModelImplBase::forward before entering the layer loop.
 }
 
 torch::Tensor Qwen2AttentionImpl::forward(

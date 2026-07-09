@@ -24,12 +24,14 @@ limitations under the License.
 #include "core/common/interruption_bus.h"
 #include "core/common/rec_model_utils.h"
 #include "core/framework/kv_cache/kv_cache.h"
+#include "core/framework/lora/lora_context.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_context.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/common/lm_head.h"
 #include "core/layers/common/rms_norm.h"
+#include "core/util/layer_dump.h"
 #include "models/model_registry.h"
 
 namespace xllm {
@@ -103,8 +105,20 @@ class LlmModelImplBase : public torch::nn::Module {
           << "Rec multi-round mode requires unshared_v_caches per layer.";
     }
 
+    // M10 per-proj LoRA: push a LoRAContext frame so Linear wrappers can
+    // read per-sequence adapter routing without extending Linear::forward.
+    // set_lora_context_layer updates layer_index on the top frame each
+    // iteration. LoRAScope pops on scope exit.
+    LoRAContextFrame lora_frame;
+    lora_frame.adapter_ids = &modified_input_params.adapter_ids;
+    lora_frame.q_seq_lens_vec = &modified_input_params.q_seq_lens_vec;
+    lora_frame.layer_index = -1;
+    LoRAScope _lora_scope(lora_frame);
+
     std::optional<torch::Tensor> residual;
     for (size_t i = 0; i < layers_.size(); i++) {
+      set_lora_context_layer(static_cast<int32_t>(i));
+
       if (llmrec_params != nullptr) {
         attn_metadata.full_k_cache = llmrec_params->full_k_caches[i];
         attn_metadata.full_v_cache = llmrec_params->full_v_caches[i];
@@ -121,6 +135,8 @@ class LlmModelImplBase : public torch::nn::Module {
                 attn_metadata,
                 kv_caches[i],
                 modified_input_params);
+      // Diff hook (env XLLM_DUMP_LAYER=<dir>).
+      layer_dump::dump_layer("torch", static_cast<int32_t>(i), h);
     }
     auto [hidden_states, residual_out] = norm_(h, residual);
     return ModelOutput(hidden_states, residual_out);

@@ -23,6 +23,7 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/layers/common/attention_mask.h"
 #endif
+#include "core/framework/lora/lora_runtime.h"
 #include "core/layers/qwen3_decoder_layer.h"
 #include "llm_model_base.h"
 
@@ -57,6 +58,46 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
     for (int32_t i = 0; i < model_args.n_layers(); i++) {
       auto layer = layer::Qwen3DecoderLayer(context);
       layers_.push_back(layer);
+    }
+
+    // M10 per-proj LoRA preload. Ctor runs on the thread that called
+    // aclrtSetDevice for NPU, so .to(device) works from here (V60 rule).
+    // We call the per-proj installer instead of the whole-block one so
+    // every (layer, proj) tensor lands in per_proj_device_pool_ for the
+    // Linear wrappers to read.
+    if (LoRARuntime::instance().enabled()) {
+      LoRARuntime::instance().set_model_device_dtype(
+          options.device(), options.dtype().toScalarType());
+      const auto& modules = LoRARuntime::instance().config().lora_modules;
+      if (!modules.empty()) {
+        LOG(INFO) << "[general path M10] preloading " << modules.size()
+                  << " per-proj static adapter(s) on " << options.device();
+        auto parallel_args = context.get_parallel_args();
+        const int32_t tp_size =
+            std::max(1, parallel_args.world_size() / parallel_args.dp_size());
+        const int32_t tp_rank = parallel_args.rank() % tp_size;
+        int ok = 0, failed = 0;
+        for (const auto& [name, path] : modules) {
+          auto id =
+              LoRARuntime::instance().install_static_adapter_on_device_per_proj(
+                  name,
+                  path,
+                  /*base_model_name=*/"",
+                  options.device(),
+                  options.dtype().toScalarType(),
+                  TPInfo{tp_size, tp_rank});
+          if (id.has_value()) {
+            ++ok;
+            LOG(INFO) << "[general path M10] preloaded '" << name
+                      << "' id=" << *id;
+          } else {
+            ++failed;
+            LOG(ERROR) << "[general path M10] failed '" << name << "'";
+          }
+        }
+        LOG(INFO) << "[general path M10] preload done: ok=" << ok
+                  << " failed=" << failed;
+      }
     }
   }
 
