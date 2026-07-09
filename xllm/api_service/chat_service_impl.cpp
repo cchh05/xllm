@@ -742,23 +742,30 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
   }
 
   // Two-field routing: lora_name field (老板 style) wins over model name.
+  // P1-A: use lookup_and_pin so unload can drain in-flight requests.
+  // The pin is released in the master->handle_request callback below (both
+  // success and error paths). unregister() during drain refuses to bind
+  // *new* pins; already-pinned requests complete under the old adapter.
   const std::string lora_name_field_async =
       rpc_request.has_lora_name() ? rpc_request.lora_name() : std::string();
-  std::optional<LoRARequest> lora_pinned_async;
+  std::optional<LoRARegistry::PinnedAdapter> lora_pinned_async;
   if (LoRARuntime::instance().enabled()) {
     if (!lora_name_field_async.empty()) {
-      lora_pinned_async =
-          LoRARuntime::instance().registry().lookup(lora_name_field_async);
+      lora_pinned_async = LoRARuntime::instance().registry().lookup_and_pin(
+          lora_name_field_async);
       if (!lora_pinned_async.has_value()) {
         call->finish_with_error(
             StatusCode::UNKNOWN,
-            "lora_name not registered: " + lora_name_field_async);
+            "lora_name not registered or draining: " + lora_name_field_async);
         return;
       }
     } else {
-      lora_pinned_async = LoRARuntime::instance().registry().lookup(model);
+      lora_pinned_async =
+          LoRARuntime::instance().registry().lookup_and_pin(model);
     }
   }
+  const uint64_t pinned_adapter_id_async =
+      lora_pinned_async.has_value() ? lora_pinned_async->int_id : 0;
   LLMMaster* master = get_model_master(model);
   if (unlikely(master == nullptr) && !lora_pinned_async.has_value()) {
     call->finish_with_error(StatusCode::UNKNOWN, "Model not supported");
@@ -771,6 +778,10 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
   // Check if the request is being rate-limited or model is sleeping.
   // is_limited() returns true if sleeping or rate-limited.
   if (unlikely(master->get_rate_limiter()->is_limited())) {
+    // P1-A: unpin before early-return since pin happened before this check.
+    if (lora_pinned_async.has_value()) {
+      LoRARuntime::instance().registry().unpin(pinned_adapter_id_async);
+    }
     if (master->get_rate_limiter()->is_sleeping()) {
       call->finish_with_error(StatusCode::UNAVAILABLE,
                               "Model is currently in sleep state.");
@@ -785,8 +796,8 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
   if (lora_pinned_async.has_value()) {
-    request_params.adapter_id = lora_pinned_async->lora_int_id;
-    request_params.adapter_name = lora_pinned_async->lora_name;
+    request_params.adapter_id = lora_pinned_async->int_id;
+    request_params.adapter_name = lora_pinned_async->req.lora_name;
   }
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
@@ -858,6 +869,7 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
       [call,
        model,
        master = master,
+       pinned_adapter_id = pinned_adapter_id_async,
        stream = std::move(saved_streaming),
        include_usage = include_usage,
        first_message_sent = std::unordered_set<size_t>(),
@@ -876,7 +888,10 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
             // Reduce the number of concurrent requests when a
             // request is finished with error.
             master->get_rate_limiter()->decrease_one_request();
-
+            // P1-A: release adapter pin on error path.
+            if (pinned_adapter_id != 0) {
+              LoRARuntime::instance().registry().unpin(pinned_adapter_id);
+            }
             return call->finish_with_error(status.code(), status.message());
           }
         }
@@ -886,6 +901,10 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
         if (req_output.finished || req_output.cancelled ||
             req_output.finished_on_prefill_instance) {
           master->get_rate_limiter()->decrease_one_request();
+          // P1-A: release adapter pin on success/cancel path.
+          if (pinned_adapter_id != 0) {
+            LoRARuntime::instance().registry().unpin(pinned_adapter_id);
+          }
         }
 
         if (stream) {
