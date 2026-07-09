@@ -20,8 +20,10 @@ limitations under the License.
 #include <json2pb/json_to_pb.h>
 #include <json2pb/pb_to_json.h>
 
+#include <chrono>
 #include <filesystem>
 #include <nlohmann/json.hpp>
+#include <thread>
 
 #include "call.h"
 #include "chat.pb.h"
@@ -1409,6 +1411,27 @@ void APIService::UnloadLoraAdapterHttp(
     return;
   }
   const std::string lora_name = j["lora_name"].get<std::string>();
+
+  // P1-A.4: optional drain_timeout_s (int seconds, default 30, max 300).
+  // Client can pass 0 to return immediately without polling.
+  int32_t drain_timeout_s = 30;
+  if (j.contains("drain_timeout_s")) {
+    try {
+      drain_timeout_s = j["drain_timeout_s"].get<int32_t>();
+    } catch (const std::exception&) {
+      drain_timeout_s = 30;
+    }
+    if (drain_timeout_s < 0) drain_timeout_s = 0;
+    if (drain_timeout_s > 300) drain_timeout_s = 300;
+  }
+
+  // Snapshot the int_id BEFORE unregister so we can poll contains() for
+  // the drain outcome. lookup by name returns nullopt once unloading is
+  // set, but the entry itself lives until refcount drops to zero.
+  auto pinned_before = LoRARuntime::instance().registry().lookup(lora_name);
+  const uint64_t int_id_snapshot =
+      pinned_before.has_value() ? pinned_before->lora_int_id : 0;
+
   Master* master = master_;
   if (master == nullptr) {
     for (const auto& [_, m] : masters_) {
@@ -1423,6 +1446,34 @@ void APIService::UnloadLoraAdapterHttp(
   if (!ok) {
     write_json_response(
         ctrl, 404, {{"error", "adapter not found"}, {"lora_name", lora_name}});
+    return;
+  }
+
+  // If we have an int_id to track, poll contains() until it disappears
+  // or the timeout expires. This keeps the /v1/unload_lora_adapter caller
+  // synchronous with the drain when the client wants that guarantee.
+  bool drained = true;
+  if (int_id_snapshot != 0 && drain_timeout_s > 0) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(drain_timeout_s);
+    while (LoRARuntime::instance().registry().contains(int_id_snapshot)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        drained = false;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  } else if (int_id_snapshot != 0 && drain_timeout_s == 0) {
+    // Client explicitly opted out of waiting; report drain status only.
+    drained = !LoRARuntime::instance().registry().contains(int_id_snapshot);
+  }
+
+  if (!drained) {
+    write_json_response(ctrl,
+                        202,
+                        {{"status", "drain_pending"},
+                         {"lora_name", lora_name},
+                         {"drain_timeout_s", drain_timeout_s}});
     return;
   }
   write_json_response(ctrl, 200, {{"status", "ok"}, {"lora_name", lora_name}});

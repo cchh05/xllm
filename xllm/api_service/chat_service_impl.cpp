@@ -627,22 +627,33 @@ void ChatServiceImpl::process_async_rpc_impl(
     const proto::ChatRequest* request) {
   const auto& service_request_id = request->service_request_id();
   const auto& target_xservice_addr = request->source_xservice_addr();
-  auto callback = [master = master_](const RequestOutput& req_output) -> bool {
+
+  // P1-A.1: pin the adapter for the lifetime of this rpc-style request.
+  // We use a shared_ptr<uint64_t> so the callback lambda (defined below
+  // to satisfy CALLBACK_WITH_ERROR macro which requires `callback` to be
+  // in scope BEFORE the rate-limit check) can capture the eventual pin id
+  // by shared_ptr. It stays 0 until we know the pin succeeded.
+  auto pin_id_holder = std::make_shared<uint64_t>(0);
+
+  auto callback = [master = master_,
+                   pin_id_holder](const RequestOutput& req_output) -> bool {
     req_output.log_request_status();
     if (req_output.status.has_value()) {
       const auto& status = req_output.status.value();
       if (!status.ok()) {
-        // Reduce the number of concurrent requests when a request is
-        // finished with error.
         master->get_rate_limiter()->decrease_one_request();
+        if (*pin_id_holder != 0) {
+          LoRARuntime::instance().registry().unpin(*pin_id_holder);
+        }
         return master->handle_rpc_response(req_output);
       }
     }
-    // Reduce the number of concurrent requests when a request is finished
-    // or canceled.
     if (req_output.finished || req_output.cancelled ||
         req_output.finished_on_prefill_instance) {
       master->get_rate_limiter()->decrease_one_request();
+      if (*pin_id_holder != 0) {
+        LoRARuntime::instance().registry().unpin(*pin_id_holder);
+      }
     }
     return master->handle_rpc_response(req_output);
   };
@@ -662,21 +673,25 @@ void ChatServiceImpl::process_async_rpc_impl(
   // check if model is supported
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
-  auto lora_pinned = LoRARuntime::instance().enabled()
-                         ? LoRARuntime::instance().registry().lookup(model)
-                         : std::nullopt;
+  std::optional<LoRARegistry::PinnedAdapter> lora_pinned;
+  if (LoRARuntime::instance().enabled()) {
+    lora_pinned = LoRARuntime::instance().registry().lookup_and_pin(model);
+  }
   if (!lora_pinned.has_value() && unlikely(!models_.contains(model))) {
-    CALLBACK_WITH_ERROR(StatusCode::UNKNOWN,
-                        "Model not supported",
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "Model not supported or lora draining: " + model,
                         service_request_id,
                         target_xservice_addr);
     return;
   }
+  if (lora_pinned.has_value()) {
+    *pin_id_holder = lora_pinned->int_id;
+  }
 
   RequestParams request_params(rpc_request, "", "");
   if (lora_pinned.has_value()) {
-    request_params.adapter_id = lora_pinned->lora_int_id;
-    request_params.adapter_name = lora_pinned->lora_name;
+    request_params.adapter_id = lora_pinned->int_id;
+    request_params.adapter_name = lora_pinned->req.lora_name;
   }
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
@@ -755,7 +770,7 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
           lora_name_field_async);
       if (!lora_pinned_async.has_value()) {
         call->finish_with_error(
-            StatusCode::UNKNOWN,
+            StatusCode::INVALID_ARGUMENT,
             "lora_name not registered or draining: " + lora_name_field_async);
         return;
       }

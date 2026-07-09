@@ -31,9 +31,30 @@ LoRARuntime& LoRARuntime::instance() {
 }
 
 void LoRARuntime::init(const LoRAConfig& config) {
-  std::lock_guard g(materialise_mu_);
-  config_ = config;
-  loader_ = std::make_unique<LoRAAdapterLoader>(config_);
+  {
+    std::lock_guard g(materialise_mu_);
+    config_ = config;
+    loader_ = std::make_unique<LoRAAdapterLoader>(config_);
+  }
+  // P1-A.3: bind the final-removal callback so per_proj_device_pool_ frees
+  // its per-adapter tensors at the exact moment the registry drops the last
+  // reference (either synchronous unregister with pin=0, or the deferred
+  // unpin after a drain).
+  registry_.set_on_final_removal([this](uint64_t int_id) {
+    std::lock_guard g(materialise_mu_);
+    auto it = per_proj_device_pool_.find(int_id);
+    if (it != per_proj_device_pool_.end()) {
+      const size_t slot_count = it->second.size();
+      per_proj_device_pool_.erase(it);
+      LOG(INFO) << "[LoRARuntime] freed per_proj device pool for id=" << int_id
+                << " slots=" << slot_count;
+    }
+    // Also drop legacy P0-A dummy pool entry if the same int_id sits there.
+    auto dp = device_pool_.find(int_id);
+    if (dp != device_pool_.end()) {
+      device_pool_.erase(dp);
+    }
+  });
   LOG(INFO) << "[LoRARuntime] initialised, enable=" << config_.enable_lora;
 }
 

@@ -95,8 +95,11 @@ void LoRARegistry::unpin(uint64_t int_id) {
     // Deferred removal completes now.
     LOG(INFO) << "[LoRARegistry] drained '" << entry.req.lora_name
               << "' id=" << int_id << ", removing";
+    // P1-A.3: fire on_final_removal so downstream pools free adapter state.
+    auto cb = on_final_removal_;
     name_to_id_.erase(entry.req.lora_name);
     id_to_entry_.erase(it);
+    if (cb) cb(int_id);
   }
 }
 
@@ -128,8 +131,11 @@ bool LoRARegistry::unregister(const std::string& lora_name) {
     // No in-flight work; free immediately.
     LOG(INFO) << "[LoRARegistry] unregistered '" << lora_name << "' id=" << id
               << " (no pins)";
+    // P1-A.3: fire on_final_removal so downstream pools free adapter state.
+    auto cb = on_final_removal_;
     name_to_id_.erase(it);
     id_to_entry_.erase(id);
+    if (cb) cb(id);
     return true;
   }
   // Requests are still using it; caller (unload_lora_adapter handler) is
@@ -138,6 +144,11 @@ bool LoRARegistry::unregister(const std::string& lora_name) {
   LOG(INFO) << "[LoRARegistry] draining '" << lora_name << "' id=" << id
             << " pins=" << entry.pin_count;
   return true;
+}
+
+bool LoRARegistry::contains(uint64_t int_id) const {
+  std::shared_lock lock(mu_);
+  return id_to_entry_.find(int_id) != id_to_entry_.end();
 }
 
 std::vector<LoRARequest> LoRARegistry::list() const {

@@ -17,7 +17,9 @@ limitations under the License.
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -89,10 +91,29 @@ class LoRARegistry {
   // scheduled for drain).
   bool unregister(const std::string& lora_name);
 
+  // P1-A.3: register a callback fired at the moment an adapter entry is
+  // finally erased from the map (either synchronously from unregister when
+  // refcount is 0, or deferred from unpin when the last ref drops after
+  // an unloading mark). The callback receives the int_id so downstream
+  // pools (per_proj_device_pool_, host cache, metric bvars) can free
+  // their per-adapter state at the same moment the registry forgets it.
+  //
+  // Called with the registry mutex held; keep the callback body short.
+  using FinalRemovalCallback = std::function<void(uint64_t int_id)>;
+  void set_on_final_removal(FinalRemovalCallback cb) {
+    std::unique_lock lock(mu_);
+    on_final_removal_ = std::move(cb);
+  }
+
   // Enumerate currently-loaded adapter names. Used by /v1/models.
   std::vector<LoRARequest> list() const;
 
   size_t size() const;
+
+  // P1-A.4: probe whether an int_id still has an entry (may be unloading).
+  // Used by /v1/unload_lora_adapter drain polling to know when the last
+  // in-flight request finished and the entry was erased.
+  bool contains(uint64_t int_id) const;
 
  private:
   struct Entry {
@@ -107,6 +128,7 @@ class LoRARegistry {
   std::unordered_map<std::string, uint64_t> name_to_id_;
   std::unordered_map<uint64_t, Entry> id_to_entry_;
   std::atomic<uint64_t> next_id_{1};
+  FinalRemovalCallback on_final_removal_;
 };
 
 }  // namespace xllm
