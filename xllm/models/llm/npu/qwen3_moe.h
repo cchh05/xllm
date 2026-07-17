@@ -505,12 +505,14 @@ class Qwen3MoeForCausalLMImpl
 TORCH_MODULE(Qwen3MoeForCausalLM);
 
 // register the causal model
-REGISTER_CAUSAL_MODEL(qwen3_moe, Qwen3MoeForCausalLM);
+// REGISTER_CAUSAL_MODEL(qwen3_moe, Qwen3MoeForCausalLM); // moved to
+// xllm/models/llm/qwen3_moe.h (TORCH backend)
 
 // register the model args
 // example config:
 // https://huggingface.co/Qwen/Qwen3-30B-A3B/blob/main/config.json
 // https://huggingface.co/Qwen/Qwen3-235B-A22B/blob/main/config.json
+#if 0   // moved to xllm/models/llm/qwen3_moe.h (TORCH backend)
 REGISTER_MODEL_ARGS(qwen3_moe, [&] {
   LOAD_ARG_OR(model_type, "model_type", "qwen3_moe");
   LOAD_ARG_OR(dtype, "torch_dtype", "");
@@ -548,4 +550,5 @@ REGISTER_MODEL_ARGS(qwen3_moe, [&] {
 
   SET_ARG(stop_token_ids, std::unordered_set<int32_t>({args->eos_token_id()}));
 });
+#endif  // moved to xllm/models/llm/qwen3_moe.h
 }  // namespace xllm::npu::model

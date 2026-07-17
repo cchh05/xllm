@@ -349,6 +349,11 @@ torch::Tensor group_gemm(GroupGemmParams& params) {
   if (!group_list.has_value()) {
     group_list = params.token_count;
   }
+  // NPU aclnnGroupedMatmulV5 requires groupList in int64 (EZ1001).
+  if (group_list.has_value() && group_list.value().defined() &&
+      group_list.value().scalar_type() != torch::kInt64) {
+    group_list = group_list.value().to(torch::kInt64);
+  }
 
   auto outputs =
       npu::apply_npu_grouped_matmul(x_ref,

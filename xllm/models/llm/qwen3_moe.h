@@ -18,7 +18,13 @@ limitations under the License.
 #include "core/common/rec_model_utils.h"
 #include "core/framework/model/model_output.h"
 #include "core/layers/qwen3_moe_decoder_layer.h"
+#include "framework/lora/lora_context.h"
+#include "framework/lora/lora_runtime.h"
 #include "llm_model_base.h"
+#if defined(USE_NPU)
+#include "core/common/global_flags.h"
+#include "core/layers/common/attention_mask.h"
+#endif
 
 namespace xllm {
 
@@ -46,6 +52,51 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
     for (int32_t i = 0; i < model_args.n_layers(); ++i) {
       auto layer = layer::Qwen3MoeDecoderLayer(context, i);
       layers_.push_back(layer);
+    }
+
+#if defined(USE_NPU)
+    int32_t mask_value = FLAGS_enable_chunked_prefill ? -9984 : 1;
+    attn_mask_ = layer::AttentionMask(
+        options.device(), options.dtype().toScalarType(), mask_value);
+#endif
+
+    // fix #4: static LoRA adapter preload (mirror of qwen3.h ctor block).
+    // Attention-only adapters are handled by the Qwen2Attention wrappers;
+    // any experts.* keys in adapter safetensors are ignored by the loader
+    // (P1 will add expert-LoRA support).
+    if (LoRARuntime::instance().enabled()) {
+      LoRARuntime::instance().set_model_device_dtype(
+          options.device(), options.dtype().toScalarType());
+      const auto& modules = LoRARuntime::instance().config().lora_modules;
+      if (!modules.empty()) {
+        LOG(INFO) << "[qwen3_moe M10] preloading " << modules.size()
+                  << " per-proj static adapter(s) on " << options.device();
+        auto parallel_args = context.get_parallel_args();
+        const int32_t tp_size =
+            std::max(1, parallel_args.world_size() / parallel_args.dp_size());
+        const int32_t tp_rank = parallel_args.rank() % tp_size;
+        int ok = 0, failed = 0;
+        for (const auto& [name, path] : modules) {
+          auto id =
+              LoRARuntime::instance().install_static_adapter_on_device_per_proj(
+                  name,
+                  path,
+                  /*base_model_name=*/"",
+                  options.device(),
+                  options.dtype().toScalarType(),
+                  TPInfo{tp_size, tp_rank});
+          if (id.has_value()) {
+            ++ok;
+            LOG(INFO) << "[qwen3_moe M10] preloaded '" << name
+                      << "' id=" << *id;
+          } else {
+            ++failed;
+            LOG(ERROR) << "[qwen3_moe M10] failed '" << name << "'";
+          }
+        }
+        LOG(INFO) << "[qwen3_moe M10] preload done: ok=" << ok
+                  << " failed=" << failed;
+      }
     }
   }
 
@@ -102,6 +153,16 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) override {
     ModelInputParams modified_input_params = input_params;
+
+    // M10 per-proj LoRA (mirror of LlmModelImplBase::forward push).
+    // Qwen3MoE forward overrides the base's forward, so LoRAContext must
+    // be pushed here or wrappers never see adapter routing info.
+    LoRAContextFrame lora_frame;
+    lora_frame.adapter_ids = &modified_input_params.adapter_ids;
+    lora_frame.q_seq_lens_vec = &modified_input_params.q_seq_lens_vec;
+    lora_frame.layer_index = -1;
+    LoRAScope _lora_scope(lora_frame);
+
     if (tokens.numel() == 0) {
       tokens = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
       positions = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
@@ -119,10 +180,44 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
     auto deep_stacks = input_params.deep_stacks;
     int deep_stack_size = deep_stacks.size();
     if (!modified_input_params.attn_metadata) {
+#if defined(USE_NPU)
+      max_seq_len_ =
+          std::max(modified_input_params.kv_max_seq_len, max_seq_len_);
+      torch::Tensor attn_mask;
+      if (FLAGS_enable_chunked_prefill) {
+        const int32_t max_kv_seq = modified_input_params.kv_max_seq_len;
+        const int32_t num_sequences = modified_input_params.num_sequences;
+        if (num_sequences > 0) {
+          std::vector<torch::Tensor> req_mask_vec;
+          req_mask_vec.reserve(num_sequences);
+          for (int32_t j = 0; j < num_sequences; ++j) {
+            auto mask = attn_mask_.gen_append_mask(
+                modified_input_params.q_seq_lens_vec[j],
+                modified_input_params.kv_seq_lens_vec[j],
+                max_kv_seq,
+                h.dtype().toScalarType(),
+                h.device());
+            req_mask_vec.emplace_back(mask);
+          }
+          attn_mask = torch::cat(req_mask_vec, 0);
+        } else {
+          attn_mask = attn_mask_.get_attn_mask(
+              max_seq_len_, h.dtype().toScalarType(), h.device());
+        }
+      } else {
+        attn_mask = attn_mask_.get_attn_mask(
+            max_seq_len_, h.dtype().toScalarType(), h.device());
+      }
+      modified_input_params.attn_metadata =
+          std::make_shared<layer::AttentionMetadata>(
+              layer::AttentionMetadataBuilder::build(
+                  modified_input_params, model_args_, attn_mask));
+#else
       modified_input_params.attn_metadata =
           std::make_shared<layer::AttentionMetadata>(
               layer::AttentionMetadataBuilder::build(modified_input_params,
                                                      model_args_));
+#endif
     }
     auto& attn_metadata = *(modified_input_params.attn_metadata);
     bool only_prefill =
@@ -148,6 +243,7 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
 
     std::optional<torch::Tensor> residual;
     for (size_t i = 0; i < layers_.size(); i++) {
+      set_lora_context_layer(static_cast<int32_t>(i));
       if (llmrec_params != nullptr) {
         attn_metadata.full_k_cache = llmrec_params->full_k_caches[i];
         attn_metadata.full_v_cache = llmrec_params->full_v_caches[i];
@@ -217,6 +313,11 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
     }
     norm_->load_state_dict(state_dict.get_dict_with_prefix("norm."));
   }
+
+#if defined(USE_NPU)
+ private:
+  layer::AttentionMask attn_mask_;
+#endif
 };
 TORCH_MODULE(Qwen3MoeModel);
 
