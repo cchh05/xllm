@@ -41,6 +41,19 @@ LoRARowParallelLinearImpl::LoRARowParallelLinearImpl(
 torch::Tensor LoRARowParallelLinearImpl::forward(torch::Tensor input) {
   auto y = base_->forward(input);
 
+  // TP>1 row-parallel LoRA temporarily skipped: input is already sharded
+  // along in-dim, so applying pd->A (full in_features) would broadcast-error.
+  // A correct fix requires either (a) slicing A on in-dim + all-reducing the
+  // partial delta, or (b) storing TP-sharded A per rank. Both are non-trivial
+  // and deferred to P1. For now, TP>1 row-parallel returns base output only.
+  // Attention o_proj and MLP down_proj miss their LoRA delta contribution
+  // in TP>1 mode. QKV (col-parallel input, replicated in-dim) and gate/up
+  // (col-parallel out-dim) still apply their deltas correctly.
+  if (base_->process_group() != nullptr &&
+      base_->process_group()->world_size() > 1) {
+    return y;
+  }
+
   // M10 per-request per-proj real LoRA. Row-parallel wrapper is a single
   // proj (o_proj or down_proj) so no output-concat like QKV.
   const auto* ctx = current_lora_context();

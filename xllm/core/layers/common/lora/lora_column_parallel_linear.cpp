@@ -37,7 +37,9 @@ LoRAColumnParallelLinearImpl::LoRAColumnParallelLinearImpl(
                                linear_extra_args);
 
   // out_features here is the total; per-rank it is out_features / world_size.
-  const int64_t world_size = process_group ? process_group->world_size() : 1;
+  tp_rank_ = process_group ? process_group->rank() : 0;
+  tp_world_size_ = process_group ? process_group->world_size() : 1;
+  const int64_t world_size = tp_world_size_;
   out_size_local_ = out_features / std::max<int64_t>(1, world_size);
   inter_size_local_ = is_fused_gate_up_ ? out_size_local_ / 2 : out_size_local_;
 }
@@ -94,7 +96,14 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
                               x_seq.options());
         }
         auto tmp = torch::matmul(x_seq, pd->A.transpose(0, 1));
-        auto d = torch::matmul(tmp, pd->B.transpose(0, 1));
+        // TP shard: adapter's B is [inter_full, rank]. This rank owns
+        // rows [tp_rank * inter_size_local_, +inter_size_local_).
+        torch::Tensor B_local = pd->B;
+        if (tp_world_size_ > 1 && pd->B.size(0) > inter_size_local_) {
+          const int64_t start = tp_rank_ * inter_size_local_;
+          B_local = pd->B.slice(0, start, start + inter_size_local_);
+        }
+        auto d = torch::matmul(tmp, B_local.transpose(0, 1));
         return (d * pd->scaling).to(x_seq.dtype());
       };
       auto gate_delta = make_delta(gate_pd);
@@ -110,7 +119,14 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
         continue;
       }
       auto tmp = torch::matmul(x_seq, pd->A.transpose(0, 1));
-      auto delta = torch::matmul(tmp, pd->B.transpose(0, 1));
+      // TP shard: adapter's B is [out_full, rank]. This rank owns
+      // rows [tp_rank * out_size_local_, +out_size_local_).
+      torch::Tensor B_local = pd->B;
+      if (tp_world_size_ > 1 && pd->B.size(0) > out_size_local_) {
+        const int64_t start = tp_rank_ * out_size_local_;
+        B_local = pd->B.slice(0, start, start + out_size_local_);
+      }
+      auto delta = torch::matmul(tmp, B_local.transpose(0, 1));
       delta = (delta * pd->scaling).to(y.dtype());
       y.slice(0, tok_off, tok_off + seq_len).add_(delta);
     }

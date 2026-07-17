@@ -48,6 +48,18 @@ ShmChannel::ShmChannel(int dp_group,
 
 bool ShmChannel::execute_model_with_shm(const RawForwardInput& input,
                                         RawForwardOutput& raw_output) {
+  // DEBUG P1G_SHM_W: what's in input.adapter_ids before shm write?
+  {
+    size_t _nonz = 0;
+    for (auto _id : input.adapter_ids)
+      if (_id != 0) ++_nonz;
+    LOG_EVERY_N(ERROR, 10) << "[P1G_SHM_W] input.adapter_ids.size="
+                           << input.adapter_ids.size() << " nonzero=" << _nonz
+                           << " first_id="
+                           << (input.adapter_ids.empty() ? 0
+                                                         : input.adapter_ids[0])
+                           << " q_seq_lens.size=" << input.q_seq_lens.size();
+  }
   // write to shared memory, then wait output.
   if (input_shm_manager_) {
     int use_shm_ret = input_shm_manager_->raw_input_write(input);

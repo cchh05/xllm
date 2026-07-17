@@ -80,6 +80,14 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
   // M10 per-request per-proj real LoRA. QKV wrapper concatenates Q/K/V
   // deltas along the last dim to match the base's fused output.
   const auto* ctx = current_lora_context();
+  // DEBUG P1G: dump wrapper's view of context (rate limited)
+  LOG_EVERY_N(ERROR, 200) << "[P1G_QKV_FWD] ctx=" << (ctx ? "ok" : "null")
+                          << " aids_ptr="
+                          << (ctx && ctx->adapter_ids ? "ok" : "null")
+                          << " layer_idx=" << (ctx ? ctx->layer_index : -99)
+                          << " aids_size="
+                          << (ctx && ctx->adapter_ids ? ctx->adapter_ids->size()
+                                                      : 0);
   if (ctx == nullptr || ctx->adapter_ids == nullptr ||
       ctx->q_seq_lens_vec == nullptr || ctx->layer_index < 0) {
     return y;
@@ -128,12 +136,23 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
     auto x_seq = input.slice(0, tok_off, tok_off + seq_len);
     // Compute per-proj delta on the fused output. Use zeros as filler
     // for missing proj slots so the concat shape stays correct.
+    // TP shard: dummy adapter's B is stored at full out size, but this
+    // rank only handles [tp_rank * out_size, (tp_rank+1) * out_size).
+    // Slice B to the local shard before matmul so the delta shape
+    // matches base linear's local output.
     auto make_delta = [&](const LoRARuntime::ProjDelta* pd, int64_t out_size) {
       if (pd == nullptr) {
         return torch::zeros({x_seq.size(0), out_size}, x_seq.options());
       }
       auto tmp = torch::matmul(x_seq, pd->A.transpose(0, 1));
-      auto d = torch::matmul(tmp, pd->B.transpose(0, 1));
+      // B is [out_full, rank]. Slice rows [tp_rank*out_size, +out_size)
+      // so we only compute this rank's portion of the output.
+      torch::Tensor B_local = pd->B;
+      if (tp_world_size_ > 1 && pd->B.size(0) > out_size) {
+        const int64_t start = tp_rank_ * out_size;
+        B_local = pd->B.slice(0, start, start + out_size);
+      }
+      auto d = torch::matmul(tmp, B_local.transpose(0, 1));
       return (d * pd->scaling).to(x_seq.dtype());
     };
     auto q_delta = make_delta(q_pd, q_size_local_);

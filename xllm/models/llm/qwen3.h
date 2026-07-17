@@ -23,6 +23,7 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/layers/common/attention_mask.h"
 #endif
+#include "core/framework/lora/lora_context.h"
 #include "core/framework/lora/lora_runtime.h"
 #include "core/layers/qwen3_decoder_layer.h"
 #include "llm_model_base.h"
@@ -188,8 +189,32 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
           apply_mrope(positions);
     }
 
+    // DEBUG P1G: what's in input_params.adapter_ids at qwen3 forward entry?
+    {
+      const auto& _aids = input_params_new.adapter_ids;
+      const auto& _qsl = input_params_new.q_seq_lens_vec;
+      size_t _nonz = 0;
+      for (auto _id : _aids)
+        if (_id != 0) ++_nonz;
+      LOG_EVERY_N(ERROR, 5)
+          << "[P1G_Q3_FWD] adapter_ids.size=" << _aids.size()
+          << " q_seq_lens.size=" << _qsl.size() << " nonzero=" << _nonz
+          << " first_id=" << (_aids.empty() ? 0 : _aids[0])
+          << " token_numel=" << tokens.numel();
+    }
+    // M10 per-proj LoRA: push a LoRAContext frame so Linear wrappers can
+    // read per-sequence adapter routing. This mirrors the same push in
+    // LlmModelImplBase::forward (llm_model_base.h) so the M10 path works
+    // regardless of which forward override the model uses.
+    LoRAContextFrame lora_frame;
+    lora_frame.adapter_ids = &input_params_new.adapter_ids;
+    lora_frame.q_seq_lens_vec = &input_params_new.q_seq_lens_vec;
+    lora_frame.layer_index = -1;
+    LoRAScope _lora_scope(lora_frame);
+
     std::optional<torch::Tensor> residual;
     for (size_t i = 0; i < layers_.size(); i++) {
+      set_lora_context_layer(static_cast<int32_t>(i));
       if (is_rec_multi_round_mode() && input_params_new.has_llmrec_params()) {
         const auto& llmrec_params = input_params_new.llmrec_params();
         attn_metadata.full_k_cache = llmrec_params->full_k_caches[i];

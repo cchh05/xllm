@@ -303,6 +303,7 @@ message ForwardInput {
   repeated string request_ids = 44;
   repeated int32 mtp_shifted_token_ids = 45;
   DiTForwardInput dit_forward_input = 46;
+  repeated uint64 adapter_ids = 47;
 }
 
  message BatchedForwardInputs {

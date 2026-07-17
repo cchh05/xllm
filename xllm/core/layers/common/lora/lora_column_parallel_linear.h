@@ -77,6 +77,8 @@ class LoRAColumnParallelLinearImpl : public torch::nn::Module {
   int64_t out_size_local_ = 0;    // per-rank, matches base
   int64_t inter_size_local_ = 0;  // per-rank, half of out_size_local_ if fused
   bool is_fused_gate_up_ = false;
+  int64_t tp_rank_ = 0;
+  int64_t tp_world_size_ = 1;
 };
 TORCH_MODULE(LoRAColumnParallelLinear);
 
