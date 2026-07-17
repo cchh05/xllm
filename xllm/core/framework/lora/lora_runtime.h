@@ -238,6 +238,72 @@ class LoRARuntime {
                                       int32_t layer_index,
                                       const std::string& proj_name);
 
+  // ---- MoE expert LoRA (Day 1 Phase 1) ----
+  //
+  // For MoE models like Qwen3-30B-A3B, adapter safetensors carry per-expert
+  // LoRA weights, e.g.
+  // base_model.model.model.layers.{L}.mlp.experts.{E}.gate_proj.lora_A.weight
+  // These cannot use ProjDelta (single 2D pair per slot) -- we need to stack
+  // over the E dim so FusedMoEImpl::forward_expert can consume them via one
+  // grouped-gemm call per proj.
+  //
+  // MoeExpertDelta holds device-resident 3D tensors:
+  //   A_gate/A_up: [E_per_rank, hidden, r]
+  //   B_gate/B_up: [E_per_rank, r, out_local]     (out_local = intermediate/tp)
+  //   A_down:      [E_per_rank, in_local, r]      (in_local  = intermediate/tp)
+  //   B_down:      [E_per_rank, r, hidden]
+  // Empty (undefined) tensor means "adapter did not target that proj".
+  struct MoeExpertDelta {
+    torch::Tensor A_gate;
+    torch::Tensor B_gate;
+    torch::Tensor A_up;
+    torch::Tensor B_up;
+    torch::Tensor A_down;
+    torch::Tensor B_down;
+    float scaling = 0.0f;
+    int32_t r = 0;
+  };
+
+  // Materialize an adapter's experts.{E}.{proj} tensors onto device and
+  // register in the MoE expert pool. Must be called from the model ctor
+  // thread (V60 rules) -- xllm can only do CPU->NPU .to() there.
+  //
+  // Preconditions: (1) the same adapter has already been installed via
+  // install_static_adapter_on_device_per_proj (which parses adapter_config,
+  // registers name->int_id, and canonicalises tensor keys); or a fresh
+  // adapter with no attention LoRA tensors is being registered by this call.
+  //
+  // Only the experts.{E}.{proj} keys are consumed here. Attention keys
+  // (self_attn.q_proj etc.) are ignored -- the sister call handles them.
+  //
+  // Fails silently (returns nullopt) if the adapter has zero experts.*
+  // tensors. This lets callers install attention-only adapters unchanged.
+  //
+  // num_experts_total: the base model's total expert count (128 for
+  //   Qwen3-30B-A3B). num_experts_per_rank: how many experts this rank owns
+  //   (32 when tp=4, ep=1). start_expert_id: this rank's first expert
+  //   (rank * num_experts_per_rank when ep=1). intermediate_size: base
+  //   model's per-expert intermediate dim (768 for Qwen3-30B-A3B, before
+  //   TP shard). tp: as usual.
+  std::optional<uint64_t> install_static_adapter_on_moe_experts(
+      const std::string& lora_name,
+      const std::string& lora_path,
+      const std::string& base_model_name,
+      torch::Device device,
+      torch::ScalarType dtype,
+      TPInfo tp,
+      int32_t num_experts_total,
+      int32_t num_experts_per_rank,
+      int32_t start_expert_id,
+      int32_t intermediate_size);
+
+  // Look up the MoE expert delta for a decoder layer. Called from
+  // FusedMoEImpl::forward_expert once per forward per layer. Returns
+  // nullptr if the adapter has no MoE tensors for this layer (or the
+  // adapter id is unknown).
+  const MoeExpertDelta* get_moe_expert_delta(uint64_t int_id,
+                                             int32_t layer_index);
+
  private:
   LoRARuntime() = default;
 
@@ -303,6 +369,13 @@ class LoRARuntime {
   std::unordered_map<uint64_t,
                      std::unordered_map<ProjKey, ProjDelta, ProjKeyHash>>
       per_proj_device_pool_;
+
+  // Day 1 Phase 1: MoE expert LoRA pool. int_id -> (layer_index ->
+  // MoeExpertDelta). Populated by install_static_adapter_on_moe_experts
+  // at ctor time. Read by get_moe_expert_delta from FusedMoEImpl::forward.
+  // Guarded by materialise_mu_.
+  std::unordered_map<uint64_t, std::unordered_map<int32_t, MoeExpertDelta>>
+      moe_expert_lora_pool_;
 };
 
 }  // namespace xllm

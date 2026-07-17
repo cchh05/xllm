@@ -76,6 +76,16 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
             std::max(1, parallel_args.world_size() / parallel_args.dp_size());
         const int32_t tp_rank = parallel_args.rank() % tp_size;
         int ok = 0, failed = 0;
+        // Compute MoE expert partition (matches FusedMoEImpl::load_experts).
+        const int32_t num_experts_total =
+            static_cast<int32_t>(model_args.num_experts());
+        const int32_t ep_size = std::max(1, parallel_args.ep_size());
+        const int32_t num_experts_per_rank = num_experts_total / ep_size;
+        // ep_rank -- when ep_size == 1, this is 0 for all TP ranks.
+        const int32_t ep_rank = (ep_size > 1) ? parallel_args.rank() : 0;
+        const int32_t start_expert_id = ep_rank * num_experts_per_rank;
+        const int32_t moe_intermediate =
+            static_cast<int32_t>(model_args.moe_intermediate_size());
         for (const auto& [name, path] : modules) {
           auto id =
               LoRARuntime::instance().install_static_adapter_on_device_per_proj(
@@ -92,6 +102,25 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
           } else {
             ++failed;
             LOG(ERROR) << "[qwen3_moe M10] failed '" << name << "'";
+          }
+
+          // Also install MoE expert LoRA tensors (experts.{E}.{proj}).
+          // Uses the same name/path -> same int_id via registry idempotency.
+          auto moe_id =
+              LoRARuntime::instance().install_static_adapter_on_moe_experts(
+                  name,
+                  path,
+                  /*base_model_name=*/"",
+                  options.device(),
+                  options.dtype().toScalarType(),
+                  TPInfo{tp_size, tp_rank},
+                  num_experts_total,
+                  num_experts_per_rank,
+                  start_expert_id,
+                  moe_intermediate);
+          if (moe_id.has_value()) {
+            LOG(INFO) << "[qwen3_moe M10-MoE] preloaded expert-LoRA for '"
+                      << name << "' id=" << *moe_id;
           }
         }
         LOG(INFO) << "[qwen3_moe M10] preload done: ok=" << ok

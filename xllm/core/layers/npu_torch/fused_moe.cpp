@@ -20,6 +20,8 @@ limitations under the License.
 #include <numeric>
 #include <vector>
 
+#include "framework/lora/lora_context.h"
+#include "framework/lora/lora_runtime.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
 
@@ -350,6 +352,82 @@ torch::Tensor FusedMoEImpl::forward_expert(
     gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
   }
 
+  // ---- MoE expert LoRA delta (Phase 2A): gate/up halves of gemm1_out ----
+  //
+  // gemm1_out is [T_exp, 2 * I_local], laid out as [gate_out || up_out].
+  // For each adapter present in the batch, add:
+  //   delta_gate = (x @ A_gate) @ B_gate * scaling  -> [T_exp, I_local]
+  //   delta_up   = (x @ A_up)   @ B_up   * scaling  -> [T_exp, I_local]
+  // Same group_list as base group_gemm since we're routed on the same
+  // token->expert mapping. MVP: single adapter, all tokens share it.
+  {
+    const auto* ctx = xllm::current_lora_context();
+    if (ctx != nullptr && ctx->adapter_ids != nullptr &&
+        !ctx->adapter_ids->empty()) {
+      // MVP: pick the first non-zero adapter_id.
+      uint64_t adapter_id = 0;
+      for (uint64_t aid : *ctx->adapter_ids) {
+        if (aid != 0) {
+          adapter_id = aid;
+          break;
+        }
+      }
+      const int32_t layer_index = ctx->layer_index;
+      if (adapter_id != 0 && layer_index >= 0) {
+        const auto* med = xllm::LoRARuntime::instance().get_moe_expert_delta(
+            adapter_id, layer_index);
+        if (med != nullptr) {
+          const int64_t I_local = gemm1_out.size(-1) / 2;
+          // gate delta
+          if (med->A_gate.defined() && med->B_gate.defined()) {
+            xllm::kernel::GroupGemmParams p1;
+            p1.a = expand_hidden_states;
+            p1.b = med->A_gate;
+            p1.group_list = selected_expert_info.token_count_slice;
+            p1.split_item = 2;
+            p1.group_type = 0;
+            p1.group_list_type = 1;
+            torch::Tensor lora_a_out = xllm::kernel::group_gemm(p1);
+
+            xllm::kernel::GroupGemmParams p2;
+            p2.a = lora_a_out;
+            p2.b = med->B_gate;
+            p2.group_list = selected_expert_info.token_count_slice;
+            p2.split_item = 2;
+            p2.group_type = 0;
+            p2.group_list_type = 1;
+            torch::Tensor delta_gate = xllm::kernel::group_gemm(p2);
+            // In-place add into the gate half of gemm1_out.
+            gemm1_out.slice(-1, 0, I_local)
+                .add_(delta_gate.to(gemm1_out.dtype()), med->scaling);
+          }
+          // up delta
+          if (med->A_up.defined() && med->B_up.defined()) {
+            xllm::kernel::GroupGemmParams p1;
+            p1.a = expand_hidden_states;
+            p1.b = med->A_up;
+            p1.group_list = selected_expert_info.token_count_slice;
+            p1.split_item = 2;
+            p1.group_type = 0;
+            p1.group_list_type = 1;
+            torch::Tensor lora_a_out = xllm::kernel::group_gemm(p1);
+
+            xllm::kernel::GroupGemmParams p2;
+            p2.a = lora_a_out;
+            p2.b = med->B_up;
+            p2.group_list = selected_expert_info.token_count_slice;
+            p2.split_item = 2;
+            p2.group_type = 0;
+            p2.group_list_type = 1;
+            torch::Tensor delta_up = xllm::kernel::group_gemm(p2);
+            gemm1_out.slice(-1, I_local, 2 * I_local)
+                .add_(delta_up.to(gemm1_out.dtype()), med->scaling);
+          }
+        }
+      }
+    }
+  }
+
   // Step 5: activation
   torch::Tensor act_out;
 
@@ -379,6 +457,46 @@ torch::Tensor FusedMoEImpl::forward_expert(
     group_gemm_params.group_type = 0;
     group_gemm_params.group_list_type = 1;
     gemm2_out = xllm::kernel::group_gemm(group_gemm_params);
+  }
+
+  // ---- MoE expert LoRA delta (Phase 2A): down_proj on gemm2_out ----
+  {
+    const auto* ctx = xllm::current_lora_context();
+    if (ctx != nullptr && ctx->adapter_ids != nullptr &&
+        !ctx->adapter_ids->empty()) {
+      uint64_t adapter_id = 0;
+      for (uint64_t aid : *ctx->adapter_ids) {
+        if (aid != 0) {
+          adapter_id = aid;
+          break;
+        }
+      }
+      const int32_t layer_index = ctx->layer_index;
+      if (adapter_id != 0 && layer_index >= 0) {
+        const auto* med = xllm::LoRARuntime::instance().get_moe_expert_delta(
+            adapter_id, layer_index);
+        if (med != nullptr && med->A_down.defined() && med->B_down.defined()) {
+          xllm::kernel::GroupGemmParams p1;
+          p1.a = act_out;
+          p1.b = med->A_down;
+          p1.group_list = selected_expert_info.token_count_slice;
+          p1.split_item = 2;
+          p1.group_type = 0;
+          p1.group_list_type = 1;
+          torch::Tensor lora_a_out = xllm::kernel::group_gemm(p1);
+
+          xllm::kernel::GroupGemmParams p2;
+          p2.a = lora_a_out;
+          p2.b = med->B_down;
+          p2.group_list = selected_expert_info.token_count_slice;
+          p2.split_item = 2;
+          p2.group_type = 0;
+          p2.group_list_type = 1;
+          torch::Tensor delta_down = xllm::kernel::group_gemm(p2);
+          gemm2_out.add_(delta_down.to(gemm2_out.dtype()), med->scaling);
+        }
+      }
+    }
   }
 
   // Step 7: combine the intermediate results and get the final hidden states

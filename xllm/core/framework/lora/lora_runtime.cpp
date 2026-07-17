@@ -530,6 +530,35 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
     return std::make_tuple(layer_index, proj, is_a);
   };
 
+  // fix #5: experts LoRA keys must NOT go through the per-proj installer.
+  // xllm's per_proj_device_pool_ is keyed by (layer, proj_name) and stores
+  // dense-MLP wrapper deltas. If we let an "layers.N.mlp.experts.M.gate_proj"
+  // key parse to proj_name="gate_proj", 128 experts would all collide on the
+  // same key and get silently overwritten, and the FusedMoE forward path
+  // has no wrapper to consume them anyway --- classic silent no-op.
+  // Refuse loud so callers know to either drop experts from target_modules
+  // or route the adapter through install_static_adapter_on_moe_experts.
+  {
+    int32_t experts_keys = 0;
+    std::string first_bad_key;
+    for (const auto& [key, unused_tensor] : adapter_opt->tensors) {
+      if (key.find(".experts.") != std::string::npos) {
+        ++experts_keys;
+        if (first_bad_key.empty()) first_bad_key = key;
+      }
+    }
+    if (experts_keys > 0) {
+      LOG(ERROR) << "[LoRARuntime] per-proj installer refuses adapter '"
+                 << lora_name << "': contains " << experts_keys
+                 << " MoE-expert key(s), e.g. '" << first_bad_key << "'. "
+                 << "Per-proj installer only handles dense attention/MLP LoRA. "
+                 << "Either drop experts from adapter target_modules "
+                 << "(attention-only: q/k/v/o_proj) or use "
+                 << "install_static_adapter_on_moe_experts (Phase D).";
+      return std::nullopt;
+    }
+  }
+
   for (const auto& [key, tensor] : adapter_opt->tensors) {
     auto parsed = parse_key(key);
     if (!parsed) continue;
@@ -605,6 +634,312 @@ const LoRARuntime::ProjDelta* LoRARuntime::get_per_proj_delta(
   auto pit = it->second.find(ProjKey{layer_index, proj_name});
   if (pit == it->second.end()) return nullptr;
   return &pit->second;
+}
+
+// ---------------------------------------------------------------------
+// Day 1 Phase 1: MoE expert LoRA install path.
+// ---------------------------------------------------------------------
+//
+// Parses adapter tensors keyed like
+//    layers.{L}.mlp.experts.{E}.{proj}#A or #B
+// (proj in {gate_proj, up_proj, down_proj}), stacks them across E into
+// 3D tensors laid out to match fused_moe.cpp's group_gemm inputs after
+// its lazy [E, out, in] -> [E, in, out] transpose, applies TP shard on
+// out_dim for gate/up B and in_dim for down A, moves to device, and
+// stores in moe_expert_lora_pool_.
+//
+// Only this rank's experts (start_expert_id .. start_expert_id +
+// num_experts_per_rank) are kept. Other experts' A/B tensors are
+// dropped after materialize.
+
+namespace {
+
+// Parse "layers.{L}.mlp.experts.{E}.{proj}#{A|B}" into (L, E, proj, is_a).
+// Returns nullopt for non-expert keys.
+struct MoeKey {
+  int32_t layer_index;
+  int32_t expert_index;
+  std::string proj;
+  bool is_a;
+};
+
+std::optional<MoeKey> parse_moe_expert_key(const std::string& canon) {
+  if (canon.size() < 2) return std::nullopt;
+  const std::string tail = canon.substr(canon.size() - 2);
+  if (tail != "#A" && tail != "#B") return std::nullopt;
+  const bool is_a = (tail == "#A");
+  const std::string prefix = canon.substr(0, canon.size() - 2);
+
+  // Strip optional "model." leader (some adapters retain it).
+  std::string p = prefix;
+  if (p.rfind("model.layers.", 0) == 0) {
+    p = p.substr(std::string("model.").size());
+  }
+  if (p.rfind("layers.", 0) != 0) return std::nullopt;
+  p = p.substr(std::string("layers.").size());  // "{L}.mlp.experts.{E}.{proj}"
+
+  auto dot1 = p.find('.');
+  if (dot1 == std::string::npos) return std::nullopt;
+  int32_t layer;
+  try {
+    layer = std::stoi(p.substr(0, dot1));
+  } catch (...) {
+    return std::nullopt;
+  }
+  const std::string rest = p.substr(dot1 + 1);  // "mlp.experts.{E}.{proj}"
+
+  // We require the exact "mlp.experts." prefix. Some adapters may use
+  // "mlp.experts." vs "mlp.experts_" depending on training toolchain;
+  // the mainline PEFT format uses the former.
+  const std::string kExpertsPrefix = "mlp.experts.";
+  if (rest.rfind(kExpertsPrefix, 0) != 0) return std::nullopt;
+  const std::string rest2 = rest.substr(kExpertsPrefix.size());  // "{E}.{proj}"
+
+  auto dot2 = rest2.find('.');
+  if (dot2 == std::string::npos) return std::nullopt;
+  int32_t expert;
+  try {
+    expert = std::stoi(rest2.substr(0, dot2));
+  } catch (...) {
+    return std::nullopt;
+  }
+  const std::string proj = rest2.substr(dot2 + 1);
+  if (proj != "gate_proj" && proj != "up_proj" && proj != "down_proj") {
+    return std::nullopt;
+  }
+
+  return MoeKey{layer, expert, proj, is_a};
+}
+
+}  // namespace
+
+std::optional<uint64_t> LoRARuntime::install_static_adapter_on_moe_experts(
+    const std::string& lora_name,
+    const std::string& lora_path,
+    const std::string& base_model_name,
+    torch::Device device,
+    torch::ScalarType dtype,
+    TPInfo tp,
+    int32_t num_experts_total,
+    int32_t num_experts_per_rank,
+    int32_t start_expert_id,
+    int32_t intermediate_size) {
+  if (!enabled()) {
+    LOG(ERROR) << "[LoRARuntime] not enabled; refuse MoE install '" << lora_name
+               << "'";
+    return std::nullopt;
+  }
+  if (!loader_) {
+    LOG(ERROR) << "[LoRARuntime] loader not initialised";
+    return std::nullopt;
+  }
+
+  LoRARequest req{lora_name, /*int_id=*/0, lora_path, base_model_name};
+  auto adapter_opt = loader_->load(req);
+  if (!adapter_opt) return std::nullopt;
+
+  // Register (or reuse) the adapter name so per_proj + moe paths share
+  // the same int_id.
+  // register_adapter is idempotent when name+path match.
+  const auto id_opt = registry_.register_adapter(req);
+  if (!id_opt) {
+    LOG(ERROR) << "[LoRARuntime] MoE install: register failed for '"
+               << lora_name << "'";
+    return std::nullopt;
+  }
+  const uint64_t int_id = *id_opt;
+
+  // Bucket adapter tensors by (layer, proj) -> vec<expert_idx, is_a, tensor>.
+  struct Slot {
+    int32_t expert_index = -1;
+    bool is_a = false;
+    torch::Tensor tensor;
+  };
+  std::unordered_map<
+      int32_t /*layer*/,
+      std::unordered_map<std::string /*proj*/, std::vector<Slot>>>
+      by_layer_proj;
+
+  int32_t total_expert_tensors = 0;
+  for (const auto& [key, tensor] : adapter_opt->tensors) {
+    auto parsed = parse_moe_expert_key(key);
+    if (!parsed) continue;
+    ++total_expert_tensors;
+    // Keep only this rank's experts.
+    if (parsed->expert_index < start_expert_id ||
+        parsed->expert_index >= start_expert_id + num_experts_per_rank) {
+      continue;
+    }
+    Slot slot{parsed->expert_index, parsed->is_a, tensor};
+    by_layer_proj[parsed->layer_index][parsed->proj].push_back(std::move(slot));
+  }
+
+  if (by_layer_proj.empty()) {
+    LOG(INFO) << "[LoRARuntime] MoE install '" << lora_name
+              << "': no experts.* tensors matched this rank (start_expert_id="
+              << start_expert_id << " num_per_rank=" << num_experts_per_rank
+              << " total_expert_tensors_seen=" << total_expert_tensors << ")";
+    return int_id;
+  }
+
+  const int32_t r = adapter_opt->r;
+  const float scaling = adapter_opt->scaling;
+  const int32_t hidden = -1;  // inferred from A tensor row count below.
+  const int32_t tp_world = std::max(1, tp.tp_size);
+  const int32_t tp_rank = std::max(0, tp.tp_rank);
+  const int32_t local_intermediate = intermediate_size / tp_world;
+
+  auto stack_experts = [&](const std::vector<Slot>& slots,
+                           bool is_a) -> torch::Tensor {
+    // Build a map expert_index -> tensor, ordered by expert_index within
+    // this rank (we already filtered to this rank's expert range).
+    std::vector<Slot> filtered;
+    for (const auto& s : slots) {
+      if (s.is_a != is_a) continue;
+      filtered.push_back(s);
+    }
+    if (filtered.empty()) return torch::Tensor();
+    std::sort(
+        filtered.begin(), filtered.end(), [](const Slot& a, const Slot& b) {
+          return a.expert_index < b.expert_index;
+        });
+    if (static_cast<int32_t>(filtered.size()) != num_experts_per_rank) {
+      LOG(WARNING) << "[LoRARuntime] MoE install '" << lora_name << "': got "
+                   << filtered.size()
+                   << " expert tensors for a slot but expected "
+                   << num_experts_per_rank << " (is_a=" << is_a
+                   << "); skipping this slot";
+      return torch::Tensor();
+    }
+    std::vector<torch::Tensor> tensors;
+    tensors.reserve(filtered.size());
+    for (auto& s : filtered) tensors.push_back(s.tensor);
+    // Stack across expert dim -> [E_per_rank, ...].
+    return torch::stack(tensors, /*dim=*/0);
+  };
+
+  int32_t layers_installed = 0;
+  int32_t layers_skipped = 0;
+  std::unordered_map<int32_t, MoeExpertDelta> pool_layers;
+
+  for (auto& [layer, projs] : by_layer_proj) {
+    MoeExpertDelta med;
+    med.r = r;
+    med.scaling = scaling;
+
+    // gate_proj.
+    if (auto it = projs.find("gate_proj"); it != projs.end()) {
+      auto A_stacked = stack_experts(it->second, /*is_a=*/true);
+      auto B_stacked = stack_experts(it->second, /*is_a=*/false);
+      if (A_stacked.defined() && B_stacked.defined()) {
+        // PEFT stored A as [r, hidden]; base group_gemm wants
+        // A_gate: [E_per_rank, hidden, r]. Transpose(1,2).
+        // PEFT stored B as [out_full, r]; we need [E_per_rank, r, out_local].
+        // Shard on dim=1 (out) then transpose to put r first.
+        A_stacked = A_stacked.transpose(1, 2).contiguous();
+        // B_stacked: [E, out_full, r] -> slice on out -> [E, out_local, r]
+        //   -> transpose to [E, r, out_local]
+        auto B_shard = B_stacked
+                           .slice(1,
+                                  tp_rank * local_intermediate,
+                                  (tp_rank + 1) * local_intermediate)
+                           .transpose(1, 2)
+                           .contiguous();
+        try {
+          med.A_gate = A_stacked.to(device, dtype).contiguous();
+          med.B_gate = B_shard.to(device, dtype).contiguous();
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "[LoRARuntime] MoE .to(device) gate_proj L=" << layer
+                     << ": " << e.what();
+          med.A_gate = torch::Tensor();
+          med.B_gate = torch::Tensor();
+        }
+      }
+    }
+
+    // up_proj.
+    if (auto it = projs.find("up_proj"); it != projs.end()) {
+      auto A_stacked = stack_experts(it->second, /*is_a=*/true);
+      auto B_stacked = stack_experts(it->second, /*is_a=*/false);
+      if (A_stacked.defined() && B_stacked.defined()) {
+        A_stacked = A_stacked.transpose(1, 2).contiguous();
+        auto B_shard = B_stacked
+                           .slice(1,
+                                  tp_rank * local_intermediate,
+                                  (tp_rank + 1) * local_intermediate)
+                           .transpose(1, 2)
+                           .contiguous();
+        try {
+          med.A_up = A_stacked.to(device, dtype).contiguous();
+          med.B_up = B_shard.to(device, dtype).contiguous();
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "[LoRARuntime] MoE .to(device) up_proj L=" << layer
+                     << ": " << e.what();
+          med.A_up = torch::Tensor();
+          med.B_up = torch::Tensor();
+        }
+      }
+    }
+
+    // down_proj.
+    if (auto it = projs.find("down_proj"); it != projs.end()) {
+      auto A_stacked = stack_experts(it->second, /*is_a=*/true);
+      auto B_stacked = stack_experts(it->second, /*is_a=*/false);
+      if (A_stacked.defined() && B_stacked.defined()) {
+        // A: [r, in_full] -> shard on in -> [r, in_local] -> [E, in_local, r]
+        auto A_shard = A_stacked
+                           .slice(2,
+                                  tp_rank * local_intermediate,
+                                  (tp_rank + 1) * local_intermediate)
+                           .transpose(1, 2)
+                           .contiguous();
+        // B: [hidden, r] -> [E, r, hidden]
+        B_stacked = B_stacked.transpose(1, 2).contiguous();
+        try {
+          med.A_down = A_shard.to(device, dtype).contiguous();
+          med.B_down = B_stacked.to(device, dtype).contiguous();
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "[LoRARuntime] MoE .to(device) down_proj L=" << layer
+                     << ": " << e.what();
+          med.A_down = torch::Tensor();
+          med.B_down = torch::Tensor();
+        }
+      }
+    }
+
+    // Only keep the layer if at least one proj is defined.
+    if (med.A_gate.defined() || med.A_up.defined() || med.A_down.defined()) {
+      pool_layers.emplace(layer, std::move(med));
+      ++layers_installed;
+    } else {
+      ++layers_skipped;
+    }
+  }
+
+  {
+    std::lock_guard g(materialise_mu_);
+    moe_expert_lora_pool_[int_id] = std::move(pool_layers);
+  }
+  LOG(INFO) << "[LoRARuntime] installed MoE expert adapter '" << lora_name
+            << "' id=" << int_id << " layers=" << layers_installed
+            << " skipped=" << layers_skipped << " r=" << r
+            << " scaling=" << scaling << " E_per_rank=" << num_experts_per_rank
+            << " start_expert=" << start_expert_id
+            << " intermediate_local=" << local_intermediate
+            << " tp=" << tp_world;
+  return int_id;
+}
+
+const LoRARuntime::MoeExpertDelta* LoRARuntime::get_moe_expert_delta(
+    uint64_t int_id,
+    int32_t layer_index) {
+  if (int_id == 0) return nullptr;
+  std::lock_guard g(materialise_mu_);
+  auto it = moe_expert_lora_pool_.find(int_id);
+  if (it == moe_expert_lora_pool_.end()) return nullptr;
+  auto lit = it->second.find(layer_index);
+  if (lit == it->second.end()) return nullptr;
+  return &lit->second;
 }
 
 }  // namespace xllm
