@@ -26,6 +26,7 @@ limitations under the License.
 #include <iomanip>
 #include <memory>
 #include <sstream>
+#include <unordered_set>
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
@@ -991,6 +992,21 @@ std::vector<Batch> ContinuousScheduler::prepare_batch() {
     // only update the scheduling latency when there are requests to process
     COUNTER_ADD(scheduling_latency_seconds, timer.elapsed_seconds());
     kv_cache_manager_->transfer_blocks(batches);
+
+    // W4-A4: observe batch-level LoRA distribution for scheduler visibility.
+    // Fast path = 0 or 1 distinct adapter (wrapper hot loop),
+    // slow path = 2+ (fused_moe per-token mask). Gateway adapter-affinity
+    // dispatch should keep this near 1.0 fast-path ratio in practice.
+    {
+      std::unordered_set<uint64_t> distinct;
+      for (const Sequence* seq : running_sequences_) {
+        if (seq == nullptr) continue;
+        const uint64_t aid = seq->adapter_id();
+        if (aid != 0) distinct.insert(aid);
+      }
+      LoRAMetrics::instance().observe_batch_lora(distinct.size(),
+                                                 running_sequences_.size());
+    }
   } else {
     kv_cache_manager_->transfer_blocks();
   }

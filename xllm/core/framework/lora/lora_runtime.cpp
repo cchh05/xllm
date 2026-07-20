@@ -96,6 +96,22 @@ void LoRARuntime::set_model_device_dtype(torch::Device device,
   }
 }
 
+// W4-A3: set the hot-swap install config so the pinned executor thread
+// knows whether to run per-proj-only or per-proj + moe-experts (and with
+// what TP + MoE args). Called from model ctor.
+void LoRARuntime::set_hotswap_config(const HotswapConfig& cfg) {
+  std::lock_guard<std::mutex> lk(materialise_mu_);
+  hotswap_config_ = cfg;
+  hotswap_config_set_ = true;
+  LOG(INFO) << "[LoRARuntime] hotswap config set: tp={" << cfg.tp.tp_size << ","
+            << cfg.tp.tp_rank << "} install_per_proj=" << cfg.install_per_proj
+            << " install_moe=" << cfg.install_moe_experts
+            << " num_experts_total=" << cfg.num_experts_total
+            << " per_rank=" << cfg.num_experts_per_rank
+            << " start_expert_id=" << cfg.start_expert_id
+            << " moe_inter=" << cfg.moe_intermediate_size;
+}
+
 void LoRARuntime::executor_loop(int32_t device_index, torch::ScalarType dtype) {
 #if defined(USE_NPU)
   aclError ret = aclrtSetDevice(device_index);
@@ -121,8 +137,57 @@ void LoRARuntime::executor_loop(int32_t device_index, torch::ScalarType dtype) {
     LOG(INFO) << "[LoRARuntime] executor picked up task name='" << task.name
               << "'";
     torch::Device dev(torch::kPrivateUse1, device_index);
-    auto id_opt = install_static_adapter_on_device(
-        task.name, task.path, task.base_model_name, dev, dtype);
+
+    // W4-A3: read hotswap config, prefer per-proj (+ optional moe experts)
+    // install. Fall back to whole-block install if config not set (legacy
+    // Path C prod v3 path).
+    HotswapConfig cfg;
+    bool have_cfg = false;
+    {
+      std::lock_guard<std::mutex> lk(materialise_mu_);
+      cfg = hotswap_config_;
+      have_cfg = hotswap_config_set_;
+    }
+
+    std::optional<uint64_t> id_opt;
+    if (have_cfg && cfg.install_per_proj) {
+      id_opt = install_static_adapter_on_device_per_proj(
+          task.name, task.path, task.base_model_name, dev, dtype, cfg.tp);
+      if (id_opt.has_value()) {
+        LOG(INFO) << "[LoRARuntime] hot-swap per-proj installed '" << task.name
+                  << "' id=" << *id_opt;
+      } else {
+        LOG(WARNING) << "[LoRARuntime] hot-swap per-proj install returned "
+                     << "nullopt for '" << task.name
+                     << "'; MoE-only adapters can still succeed via next step";
+      }
+      // MoE experts install: shares int_id with per-proj via registry
+      // idempotency. Real MoE fine-tuned adapters have both attn (per-proj)
+      // and experts tensors; attn-only adapters are handled by per-proj only.
+      if (cfg.install_moe_experts) {
+        auto moe_id =
+            install_static_adapter_on_moe_experts(task.name,
+                                                  task.path,
+                                                  task.base_model_name,
+                                                  dev,
+                                                  dtype,
+                                                  cfg.tp,
+                                                  cfg.num_experts_total,
+                                                  cfg.num_experts_per_rank,
+                                                  cfg.start_expert_id,
+                                                  cfg.moe_intermediate_size);
+        if (moe_id.has_value()) {
+          LOG(INFO) << "[LoRARuntime] hot-swap MoE-experts installed '"
+                    << task.name << "' id=" << *moe_id;
+          // If per-proj skipped (e.g. attn-only refused because adapter
+          // contains only experts), surface moe id as the result.
+          if (!id_opt.has_value()) id_opt = moe_id;
+        }
+      }
+    } else {
+      id_opt = install_static_adapter_on_device(
+          task.name, task.path, task.base_model_name, dev, dtype);
+    }
     task.result.set_value(id_opt);
   }
 

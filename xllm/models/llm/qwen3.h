@@ -70,13 +70,23 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
       LoRARuntime::instance().set_model_device_dtype(
           options.device(), options.dtype().toScalarType());
       const auto& modules = LoRARuntime::instance().config().lora_modules;
+      // W4-A3: capture TP and register hotswap config for the pinned
+      // executor thread. Dense qwen3 has no MoE experts, so
+      // install_moe_experts stays false.
+      auto parallel_args = context.get_parallel_args();
+      const int32_t tp_size =
+          std::max(1, parallel_args.world_size() / parallel_args.dp_size());
+      const int32_t tp_rank = parallel_args.rank() % tp_size;
+      {
+        LoRARuntime::HotswapConfig cfg;
+        cfg.tp = TPInfo{tp_size, tp_rank};
+        cfg.install_per_proj = true;
+        cfg.install_moe_experts = false;
+        LoRARuntime::instance().set_hotswap_config(cfg);
+      }
       if (!modules.empty()) {
         LOG(INFO) << "[general path M10] preloading " << modules.size()
                   << " per-proj static adapter(s) on " << options.device();
-        auto parallel_args = context.get_parallel_args();
-        const int32_t tp_size =
-            std::max(1, parallel_args.world_size() / parallel_args.dp_size());
-        const int32_t tp_rank = parallel_args.rank() % tp_size;
         int ok = 0, failed = 0;
         for (const auto& [name, path] : modules) {
           auto id =

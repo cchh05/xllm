@@ -68,24 +68,35 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
       LoRARuntime::instance().set_model_device_dtype(
           options.device(), options.dtype().toScalarType());
       const auto& modules = LoRARuntime::instance().config().lora_modules;
+      // W4-A3: capture TP + MoE args and register hotswap config so the
+      // pinned executor thread runs the same install path as static preload.
+      auto parallel_args = context.get_parallel_args();
+      const int32_t tp_size =
+          std::max(1, parallel_args.world_size() / parallel_args.dp_size());
+      const int32_t tp_rank = parallel_args.rank() % tp_size;
+      const int32_t num_experts_total =
+          static_cast<int32_t>(model_args.num_experts());
+      const int32_t ep_size = std::max(1, parallel_args.ep_size());
+      const int32_t num_experts_per_rank = num_experts_total / ep_size;
+      const int32_t ep_rank = (ep_size > 1) ? parallel_args.rank() : 0;
+      const int32_t start_expert_id = ep_rank * num_experts_per_rank;
+      const int32_t moe_intermediate =
+          static_cast<int32_t>(model_args.moe_intermediate_size());
+      {
+        LoRARuntime::HotswapConfig cfg;
+        cfg.tp = TPInfo{tp_size, tp_rank};
+        cfg.install_per_proj = true;
+        cfg.install_moe_experts = true;
+        cfg.num_experts_total = num_experts_total;
+        cfg.num_experts_per_rank = num_experts_per_rank;
+        cfg.start_expert_id = start_expert_id;
+        cfg.moe_intermediate_size = moe_intermediate;
+        LoRARuntime::instance().set_hotswap_config(cfg);
+      }
       if (!modules.empty()) {
         LOG(INFO) << "[qwen3_moe M10] preloading " << modules.size()
                   << " per-proj static adapter(s) on " << options.device();
-        auto parallel_args = context.get_parallel_args();
-        const int32_t tp_size =
-            std::max(1, parallel_args.world_size() / parallel_args.dp_size());
-        const int32_t tp_rank = parallel_args.rank() % tp_size;
         int ok = 0, failed = 0;
-        // Compute MoE expert partition (matches FusedMoEImpl::load_experts).
-        const int32_t num_experts_total =
-            static_cast<int32_t>(model_args.num_experts());
-        const int32_t ep_size = std::max(1, parallel_args.ep_size());
-        const int32_t num_experts_per_rank = num_experts_total / ep_size;
-        // ep_rank -- when ep_size == 1, this is 0 for all TP ranks.
-        const int32_t ep_rank = (ep_size > 1) ? parallel_args.rank() : 0;
-        const int32_t start_expert_id = ep_rank * num_experts_per_rank;
-        const int32_t moe_intermediate =
-            static_cast<int32_t>(model_args.moe_intermediate_size());
         for (const auto& [name, path] : modules) {
           auto id =
               LoRARuntime::instance().install_static_adapter_on_device_per_proj(
@@ -191,7 +202,8 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
     lora_frame.q_seq_lens_vec = &modified_input_params.q_seq_lens_vec;
     // Phase A W2 v2: device-side per-token adapter tensor (built in
     // ModelInputParams::to(device); may be undefined() for pure-base).
-    lora_frame.adapter_ids_per_token = &modified_input_params.adapter_ids_per_token;
+    lora_frame.adapter_ids_per_token =
+        &modified_input_params.adapter_ids_per_token;
     lora_frame.layer_index = -1;
     LoRAScope _lora_scope(lora_frame);
 

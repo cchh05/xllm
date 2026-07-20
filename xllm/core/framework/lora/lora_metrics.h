@@ -128,6 +128,13 @@ class LoRAMetrics {
   };
   std::vector<Snapshot> snapshot_all() const;
 
+  // W4-A4: batch-level LoRA metrics (global, not per-adapter). Called from
+  // scheduler prepare_batch once per assembled batch.
+  //   distinct_count = number of distinct non-zero adapter_ids in the batch
+  //   total_seqs     = total sequences in the batch (for hit-rate ratio)
+  // fast_path = (distinct_count <= 1), slow_path = (distinct_count >= 2)
+  void observe_batch_lora(size_t distinct_count, size_t total_seqs);
+
   // For test / debug: how many adapters are currently tracked.
   size_t adapter_count() const;
 
@@ -154,6 +161,11 @@ class LoRAMetrics {
 
   // Global gauge: how many adapters are currently in `active` state.
   std::unique_ptr<bvar::Status<int64_t>> active_adapters_count_;
+
+  // W4-A4 batch-level counters (global, not per-adapter).
+  std::unique_ptr<bvar::Adder<int64_t>> batch_fast_path_total_;
+  std::unique_ptr<bvar::Adder<int64_t>> batch_slow_path_total_;
+  std::unique_ptr<bvar::LatencyRecorder> batch_distinct_adapters_;
 };
 
 }  // namespace xllm

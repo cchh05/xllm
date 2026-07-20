@@ -95,6 +95,22 @@ class LoRARuntime {
   // per engine today).
   void set_model_device_dtype(torch::Device device, torch::ScalarType dtype);
 
+  // W4-A3: hot-swap install config. Passed from model ctor so that
+  // load_and_activate_hotswap knows whether to run per-proj + moe-experts
+  // installers (and with what TP + MoE args) or only per-proj (dense).
+  // Idempotent; last caller wins (single model per engine today).
+  struct HotswapConfig {
+    TPInfo tp;                         // TP {world_size, rank}
+    bool install_per_proj = true;      // always install per-proj attn/MLP
+    bool install_moe_experts = false;  // set true for qwen3_moe
+    // MoE args (ignored when install_moe_experts=false)
+    int32_t num_experts_total = 0;
+    int32_t num_experts_per_rank = 0;
+    int32_t start_expert_id = 0;
+    int32_t moe_intermediate_size = 0;
+  };
+  void set_hotswap_config(const HotswapConfig& cfg);
+
   // Load an adapter from a filesystem path, parse its PEFT files, pick a
   // whole-block A/B pair, cast to the model's dtype, and register it.
   //
@@ -353,6 +369,11 @@ class LoRARuntime {
   std::atomic<bool> executor_stop_{false};
   std::thread executor_thread_;
   bool executor_started_ = false;
+
+  // W4-A3: hot-swap install config. Guarded by materialise_mu_ (writes
+  // are rare from model ctor; reads from executor_loop task pickup).
+  HotswapConfig hotswap_config_{};
+  bool hotswap_config_set_ = false;
 
   void executor_loop(int32_t device_index, torch::ScalarType dtype);
 

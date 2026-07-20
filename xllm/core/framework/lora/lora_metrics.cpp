@@ -46,6 +46,13 @@ LoRAMetrics::LoRAMetrics() {
       "xllm_lora_requests_info", std::list<std::string>{"lora_name", "state"});
   active_adapters_count_ = std::make_unique<bvar::Status<int64_t>>(
       "xllm_lora_active_adapters_count", 0);
+  // W4-A4 batch-level metrics (global).
+  batch_fast_path_total_ =
+      std::make_unique<bvar::Adder<int64_t>>("xllm_lora_batch_fast_path_total");
+  batch_slow_path_total_ =
+      std::make_unique<bvar::Adder<int64_t>>("xllm_lora_batch_slow_path_total");
+  batch_distinct_adapters_ = std::make_unique<bvar::LatencyRecorder>(
+      "xllm_lora_batch_distinct_adapters");
   LOG(INFO) << "[LoRAMetrics] initialised";
 }
 
@@ -268,6 +275,21 @@ std::vector<LoRAMetrics::Snapshot> LoRAMetrics::snapshot_all() const {
 size_t LoRAMetrics::adapter_count() const {
   std::shared_lock lock(mu_);
   return per_adapter_.size();
+}
+
+// W4-A4: observe a scheduler batch's LoRA distribution. Fast path is
+// (0 or 1) distinct adapters, slow path is 2+. total_seqs unused today
+// but included for future hit-rate weighting.
+void LoRAMetrics::observe_batch_lora(size_t distinct_count, size_t total_seqs) {
+  (void)total_seqs;
+  if (batch_distinct_adapters_) {
+    (*batch_distinct_adapters_) << static_cast<int64_t>(distinct_count);
+  }
+  if (distinct_count <= 1) {
+    if (batch_fast_path_total_) (*batch_fast_path_total_) << 1;
+  } else {
+    if (batch_slow_path_total_) (*batch_slow_path_total_) << 1;
+  }
 }
 
 }  // namespace xllm
