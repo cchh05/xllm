@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <numeric>
 #include <vector>
 
@@ -27,6 +28,27 @@ limitations under the License.
 
 namespace xllm {
 namespace layer {
+
+namespace {
+
+// Phase A W2: collect distinct non-zero adapter ids in a batch.
+// Returns adapters sorted ascending. Duplicates removed. Zero entries
+// (base-only sequences) are dropped. Used by fused_moe forward to detect
+// whether the batch is fast-path eligible (0 or 1 adapters) or must warn
+// and fall back to first-adapter-only (the W2 v2 slow path is deferred).
+std::vector<uint64_t> collect_distinct_adapters(
+    const std::vector<uint64_t>& adapter_ids) {
+  std::vector<uint64_t> out;
+  out.reserve(adapter_ids.size());
+  for (uint64_t aid : adapter_ids) {
+    if (aid != 0) out.push_back(aid);
+  }
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
+}  // namespace
 
 namespace {
 // Generic local tensor helpers.
@@ -352,27 +374,42 @@ torch::Tensor FusedMoEImpl::forward_expert(
     gemm1_out = xllm::kernel::group_gemm(group_gemm_params);
   }
 
-  // ---- MoE expert LoRA delta (Phase 2A): gate/up halves of gemm1_out ----
+  // ---- MoE expert LoRA delta (Phase 2A + Phase A W2): gate/up on gemm1_out
   //
   // gemm1_out is [T_exp, 2 * I_local], laid out as [gate_out || up_out].
-  // For each adapter present in the batch, add:
-  //   delta_gate = (x @ A_gate) @ B_gate * scaling  -> [T_exp, I_local]
-  //   delta_up   = (x @ A_up)   @ B_up   * scaling  -> [T_exp, I_local]
-  // Same group_list as base group_gemm since we're routed on the same
-  // token->expert mapping. MVP: single adapter, all tokens share it.
+  // For each adapter a in the batch, add:
+  //   delta_gate_a = ((x @ A_gate_a) @ B_gate_a) * scaling_a
+  //   delta_up_a   = ((x @ A_up_a)   @ B_up_a)   * scaling_a
+  //
+  // Fast path (W2 v1): batch has 0 or 1 distinct non-zero adapter.
+  //   - all zero: skip (base-only batch)
+  //   - single non-zero: apply that adapter's delta unconditionally
+  //     (all tokens in the batch share the adapter -- this is the
+  //     original MVP fast path from Phase 1+2)
+  //
+  // Slow path (W2 v2, DEFERRED): 2+ distinct adapters would need per-token
+  // masking. The MVP implementation using CPU->NPU tensor copy inside
+  // forward triggered CANN 8.5 aivec exceptions (thread-restricted copy).
+  // v2 will pre-stage the per-token adapter map as a device tensor at
+  // batch-build time and let forward do a pure device-side index_select /
+  // masked scatter. For now, if 2+ adapters are present we apply only the
+  // first non-zero adapter to all tokens with a warning -- correctness for
+  // those "wrong-adapter" tokens is compromised, but we never crash. In
+  // practice this only affects genuinely mixed batches; the gateway is
+  // expected to bucket requests by adapter until v2 lands.
   {
     const auto* ctx = xllm::current_lora_context();
     if (ctx != nullptr && ctx->adapter_ids != nullptr &&
         !ctx->adapter_ids->empty()) {
-      // MVP: pick the first non-zero adapter_id.
-      uint64_t adapter_id = 0;
-      for (uint64_t aid : *ctx->adapter_ids) {
-        if (aid != 0) {
-          adapter_id = aid;
-          break;
-        }
+      auto distinct_adapters = collect_distinct_adapters(*ctx->adapter_ids);
+      if (distinct_adapters.size() > 1) {
+        LOG_EVERY_N(WARNING, 100)
+            << "[Phase A W2] mixed batch with " << distinct_adapters.size()
+            << " adapters; slow path not yet implemented, applying first only";
       }
       const int32_t layer_index = ctx->layer_index;
+      uint64_t adapter_id =
+          distinct_adapters.empty() ? 0 : distinct_adapters[0];
       if (adapter_id != 0 && layer_index >= 0) {
         const auto* med = xllm::LoRARuntime::instance().get_moe_expert_delta(
             adapter_id, layer_index);
@@ -397,7 +434,6 @@ torch::Tensor FusedMoEImpl::forward_expert(
             p2.group_type = 0;
             p2.group_list_type = 1;
             torch::Tensor delta_gate = xllm::kernel::group_gemm(p2);
-            // In-place add into the gate half of gemm1_out.
             gemm1_out.slice(-1, 0, I_local)
                 .add_(delta_gate.to(gemm1_out.dtype()), med->scaling);
           }
@@ -459,19 +495,16 @@ torch::Tensor FusedMoEImpl::forward_expert(
     gemm2_out = xllm::kernel::group_gemm(group_gemm_params);
   }
 
-  // ---- MoE expert LoRA delta (Phase 2A): down_proj on gemm2_out ----
+  // ---- MoE expert LoRA delta (Phase 2A + Phase A W2): down_proj on gemm2_out
+  // Same fast/slow path considerations as gate/up above (W2 v2 deferred).
   {
     const auto* ctx = xllm::current_lora_context();
     if (ctx != nullptr && ctx->adapter_ids != nullptr &&
         !ctx->adapter_ids->empty()) {
-      uint64_t adapter_id = 0;
-      for (uint64_t aid : *ctx->adapter_ids) {
-        if (aid != 0) {
-          adapter_id = aid;
-          break;
-        }
-      }
+      auto distinct_adapters = collect_distinct_adapters(*ctx->adapter_ids);
       const int32_t layer_index = ctx->layer_index;
+      uint64_t adapter_id =
+          distinct_adapters.empty() ? 0 : distinct_adapters[0];
       if (adapter_id != 0 && layer_index >= 0) {
         const auto* med = xllm::LoRARuntime::instance().get_moe_expert_delta(
             adapter_id, layer_index);

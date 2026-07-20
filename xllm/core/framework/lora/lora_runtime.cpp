@@ -479,6 +479,17 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
   if (!id_opt) return std::nullopt;
   const uint64_t int_id = *id_opt;
 
+  // Phase A W1 A1.3: idempotent guard (symmetric to MoE variant). If this
+  // int_id already has per-proj attention slots, skip the expensive re-load.
+  {
+    std::lock_guard g(materialise_mu_);
+    if (per_proj_device_pool_.count(int_id) > 0) {
+      LOG(INFO) << "[LoRARuntime] per-proj install: idempotent skip '"
+                << lora_name << "' id=" << int_id << " (already installed)";
+      return int_id;
+    }
+  }
+
   // Parse canonical keys "layers.{L}.{module_path}.{proj}#A|#B" into
   // (layer_index, proj_name) and pair the A/B tensors up.
   //
@@ -748,6 +759,19 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_moe_experts(
     return std::nullopt;
   }
   const uint64_t int_id = *id_opt;
+
+  // Phase A W1 A1.3: idempotent guard. If this int_id already has MoE experts
+  // installed, skip the expensive re-load. Same name+path caller (via
+  // register_adapter idempotency) sees the pool intact; genuine re-load
+  // requires unload first.
+  {
+    std::lock_guard g(materialise_mu_);
+    if (moe_expert_lora_pool_.count(int_id) > 0) {
+      LOG(INFO) << "[LoRARuntime] MoE install: idempotent skip '" << lora_name
+                << "' id=" << int_id << " (already installed)";
+      return int_id;
+    }
+  }
 
   // Bucket adapter tensors by (layer, proj) -> vec<expert_idx, is_a, tensor>.
   struct Slot {
