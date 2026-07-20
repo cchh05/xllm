@@ -108,7 +108,72 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
   }
   if (!any_nonzero) return y;
 
-  // Per-seq apply: slice y along dim=0 by q_seq_lens, look up
+  // P1a Phase 0 fast path: batch uses one non-zero adapter (99% prod).
+  // Skip per-seq slice/matmul loop; do 2 matmuls on full [T, hidden]:
+  //   tmp = x @ A^T                    [T, r]
+  //   delta_q = tmp @ B_q_local^T      [T, q_local]
+  //   delta_k = tmp @ B_k_local^T      [T, kv_local]
+  //   delta_v = tmp @ B_v_local^T      [T, kv_local]
+  //   y[:, q_local .. q_local+2*kv_local] += cat([q,k,v], -1)
+  // For base-only sequences interleaved with adapter sequences we still
+  // fall back to per-seq (see below); this fast path requires *all*
+  // non-zero ids match one adapter and no base-only seq is present.
+  {
+    uint64_t sole_aid = 0;
+    bool single_adapter = true;
+    for (auto id : adapter_ids) {
+      if (id == 0) {
+        single_adapter = false;  // any base-only seq disqualifies fast path
+        break;
+      }
+      if (sole_aid == 0) {
+        sole_aid = id;
+      } else if (id != sole_aid) {
+        single_adapter = false;
+        break;
+      }
+    }
+    if (single_adapter && sole_aid != 0) {
+      auto& runtime = LoRARuntime::instance();
+      const auto* q_pd =
+          runtime.get_per_proj_delta(sole_aid, ctx->layer_index, "q_proj");
+      const auto* k_pd =
+          runtime.get_per_proj_delta(sole_aid, ctx->layer_index, "k_proj");
+      const auto* v_pd =
+          runtime.get_per_proj_delta(sole_aid, ctx->layer_index, "v_proj");
+      if (q_pd == nullptr && k_pd == nullptr && v_pd == nullptr) {
+        return y;
+      }
+      // A is the same for Q/K/V? No — three independent A matrices. But
+      // each proj has its own A. We do 3 shrinks + 3 expands (each on
+      // the full [T, hidden] input, no slicing).
+      auto shrink_expand = [&](const LoRARuntime::ProjDelta* pd,
+                               int64_t out_local) -> torch::Tensor {
+        if (pd == nullptr) {
+          return torch::zeros({input.size(0), out_local}, input.options());
+        }
+        // tmp: [T, hidden] @ [hidden, r] -> [T, r]
+        auto tmp = torch::matmul(input, pd->A.transpose(0, 1));
+        // B [out_full, r] -> slice rows to local: [out_local, r]
+        torch::Tensor B_local = pd->B;
+        if (tp_world_size_ > 1 && pd->B.size(0) > out_local) {
+          const int64_t start = tp_rank_ * out_local;
+          B_local = pd->B.slice(0, start, start + out_local);
+        }
+        // d: [T, r] @ [r, out_local] -> [T, out_local]
+        auto d = torch::matmul(tmp, B_local.transpose(0, 1));
+        return (d * pd->scaling).to(input.dtype());
+      };
+      auto q_delta = shrink_expand(q_pd, q_size_local_);
+      auto k_delta = shrink_expand(k_pd, kv_size_local_);
+      auto v_delta = shrink_expand(v_pd, kv_size_local_);
+      auto qkv_delta = torch::cat({q_delta, k_delta, v_delta}, /*dim=*/-1);
+      y.add_(qkv_delta);
+      return y;
+    }
+  }
+
+  // Fallback per-seq apply: slice y along dim=0 by q_seq_lens, look up
   // (int_id, layer, {q_proj,k_proj,v_proj}), stack Q/K/V deltas into
   // one [seq_tokens, q_size + 2*kv_size] slab, add to that slice.
   auto& runtime = LoRARuntime::instance();
