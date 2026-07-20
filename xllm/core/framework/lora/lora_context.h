@@ -38,6 +38,8 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include <torch/torch.h>
+
 namespace xllm {
 
 struct LoRAContextFrame {
@@ -48,6 +50,19 @@ struct LoRAContextFrame {
   // Per-sequence lengths, index-aligned with adapter_ids. Used to slice
   // the [num_tokens, hidden] hidden state into per-seq chunks.
   const std::vector<int32_t>* q_seq_lens_vec = nullptr;
+
+  // Phase A W2 v2: per-token adapter id, device-side int64 [total_tokens].
+  // Prepared by ModelInputParams::to(device) at batch-build time by
+  // expanding adapter_ids according to q_seq_lens_vec. Pointer is valid
+  // for the duration of the forward pass. nullptr or undefined() when the
+  // batch is pure-base (all adapter_ids == 0) or LoRA is disabled -
+  // consumers treat that as the fast path and skip delta entirely.
+  //
+  // Consumers (fused_moe.cpp, LoRA wrappers) may safely combine this with
+  // per_layer combine_idx / cu_seq_lens to derive per-expanded-row adapter
+  // labels via index_select - all device-side, no CPU->NPU copy in the
+  // forward loop (CANN 8.5 + torch_npu 2.7.1 forbid that; see 07-06 notes).
+  const torch::Tensor* adapter_ids_per_token = nullptr;
 
   // Which decoder layer the forward is currently in (0-indexed). Updated
   // by the model's layer loop each iteration. LoRA wrapper uses this to

@@ -351,6 +351,35 @@ struct ModelInputParams {
     params.dp_is_decode = dp_is_decode;
     params.embedding_ids = std::move(embedding_ids);
     params.adapter_ids = adapter_ids;
+    // Phase A W2 v2: build per-token adapter_ids device tensor for
+    // fused_moe / LoRA wrappers. Only when at least one seq has a
+    // non-zero adapter (avoid wasted alloc for pure-base batches).
+    // We must do the CPU->NPU copy here (batch-build window) because
+    // CANN 8.5 + torch_npu 2.7.1 forbid it inside forward.
+    if (!adapter_ids.empty() && !q_seq_lens_vec.empty() &&
+        adapter_ids.size() == q_seq_lens_vec.size()) {
+      bool any_nonzero = false;
+      for (auto id : adapter_ids) {
+        if (id != 0) { any_nonzero = true; break; }
+      }
+      if (any_nonzero) {
+        std::vector<int64_t> per_token;
+        int64_t total = 0;
+        for (auto len : q_seq_lens_vec) total += static_cast<int64_t>(len);
+        per_token.reserve(total);
+        for (size_t i = 0; i < adapter_ids.size(); ++i) {
+          const int64_t seq_len = static_cast<int64_t>(q_seq_lens_vec[i]);
+          const int64_t aid = static_cast<int64_t>(adapter_ids[i]);
+          for (int64_t t = 0; t < seq_len; ++t) per_token.push_back(aid);
+        }
+        auto host_t = torch::from_blob(
+                          per_token.data(),
+                          {static_cast<int64_t>(per_token.size())},
+                          torch::TensorOptions().dtype(torch::kInt64))
+                          .clone();
+        params.adapter_ids_per_token = safe_to(host_t, device, true);
+      }
+    }
     params.request_ids = std::move(request_ids);
     params.extra_token_ids = std::move(extra_token_ids);
     params.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
@@ -538,6 +567,18 @@ struct ModelInputParams {
   // 0 = no adapter (base model). Populated by BatchInputBuilder from
   // Sequence::adapter_id(). Consumed by model forward to route LoRA delta.
   std::vector<uint64_t> adapter_ids;
+
+  // Phase A W2 v2: per-token adapter id, device-side int64 [total_tokens].
+  // Built by ModelInputParams::to(device) from (adapter_ids, q_seq_lens_vec)
+  // and populated only when at least one sequence has a non-zero adapter.
+  // Otherwise stays undefined() and fused_moe / LoRA wrappers treat that
+  // as the pure-base fast path.
+  //
+  // Constructed inside to(device) so the single host->device copy lives
+  // in the known-safe batch-build window; CANN 8.5 + torch_npu 2.7.1
+  // forbid CPU->NPU copies inside forward (see 07-06 notes on
+  // aivec exception + thread-restricted copy).
+  torch::Tensor adapter_ids_per_token;
 
   // request ids of each sequence, used by suffix decoding request identity
   std::vector<std::string> request_ids;

@@ -189,6 +189,9 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
     LoRAContextFrame lora_frame;
     lora_frame.adapter_ids = &modified_input_params.adapter_ids;
     lora_frame.q_seq_lens_vec = &modified_input_params.q_seq_lens_vec;
+    // Phase A W2 v2: device-side per-token adapter tensor (built in
+    // ModelInputParams::to(device); may be undefined() for pure-base).
+    lora_frame.adapter_ids_per_token = &modified_input_params.adapter_ids_per_token;
     lora_frame.layer_index = -1;
     LoRAScope _lora_scope(lora_frame);
 

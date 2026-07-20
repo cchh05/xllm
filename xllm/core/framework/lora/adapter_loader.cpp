@@ -135,6 +135,25 @@ bool LoRAAdapterLoader::parse_config(
       }
       out->target_modules.push_back(mod);
     }
+
+    // fix #6: warn about row-parallel projections whose LoRA delta is
+    // silently skipped in TP>1 setups (see lora_row_parallel_linear.cpp
+    // fix #3c: TP>1 row-parallel returns base output only; correct fix
+    // requires all-reduce of partial delta, deferred to P1).
+    // In dense Qwen family: o_proj (attention output) and down_proj (MLP
+    // output) are row-parallel. In MoE Qwen3 experts: down_proj is also
+    // row-parallel. If user trained an adapter targeting these, their
+    // delta is IGNORED when the model runs on multiple ranks.
+    for (const auto& mod : out->target_modules) {
+      if (mod == "o_proj" || mod == "down_proj") {
+        LOG(WARNING) << "[LoRAAdapterLoader] " << path << ": target_modules "
+                     << "contains row-parallel projection '" << mod
+                     << "'. If this adapter is served under TP>1 the LoRA "
+                     << "delta for this proj is silently skipped (P1 all-"
+                     << "reduce fix pending). Attention Q/K/V and MLP "
+                     << "gate/up_proj deltas still apply normally.";
+      }
+    }
   }
 
   // Optional base-model check: only enforced if the caller passed one.

@@ -48,6 +48,37 @@ std::vector<uint64_t> collect_distinct_adapters(
   return out;
 }
 
+// Phase A W2 v2 safety: check that per_token tensor is large enough
+// to be indexed by combine_idx (values in [0, T_local)). Returns true
+// only when the alignment is verifiable and safe. Uses combine_idx.max()
+// on device (async, no host->device copy) plus a single .item() to read
+// the scalar back (device->host is permitted; only host->device inside
+// forward is forbidden by CANN 8.5 + torch_npu 2.7.1).
+inline bool per_token_slow_path_safe(const torch::Tensor& per_token,
+                                      const torch::Tensor& combine_idx) {
+  if (!per_token.defined() || per_token.numel() == 0) return false;
+  if (!combine_idx.defined() || combine_idx.numel() == 0) return true;
+  const int64_t per_token_len = per_token.numel();
+  // combine_idx values are int32 in [0, T_local). Its numel is T_exp.
+  int64_t max_idx = 0;
+  try {
+    auto max_t = combine_idx.max();
+    max_idx = max_t.to(torch::kInt64).item<int64_t>();
+  } catch (const std::exception& e) {
+    LOG_EVERY_N(WARNING, 100)
+        << "[Phase A W2 v2] combine_idx.max() failed: " << e.what();
+    return false;
+  }
+  if (max_idx >= per_token_len) {
+    LOG_EVERY_N(WARNING, 100)
+        << "[Phase A W2 v2] per_token misaligned: numel=" << per_token_len
+        << " combine_idx.max=" << max_idx
+        << "; slow path unsafe -- falling back to first-adapter";
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 namespace {
@@ -402,63 +433,107 @@ torch::Tensor FusedMoEImpl::forward_expert(
     if (ctx != nullptr && ctx->adapter_ids != nullptr &&
         !ctx->adapter_ids->empty()) {
       auto distinct_adapters = collect_distinct_adapters(*ctx->adapter_ids);
-      if (distinct_adapters.size() > 1) {
-        LOG_EVERY_N(WARNING, 100)
-            << "[Phase A W2] mixed batch with " << distinct_adapters.size()
-            << " adapters; slow path not yet implemented, applying first only";
-      }
       const int32_t layer_index = ctx->layer_index;
-      uint64_t adapter_id =
-          distinct_adapters.empty() ? 0 : distinct_adapters[0];
-      if (adapter_id != 0 && layer_index >= 0) {
+
+      // Phase A W2 v2: per-token mask when 2+ adapters. adapter_ids_per_token
+      // is [T_tokens] int64 device-side (built in ModelInputParams::to).
+      // combine_idx is [T_exp] int32 mapping expanded rows -> original tokens.
+      // sel_adapter_row = per_token[combine_idx] -> [T_exp] int64
+      // For each distinct adapter A, mask = (sel_adapter_row == A) -> [T_exp]
+      // then multiply the delta by mask so only tokens routed to A get delta.
+      const bool slow_path = distinct_adapters.size() > 1;
+      torch::Tensor sel_adapter_row;  // [T_exp] int64, only in slow path
+      if (slow_path) {
+        const torch::Tensor* per_token = ctx->adapter_ids_per_token;
+        const bool safe = per_token != nullptr &&
+            per_token_slow_path_safe(*per_token,
+                                     selected_expert_info.combine_idx);
+        if (safe) {
+          auto idx64 = selected_expert_info.combine_idx.to(torch::kInt64);
+          sel_adapter_row = per_token->index_select(0, idx64);
+        } else {
+          LOG_EVERY_N(WARNING, 100)
+              << "[Phase A W2 v2] mixed batch of "
+              << distinct_adapters.size()
+              << " adapters but per-token tensor missing/misaligned; "
+              << "falling back to first-adapter-only for gate/up delta";
+        }
+      }
+
+      // Iterate adapters (single-element in fast path, all in slow path).
+      // In fast path we apply the delta unconditionally (all tokens share
+      // the adapter). In slow path we multiply by the per-adapter mask
+      // before add_, restricting the delta to tokens routed to A.
+      const int64_t I_local = gemm1_out.size(-1) / 2;
+      const bool have_mask = slow_path && sel_adapter_row.defined();
+
+      auto adapters_to_apply = distinct_adapters;
+      if (!have_mask && !distinct_adapters.empty()) {
+        // Fast path OR slow-path fallback (per_token missing): apply first
+        // adapter to all tokens.
+        adapters_to_apply.resize(1);
+      }
+
+      for (uint64_t adapter_id : adapters_to_apply) {
+        if (adapter_id == 0 || layer_index < 0) continue;
         const auto* med = xllm::LoRARuntime::instance().get_moe_expert_delta(
             adapter_id, layer_index);
-        if (med != nullptr) {
-          const int64_t I_local = gemm1_out.size(-1) / 2;
-          // gate delta
-          if (med->A_gate.defined() && med->B_gate.defined()) {
-            xllm::kernel::GroupGemmParams p1;
-            p1.a = expand_hidden_states;
-            p1.b = med->A_gate;
-            p1.group_list = selected_expert_info.token_count_slice;
-            p1.split_item = 2;
-            p1.group_type = 0;
-            p1.group_list_type = 1;
-            torch::Tensor lora_a_out = xllm::kernel::group_gemm(p1);
+        if (med == nullptr) continue;
 
-            xllm::kernel::GroupGemmParams p2;
-            p2.a = lora_a_out;
-            p2.b = med->B_gate;
-            p2.group_list = selected_expert_info.token_count_slice;
-            p2.split_item = 2;
-            p2.group_type = 0;
-            p2.group_list_type = 1;
-            torch::Tensor delta_gate = xllm::kernel::group_gemm(p2);
-            gemm1_out.slice(-1, 0, I_local)
-                .add_(delta_gate.to(gemm1_out.dtype()), med->scaling);
-          }
-          // up delta
-          if (med->A_up.defined() && med->B_up.defined()) {
-            xllm::kernel::GroupGemmParams p1;
-            p1.a = expand_hidden_states;
-            p1.b = med->A_up;
-            p1.group_list = selected_expert_info.token_count_slice;
-            p1.split_item = 2;
-            p1.group_type = 0;
-            p1.group_list_type = 1;
-            torch::Tensor lora_a_out = xllm::kernel::group_gemm(p1);
+        torch::Tensor mask_col;  // [T_exp, 1], only in slow path
+        if (have_mask) {
+          mask_col = sel_adapter_row
+                         .eq(static_cast<int64_t>(adapter_id))
+                         .to(gemm1_out.dtype())
+                         .unsqueeze(-1);
+        }
 
-            xllm::kernel::GroupGemmParams p2;
-            p2.a = lora_a_out;
-            p2.b = med->B_up;
-            p2.group_list = selected_expert_info.token_count_slice;
-            p2.split_item = 2;
-            p2.group_type = 0;
-            p2.group_list_type = 1;
-            torch::Tensor delta_up = xllm::kernel::group_gemm(p2);
-            gemm1_out.slice(-1, I_local, 2 * I_local)
-                .add_(delta_up.to(gemm1_out.dtype()), med->scaling);
-          }
+        // gate delta
+        if (med->A_gate.defined() && med->B_gate.defined()) {
+          xllm::kernel::GroupGemmParams p1;
+          p1.a = expand_hidden_states;
+          p1.b = med->A_gate;
+          p1.group_list = selected_expert_info.token_count_slice;
+          p1.split_item = 2;
+          p1.group_type = 0;
+          p1.group_list_type = 1;
+          torch::Tensor lora_a_out = xllm::kernel::group_gemm(p1);
+
+          xllm::kernel::GroupGemmParams p2;
+          p2.a = lora_a_out;
+          p2.b = med->B_gate;
+          p2.group_list = selected_expert_info.token_count_slice;
+          p2.split_item = 2;
+          p2.group_type = 0;
+          p2.group_list_type = 1;
+          torch::Tensor delta_gate = xllm::kernel::group_gemm(p2)
+                                          .to(gemm1_out.dtype());
+          if (have_mask) delta_gate = delta_gate * mask_col;
+          gemm1_out.slice(-1, 0, I_local).add_(delta_gate, med->scaling);
+        }
+        // up delta
+        if (med->A_up.defined() && med->B_up.defined()) {
+          xllm::kernel::GroupGemmParams p1;
+          p1.a = expand_hidden_states;
+          p1.b = med->A_up;
+          p1.group_list = selected_expert_info.token_count_slice;
+          p1.split_item = 2;
+          p1.group_type = 0;
+          p1.group_list_type = 1;
+          torch::Tensor lora_a_out = xllm::kernel::group_gemm(p1);
+
+          xllm::kernel::GroupGemmParams p2;
+          p2.a = lora_a_out;
+          p2.b = med->B_up;
+          p2.group_list = selected_expert_info.token_count_slice;
+          p2.split_item = 2;
+          p2.group_type = 0;
+          p2.group_list_type = 1;
+          torch::Tensor delta_up = xllm::kernel::group_gemm(p2)
+                                        .to(gemm1_out.dtype());
+          if (have_mask) delta_up = delta_up * mask_col;
+          gemm1_out.slice(-1, I_local, 2 * I_local)
+              .add_(delta_up, med->scaling);
         }
       }
     }
@@ -503,31 +578,60 @@ torch::Tensor FusedMoEImpl::forward_expert(
         !ctx->adapter_ids->empty()) {
       auto distinct_adapters = collect_distinct_adapters(*ctx->adapter_ids);
       const int32_t layer_index = ctx->layer_index;
-      uint64_t adapter_id =
-          distinct_adapters.empty() ? 0 : distinct_adapters[0];
-      if (adapter_id != 0 && layer_index >= 0) {
+
+      const bool slow_path = distinct_adapters.size() > 1;
+      torch::Tensor sel_adapter_row;
+      if (slow_path) {
+        const torch::Tensor* per_token = ctx->adapter_ids_per_token;
+        const bool safe = per_token != nullptr &&
+            per_token_slow_path_safe(*per_token,
+                                     selected_expert_info.combine_idx);
+        if (safe) {
+          auto idx64 = selected_expert_info.combine_idx.to(torch::kInt64);
+          sel_adapter_row = per_token->index_select(0, idx64);
+        }
+      }
+      const bool have_mask = slow_path && sel_adapter_row.defined();
+
+      auto adapters_to_apply = distinct_adapters;
+      if (!have_mask && !distinct_adapters.empty()) {
+        adapters_to_apply.resize(1);
+      }
+
+      for (uint64_t adapter_id : adapters_to_apply) {
+        if (adapter_id == 0 || layer_index < 0) continue;
         const auto* med = xllm::LoRARuntime::instance().get_moe_expert_delta(
             adapter_id, layer_index);
-        if (med != nullptr && med->A_down.defined() && med->B_down.defined()) {
-          xllm::kernel::GroupGemmParams p1;
-          p1.a = act_out;
-          p1.b = med->A_down;
-          p1.group_list = selected_expert_info.token_count_slice;
-          p1.split_item = 2;
-          p1.group_type = 0;
-          p1.group_list_type = 1;
-          torch::Tensor lora_a_out = xllm::kernel::group_gemm(p1);
-
-          xllm::kernel::GroupGemmParams p2;
-          p2.a = lora_a_out;
-          p2.b = med->B_down;
-          p2.group_list = selected_expert_info.token_count_slice;
-          p2.split_item = 2;
-          p2.group_type = 0;
-          p2.group_list_type = 1;
-          torch::Tensor delta_down = xllm::kernel::group_gemm(p2);
-          gemm2_out.add_(delta_down.to(gemm2_out.dtype()), med->scaling);
+        if (med == nullptr || !med->A_down.defined() ||
+            !med->B_down.defined()) {
+          continue;
         }
+        xllm::kernel::GroupGemmParams p1;
+        p1.a = act_out;
+        p1.b = med->A_down;
+        p1.group_list = selected_expert_info.token_count_slice;
+        p1.split_item = 2;
+        p1.group_type = 0;
+        p1.group_list_type = 1;
+        torch::Tensor lora_a_out = xllm::kernel::group_gemm(p1);
+
+        xllm::kernel::GroupGemmParams p2;
+        p2.a = lora_a_out;
+        p2.b = med->B_down;
+        p2.group_list = selected_expert_info.token_count_slice;
+        p2.split_item = 2;
+        p2.group_type = 0;
+        p2.group_list_type = 1;
+        torch::Tensor delta_down = xllm::kernel::group_gemm(p2)
+                                        .to(gemm2_out.dtype());
+        if (have_mask) {
+          torch::Tensor mask_col = sel_adapter_row
+                                       .eq(static_cast<int64_t>(adapter_id))
+                                       .to(gemm2_out.dtype())
+                                       .unsqueeze(-1);
+          delta_down = delta_down * mask_col;
+        }
+        gemm2_out.add_(delta_down, med->scaling);
       }
     }
   }
