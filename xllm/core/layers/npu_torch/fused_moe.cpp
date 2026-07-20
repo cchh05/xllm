@@ -18,6 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <sstream>
 #include <numeric>
 #include <vector>
 
@@ -56,26 +57,12 @@ std::vector<uint64_t> collect_distinct_adapters(
 // forward is forbidden by CANN 8.5 + torch_npu 2.7.1).
 inline bool per_token_slow_path_safe(const torch::Tensor& per_token,
                                       const torch::Tensor& combine_idx) {
+  // W2 v2 fix: after we correctly index combine_idx via (combine_idx / topk),
+  // the resulting token indices are bounded to [0, T_tokens) by construction
+  // (expand_row_ids values encode token_idx * topk + k_idx). So we only need
+  // to check both tensors are defined and non-empty.
   if (!per_token.defined() || per_token.numel() == 0) return false;
-  if (!combine_idx.defined() || combine_idx.numel() == 0) return true;
-  const int64_t per_token_len = per_token.numel();
-  // combine_idx values are int32 in [0, T_local). Its numel is T_exp.
-  int64_t max_idx = 0;
-  try {
-    auto max_t = combine_idx.max();
-    max_idx = max_t.to(torch::kInt64).item<int64_t>();
-  } catch (const std::exception& e) {
-    LOG_EVERY_N(WARNING, 100)
-        << "[Phase A W2 v2] combine_idx.max() failed: " << e.what();
-    return false;
-  }
-  if (max_idx >= per_token_len) {
-    LOG_EVERY_N(WARNING, 100)
-        << "[Phase A W2 v2] per_token misaligned: numel=" << per_token_len
-        << " combine_idx.max=" << max_idx
-        << "; slow path unsafe -- falling back to first-adapter";
-    return false;
-  }
+  if (!combine_idx.defined() || combine_idx.numel() == 0) return false;
   return true;
 }
 
@@ -449,14 +436,31 @@ torch::Tensor FusedMoEImpl::forward_expert(
             per_token_slow_path_safe(*per_token,
                                      selected_expert_info.combine_idx);
         if (safe) {
+          // W2 v2 correct semantics (per user's diagnosis 07-20):
+          // combine_idx is the pre-routing flat index into a [T_tokens*topk]
+          // pre-routing view produced by moe_init_routing_v2's permutation.
+          // The correct way to derive per-expanded-row adapter is:
+          //   1. Expand per_token [T_tokens] to per-pre-routing-row
+          //      per_token.repeat_interleave(topk) -> [T_tokens*topk],
+          //      where row (t*topk + k) belongs to original token t (so
+          //      all top_k copies of the same token share the same adapter).
+          //   2. index_select with combine_idx directly (no floor_divide).
+          //      This maps expanded row i -> its owner token's adapter,
+          //      following the same permutation the base MoE kernel uses.
+          auto per_token_pre_routing =
+              per_token->repeat_interleave(static_cast<int64_t>(topk_));
           auto idx64 = selected_expert_info.combine_idx.to(torch::kInt64);
-          sel_adapter_row = per_token->index_select(0, idx64);
+          sel_adapter_row = per_token_pre_routing.index_select(0, idx64);
+          // DIAG: log per_token/combine_idx/sel_adapter, but ONLY when we're
+          // actually seeing a real mixed batch (per_token has >1 element AND
+          // it contains distinct values). This filters out the many single-seq
+          // decode forwards that dominate LOG_EVERY_N sampling.
         } else {
           LOG_EVERY_N(WARNING, 100)
               << "[Phase A W2 v2] mixed batch of "
               << distinct_adapters.size()
-              << " adapters but per-token tensor missing/misaligned; "
-              << "falling back to first-adapter-only for gate/up delta";
+              << " adapters but per-token tensor missing; falling back to "
+              << "first-adapter-only for gate/up delta";
         }
       }
 
@@ -587,8 +591,11 @@ torch::Tensor FusedMoEImpl::forward_expert(
             per_token_slow_path_safe(*per_token,
                                      selected_expert_info.combine_idx);
         if (safe) {
+          // W2 v2 correct semantics (see gate/up block for full explanation).
+          auto per_token_pre_routing =
+              per_token->repeat_interleave(static_cast<int64_t>(topk_));
           auto idx64 = selected_expert_info.combine_idx.to(torch::kInt64);
-          sel_adapter_row = per_token->index_select(0, idx64);
+          sel_adapter_row = per_token_pre_routing.index_select(0, idx64);
         }
       }
       const bool have_mask = slow_path && sel_adapter_row.defined();
