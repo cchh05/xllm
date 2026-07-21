@@ -63,6 +63,17 @@ void LoRARuntime::init(const LoRAConfig& config) {
       if (dp != device_pool_.end()) {
         device_pool_.erase(dp);
       }
+      // P1 hot-swap HBM leak fix (C4 stress test 07-21): also erase the
+      // MoE expert pool. Without this, each hot-swap of a MoE-experts
+      // adapter (Qwen3-30B-A3B) accumulates ~1.6 GB per rank; ~2 churns
+      // exhaust NPU 61 GB and crash the process with PTA memory error.
+      auto mp = moe_expert_lora_pool_.find(int_id);
+      if (mp != moe_expert_lora_pool_.end()) {
+        const size_t layers = mp->second.size();
+        moe_expert_lora_pool_.erase(mp);
+        LOG(INFO) << "[LoRARuntime] freed MoE expert pool for id=" << int_id
+                  << " layers=" << layers;
+      }
     }
     // Drop metrics bvars AFTER releasing materialise_mu_ (LoRAMetrics
     // takes its own shared_mutex; keep locks disjoint).
