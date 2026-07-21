@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/framework/kv_cache/kv_cache.h"
+#include "core/framework/lora/lora_context.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_context.h"
@@ -91,11 +92,24 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
       }
     }
 
+    // Qwen3.5-122B fix #1: mirror qwen3_moe.h / llm_model_base.h -- push
+    // LoRAContext so wrapper (QKV / MLP) sees adapter_ids for this batch.
+    // Without this, wrapper falls into fast-return and delta is never applied.
+    ModelInputParams modified_input_params = input_params;
+    LoRAContextFrame lora_frame;
+    lora_frame.adapter_ids = &modified_input_params.adapter_ids;
+    lora_frame.q_seq_lens_vec = &modified_input_params.q_seq_lens_vec;
+    lora_frame.adapter_ids_per_token =
+        &modified_input_params.adapter_ids_per_token;
+    lora_frame.layer_index = -1;
+    LoRAScope _lora_scope(lora_frame);
+
     layer::AttentionMetadata attn_metadata =
         layer::AttentionMetadataBuilder::build(
             input_params, model_args_, build_attention_mask(input_params));
     torch::Tensor h = embed_tokens_(tokens);
     for (size_t i = 0; i < layers_.size(); i++) {
+      set_lora_context_layer(static_cast<int32_t>(i));
       auto& layer = layers_[i];
       h = layer->forward(
           h, positions, attn_metadata, kv_caches[i], input_params);
