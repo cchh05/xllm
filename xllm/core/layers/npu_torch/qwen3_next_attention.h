@@ -24,6 +24,7 @@ limitations under the License.
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
 #include "layers/common/linear.h"
+#include "layers/common/lora/lora_row_parallel_linear.h"
 #include "layers/common/partial_rotary_embedding.h"
 #include "layers/common/qwen3_next_rms_norm.h"
 
@@ -59,7 +60,13 @@ class Qwen3NextAttentionImpl : public torch::nn::Module {
   int32_t rank_;
 
   QKVParallelLinear qkv_proj_{nullptr};
-  RowParallelLinear o_proj_{nullptr};
+  // Qwen3.5-122B: swap to LoRA-wrapped RowParallelLinear so o_proj adapter
+  // deltas fire. QKV proj stays vanilla because Qwen3-Next fuses q + gate
+  // into one out-column (num_heads * 2), which LoRAQKVParallelLinear does
+  // not yet handle (assumes q_size_local == num_heads * head_size). A future
+  // CL adds a q_has_gate parameter; for now attention q/k/v LoRA is silent
+  // no-op, o_proj LoRA is live.
+  LoRARowParallelLinear o_proj_{nullptr};
 
   Qwen3NextRMSNorm q_norm_{nullptr};
   Qwen3NextRMSNorm k_norm_{nullptr};
