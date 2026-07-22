@@ -45,6 +45,13 @@ class LoRAQKVParallelLinearImpl : public torch::nn::Module {
 
   // Signature mirrors QKVParallelLinearImpl exactly so we can drop-in
   // replace the member type in Qwen2Attention with zero call-site changes.
+  //
+  // q_has_gate: when true, the base linear was constructed with
+  //   num_heads_effective = num_heads_attn * 2 (Qwen3-Next attn_output_gate
+  //   fuses q + gate into the q lane). The wrapper then sizes q_size_local
+  //   as num_heads_effective * head_size to match base's fused output, and
+  //   the PEFT adapter is expected to have been trained on the same fused
+  //   lane (B_q shape [q_size_fused, rank]).
   LoRAQKVParallelLinearImpl(int64_t hidden_size,
                             int64_t num_heads,
                             int64_t num_kv_heads,
@@ -54,7 +61,8 @@ class LoRAQKVParallelLinearImpl : public torch::nn::Module {
                             bool gather_output,
                             const ParallelArgs& parallel_args,
                             const torch::TensorOptions& options,
-                            const QuantArgs& quant_args = QuantArgs{});
+                            const QuantArgs& quant_args = QuantArgs{},
+                            bool q_has_gate = false);
 
   // Same signature as base: y = base(x); delta = B(A(x)) * scaling.
   torch::Tensor forward(torch::Tensor input);
@@ -121,6 +129,11 @@ class LoRAQKVParallelLinearImpl : public torch::nn::Module {
   int64_t out_size_local_ = 0;  // q_size_local + 2 * kv_size_local
   int64_t tp_rank_ = 0;
   int64_t tp_world_size_ = 1;
+
+  // True for Qwen3-Next-style attn_output_gate: q_size_local includes the
+  // fused gate lane, and the PEFT adapter's B_q is expected at fused width.
+  // Currently informational — sizing already uses fused num_heads.
+  bool q_has_gate_ = false;
 };
 TORCH_MODULE(LoRAQKVParallelLinear);
 

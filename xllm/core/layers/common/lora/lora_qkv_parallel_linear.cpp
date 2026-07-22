@@ -34,18 +34,25 @@ LoRAQKVParallelLinearImpl::LoRAQKVParallelLinearImpl(
     bool gather_output,
     const ParallelArgs& parallel_args,
     const torch::TensorOptions& options,
-    const QuantArgs& quant_args)
+    const QuantArgs& quant_args,
+    bool q_has_gate)
     : hidden_size_(hidden_size) {
   // Cache TP topology for LoRA weight sharding logic.
   tp_rank_ = parallel_args.tp_group_->rank();
   tp_world_size_ = parallel_args.tp_group_->world_size();
 
-  // Match base's per-partition sizing exactly:
+  // Match base's per-partition sizing exactly. When q_has_gate=true
+  // (Qwen3-Next attn_output_gate), num_heads passed in already accounts
+  // for the fused q+gate lanes (num_heads_attn * 2), so q_size_local is
+  // naturally the fused lane width. The PEFT adapter for such a model
+  // must also carry a B_q sized to the fused lane; if it does not, the
+  // shape check in set_lora_weights / per-proj slicing will trip.
   //   q_size_local  = num_heads * head_size          (already tp-partitioned)
   //   kv_size_local = num_kv_heads * head_size       (with kv_head_replicas)
   q_size_local_ = num_heads * head_size;
   kv_size_local_ = num_kv_heads * head_size;
   out_size_local_ = q_size_local_ + 2 * kv_size_local_;
+  q_has_gate_ = q_has_gate;
 
   // Base linear owns the vanilla forward + weight loading path. NOT
   // register_module'd here on purpose — see the note in the header. Base
@@ -154,10 +161,19 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
         }
         // tmp: [T, hidden] @ [hidden, r] -> [T, r]
         auto tmp = torch::matmul(input, pd->A.transpose(0, 1));
-        // B [out_full, r] -> slice rows to local: [out_local, r]
+        // B [out_full, r] -> slice rows to local: [out_local, r].
+        // For q_proj under TP: out_full = q_hidden_total, sliced evenly
+        // per tp_rank. For k/v_proj when TP > num_kv_heads (GQA replicas),
+        // out_full = kv_hidden_total which is smaller than out_local *
+        // tp_world_size; several ranks share the same kv head. Compute
+        // the actual shard count from B.size(0) / out_local so each rank
+        // picks the correct slice.
         torch::Tensor B_local = pd->B;
         if (tp_world_size_ > 1 && pd->B.size(0) > out_local) {
-          const int64_t start = tp_rank_ * out_local;
+          const int64_t num_shards = pd->B.size(0) / out_local;
+          const int64_t shard_idx =
+              (num_shards > 0) ? (tp_rank_ * num_shards / tp_world_size_) : 0;
+          const int64_t start = shard_idx * out_local;
           B_local = pd->B.slice(0, start, start + out_local);
         }
         // d: [T, r] @ [r, out_local] -> [T, out_local]
@@ -210,11 +226,15 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
         return torch::zeros({x_seq.size(0), out_size}, x_seq.options());
       }
       auto tmp = torch::matmul(x_seq, pd->A.transpose(0, 1));
-      // B is [out_full, rank]. Slice rows [tp_rank*out_size, +out_size)
-      // so we only compute this rank's portion of the output.
+      // B is [out_full, rank]. Slice per shard so this rank picks its
+      // portion of the output. For k/v_proj with GQA replicas the shard
+      // count is smaller than tp_world_size, so derive it from B.size(0).
       torch::Tensor B_local = pd->B;
       if (tp_world_size_ > 1 && pd->B.size(0) > out_size) {
-        const int64_t start = tp_rank_ * out_size;
+        const int64_t num_shards = pd->B.size(0) / out_size;
+        const int64_t shard_idx =
+            (num_shards > 0) ? (tp_rank_ * num_shards / tp_world_size_) : 0;
+        const int64_t start = shard_idx * out_size;
         B_local = pd->B.slice(0, start, start + out_size);
       }
       auto d = torch::matmul(tmp, B_local.transpose(0, 1));
