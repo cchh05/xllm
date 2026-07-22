@@ -50,18 +50,23 @@ Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
   kv_size_ = num_kv_heads_ * head_dim_;
   scaling_ = 1.0f / std::sqrt(static_cast<float>(head_dim_));
   attn_output_gate_ = args.attn_output_gate();
-  // 1. QKV linear
+  // 1. QKV linear (LoRA-wrapped). For attn_output_gate=true (Qwen3-Next),
+  // num_heads_ * 2 folds q + gate into one fused lane; the wrapper sizes
+  // q_size_local from that argument, and the PEFT adapter's B_q shape
+  // matches the fused lane at 122B (16384 = 32 heads * 256 head_dim * 2).
   qkv_proj_ = register_module(
       "qkv_proj",
-      QKVParallelLinear(args.hidden_size(),
-                        attn_output_gate_ ? num_heads_ * 2 : num_heads_,
-                        num_kv_heads_,
-                        args.head_dim(),
-                        num_kv_head_replicas_,
-                        /*bias=*/args.attention_bias(),
-                        /*gather_output=*/false,
-                        parallel_args,
-                        options));
+      LoRAQKVParallelLinear(args.hidden_size(),
+                            attn_output_gate_ ? num_heads_ * 2 : num_heads_,
+                            num_kv_heads_,
+                            args.head_dim(),
+                            num_kv_head_replicas_,
+                            /*bias=*/args.attention_bias(),
+                            /*gather_output=*/false,
+                            parallel_args,
+                            options,
+                            quant_args,
+                            /*q_has_gate=*/attn_output_gate_));
 
   // 2. O proj (LoRA-wrapped for Qwen3.5-122B adapter delta injection).
   o_proj_ =
