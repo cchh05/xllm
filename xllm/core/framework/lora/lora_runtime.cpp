@@ -591,11 +591,19 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
     // (canonicalize_weight_name strips "base_model.model." but the
     // remaining "model." from PEFT paths like
     // "base_model.model.model.layers.5.self_attn.q_proj.lora_A.weight"
-    // is left as-is).
+    // is left as-is). VL / hybrid models add "model.language_model." prefix,
+    // e.g. Qwen3.5-122B PEFT adapters use
+    // "base_model.model.model.language_model.layers.3.self_attn.q_proj...".
     const std::string kLayersPrefix = "layers.";
     const std::string kModelLayersPrefix = "model.layers.";
+    const std::string kModelLangLayersPrefix = "model.language_model.layers.";
+    const std::string kLangLayersPrefix = "language_model.layers.";
     std::string after_layers;
-    if (prefix.rfind(kModelLayersPrefix, 0) == 0) {
+    if (prefix.rfind(kModelLangLayersPrefix, 0) == 0) {
+      after_layers = prefix.substr(kModelLangLayersPrefix.size());
+    } else if (prefix.rfind(kLangLayersPrefix, 0) == 0) {
+      after_layers = prefix.substr(kLangLayersPrefix.size());
+    } else if (prefix.rfind(kModelLayersPrefix, 0) == 0) {
       after_layers = prefix.substr(kModelLayersPrefix.size());
     } else if (prefix.rfind(kLayersPrefix, 0) == 0) {
       after_layers = prefix.substr(kLayersPrefix.size());
@@ -757,9 +765,14 @@ std::optional<MoeKey> parse_moe_expert_key(const std::string& canon) {
   const bool is_a = (tail == "#A");
   const std::string prefix = canon.substr(0, canon.size() - 2);
 
-  // Strip optional "model." leader (some adapters retain it).
+  // Strip optional "model." / "model.language_model." / "language_model."
+  // leader (VL / hybrid models add these).
   std::string p = prefix;
-  if (p.rfind("model.layers.", 0) == 0) {
+  if (p.rfind("model.language_model.layers.", 0) == 0) {
+    p = p.substr(std::string("model.language_model.").size());
+  } else if (p.rfind("language_model.layers.", 0) == 0) {
+    p = p.substr(std::string("language_model.").size());
+  } else if (p.rfind("model.layers.", 0) == 0) {
     p = p.substr(std::string("model.").size());
   }
   if (p.rfind("layers.", 0) != 0) return std::nullopt;
