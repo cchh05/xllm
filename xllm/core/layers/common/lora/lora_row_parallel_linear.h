@@ -14,15 +14,21 @@ You may obtain a copy of the License at
 //
 // LoRA math (single proj):
 //   y = base(x)
-//   delta = B @ A @ x           A: [r, in]     B: [out, r]
-//   return y + delta * scaling
+//   delta = B @ (A @ x) * scaling      A: [r, in_full]   B: [out, r]
+//   return y + delta
 //
-// TP handling: A is input-sharded (matches base's row-shard), B is replicated.
-// Since input is already partial along in-features, A@x gives a partial
-// intermediate; the final all-reduce on base output already covers our delta
-// too if we add before reduce — but for simplicity we add after reduce and
-// keep A/B replicated. First-order correct for r << in_features; TP-sharded
-// A/B is a P1 optimization.
+// TP handling (mirrors SGLang RowParallelLinearWithLoRA):
+//   * A is slice-sharded on in-dim at forward time: A_local = A[:, rank_slice]
+//     Input arrives already sharded on in-dim, so this alignment is natural.
+//   * B is kept full-width (replicated) — cheap because r is tiny.
+//   * forward: tmp_local = x_local @ A_local^T -> [T, r]  (partial per rank)
+//              tmp_full  = all_reduce(tmp_local)         (rank-dim, cheap)
+//              delta     = tmp_full @ B^T * scaling      (replicated on ranks)
+//              y         = base_output (already reduced by base) + delta
+//
+// Cost win over naive "all_reduce(delta)": we reduce a rank-dim tensor
+// [T, r=16] instead of hidden-dim [T, out]. For Qwen3-30B r=16 vs out=2048
+// that is 128x smaller.
 
 #pragma once
 
@@ -72,6 +78,12 @@ class LoRARowParallelLinearImpl : public torch::nn::Module {
   std::string proj_name_;
   int64_t in_features_ = 0;
   int64_t out_features_ = 0;
+
+  // Cached TP topology so forward's hot path avoids a virtual dispatch
+  // into ProcessGroup for the tp_rank / world_size on every call.
+  int32_t tp_rank_ = 0;
+  int32_t tp_world_size_ = 1;
+  int64_t in_features_local_ = 0;
 };
 TORCH_MODULE(LoRARowParallelLinear);
 
