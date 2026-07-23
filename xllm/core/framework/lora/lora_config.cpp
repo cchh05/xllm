@@ -73,6 +73,25 @@ DEFINE_bool(
     "Whether HTTP endpoints /v1/load_lora_adapter and /v1/unload_lora_adapter "
     "are honoured at runtime.");
 
+// Row-parallel LoRA (o_proj / down_proj) requires an extra rank-dim
+// all-reduce per layer per forward to keep the delta TP-correct. Under NPU
+// HCCL this launch cost is non-trivial and can subtract ~15-20% throughput
+// even though the bytes moved are tiny. Set to false for pure-tps deployments
+// where the adapters are known to target only column-parallel projections
+// (q_proj / k_proj / v_proj / gate_proj / up_proj); the wrapper then skips
+// the collective and the row-parallel delta silently no-ops (same behaviour
+// as pre-fix). Default true because most PEFT adapters do include o_proj /
+// down_proj and precision improvement of ~9pp compliance typically outweighs
+// the throughput cost.
+DEFINE_bool(
+    enable_lora_row_parallel_all_reduce,
+    true,
+    "Whether LoRARowParallelLinear applies its delta under TP>1 via an extra "
+    "rank-dim all-reduce. Setting false restores pre-fix behaviour: row-"
+    "parallel LoRA deltas (o_proj, down_proj) are silently skipped and only "
+    "column-parallel deltas (q/k/v_proj, gate/up_proj) apply. Trades ~+9pp "
+    "compliance-rate precision for ~+17% throughput headroom.");
+
 namespace xllm {
 
 namespace {

@@ -7,6 +7,7 @@ Licensed under the Apache License, Version 2.0.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include "framework/lora/lora_config.h"
 #include "framework/lora/lora_context.h"
 #include "framework/lora/lora_runtime.h"
 #include "framework/parallel_state/parallel_state.h"
@@ -46,6 +47,16 @@ LoRARowParallelLinearImpl::LoRARowParallelLinearImpl(
 
 torch::Tensor LoRARowParallelLinearImpl::forward(torch::Tensor input) {
   auto y = base_->forward(input);
+
+  // Under TP>1, applying the LoRA delta correctly requires an extra rank-dim
+  // all-reduce (see below). That collective has non-trivial HCCL launch cost
+  // on NPU; deployments that only serve adapters whose target_modules are
+  // column-parallel (q/k/v_proj, gate/up_proj) can opt out to reclaim the
+  // throughput. The flag is a hard gate: when false the wrapper degrades to
+  // pre-fix behaviour and o_proj / down_proj deltas silently no-op under TP>1.
+  if (tp_world_size_ > 1 && !FLAGS_enable_lora_row_parallel_all_reduce) {
+    return y;
+  }
 
   // Row-parallel LoRA delta.
   //

@@ -98,3 +98,4 @@ DECLARE_int32(max_lora_rank);
 DECLARE_string(lora_target_modules);
 DECLARE_string(lora_modules);
 DECLARE_bool(allow_runtime_lora_updating);
+DECLARE_bool(enable_lora_row_parallel_all_reduce);
