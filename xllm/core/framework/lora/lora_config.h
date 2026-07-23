@@ -99,3 +99,4 @@ DECLARE_string(lora_target_modules);
 DECLARE_string(lora_modules);
 DECLARE_bool(allow_runtime_lora_updating);
 DECLARE_bool(enable_lora_row_parallel_all_reduce);
+DECLARE_bool(enable_lora_row_parallel_fused_ar);

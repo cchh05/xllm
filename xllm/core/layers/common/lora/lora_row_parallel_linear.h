@@ -84,6 +84,13 @@ class LoRARowParallelLinearImpl : public torch::nn::Module {
   int32_t tp_rank_ = 0;
   int32_t tp_world_size_ = 1;
   int64_t in_features_local_ = 0;
+
+  // Fused-AR mode: base is constructed with enable_result_reduction=false
+  // and the wrapper owns the collective. Set once in the ctor from the
+  // enable_lora_row_parallel_fused_ar flag.
+  bool fused_ar_ = false;
+  // True iff we actually issue an AR in forward (fused_ar_ && tp>1).
+  bool wrapper_owns_reduction_ = false;
 };
 TORCH_MODULE(LoRARowParallelLinear);
 

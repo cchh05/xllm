@@ -92,6 +92,27 @@ DEFINE_bool(
     "column-parallel deltas (q/k/v_proj, gate/up_proj) apply. Trades ~+9pp "
     "compliance-rate precision for ~+17% throughput headroom.");
 
+// Fused variant: sum the LoRA delta into the base's partial [T, out] BEFORE
+// the base row-parallel's all-reduce, so both base output and delta ride the
+// same collective. Cuts per-layer AR count from 2 (rank-dim + base) to 1
+// (base only), same as vLLM RowParallelLinearWithShardedLoRA / LoRAX /
+// HF-TGI. Requires B to be replicated on every rank and A to be sliced on
+// in-dim (matches base's shard layout).
+//
+// When true, this SUPERSEDES enable_lora_row_parallel_all_reduce — the base
+// linear is constructed with enable_result_reduction=false and the wrapper
+// owns the collective for the fused output.
+//
+// Default false while we validate. Enabling it should reclaim most of the
+// ~17% throughput cost of enable_lora_row_parallel_all_reduce=true without
+// giving up the +9pp precision benefit.
+DEFINE_bool(
+    enable_lora_row_parallel_fused_ar,
+    false,
+    "Fuse LoRA row-parallel delta into the base's all-reduce (S-LoRA / vLLM "
+    "RowParallelLinearWithShardedLoRA pattern). Cuts per-layer AR count "
+    "from 2 to 1. Supersedes enable_lora_row_parallel_all_reduce when true.");
+
 namespace xllm {
 
 namespace {
