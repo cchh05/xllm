@@ -145,6 +145,11 @@ struct AttentionMetadata {
 #if defined(USE_NPU)
   // for npu
   torch::Tensor kv_seq_lens_host;
+  // Per-sequence host q_seq_lens (int32 CPU tensor), used by the chunked
+  // prefill workaround path (2026-07-24) which must call batch_prefill with
+  // the actual number of NEW query tokens per sequence rather than the
+  // full kv_seq_lens.
+  torch::Tensor q_seq_lens_host;
   // For ACL graph execution - tiling data for CustomPagedAttention.
   // If defined, use this instead of kv_seq_lens_host to avoid .to(kCPU)
   // operations that break ACL graph capture.

@@ -228,7 +228,15 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
       max_seq_len_ =
           std::max(modified_input_params.kv_max_seq_len, max_seq_len_);
       torch::Tensor attn_mask;
-      if (FLAGS_enable_chunked_prefill) {
+      // Prefix-cache × LoRA workaround (2026-07-24): also generate spec
+      // (append) mask when the batch is in CHUNKED_PREFILL stage even if
+      // FLAGS_enable_chunked_prefill is off. Otherwise the default triu
+      // mask does not match the per-sequence q_len<kv_len layout expected
+      // by the chunked-prefill fallback in attention.cpp.
+      const bool need_spec_mask =
+          FLAGS_enable_chunked_prefill ||
+          modified_input_params.batch_forward_type.is_chunked_prefill();
+      if (need_spec_mask) {
         const int32_t max_kv_seq = modified_input_params.kv_max_seq_len;
         const int32_t num_sequences = modified_input_params.num_sequences;
         if (num_sequences > 0) {

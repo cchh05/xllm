@@ -98,11 +98,24 @@ void AttentionImpl::prefill_forward(torch::Tensor& query,
                                      scale_,
                                      output);
   } else if (attn_metadata.is_chunked_prefill) {
+    // Prefix-cache × LoRA workaround (2026-07-24 v3): degrade chunked_prefill
+    // to fresh prefill on the NEW query tokens only (ignore historical KV
+    // cache blocks). This sacrifices the prefix cache TTFT gain on the
+    // prefill path but keeps the KV cache infrastructure alive (LoRA
+    // isolation patch still applies to hash chains) and avoids the broken
+    // atb SelfAttention.PA_ENCODER + paged k_cache combination that fork
+    // 502de04f left dead-coded. NOTE: uses q_seq_lens_host (new tokens per
+    // seq) not kv_seq_lens_host (full history) so tensor shapes match the
+    // per-token key/value pair.
+    key = key.view({-1, num_kv_heads_, head_size_});
+    value = value.view({-1, num_kv_heads_, head_size_});
     xllm::kernel::npu::batch_prefill(query,
-                                     k_cache,
-                                     v_cache.value(),
+                                     key,
+                                     value,
                                      attn_metadata.attn_mask,
-                                     attn_metadata.kv_seq_lens_host,
+                                     attn_metadata.q_seq_lens_host.defined()
+                                         ? attn_metadata.q_seq_lens_host
+                                         : attn_metadata.kv_seq_lens_host,
                                      scale_,
                                      output);
   }

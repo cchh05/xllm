@@ -94,6 +94,13 @@ AttentionMetadata build_attention_metadata(
     attn_metadata.kv_seq_lens_host =
         torch::tensor(params.kv_seq_lens_vec, torch::kInt);
   }
+  // Prefix-cache × LoRA workaround (2026-07-24): also expose per-seq q_seq_lens
+  // on the host so the chunked-prefill fallback path can call batch_prefill
+  // with the correct new-token counts.
+  if (!params.q_seq_lens_vec.empty()) {
+    attn_metadata.q_seq_lens_host =
+        torch::tensor(params.q_seq_lens_vec, torch::kInt);
+  }
 #endif
   attn_metadata.is_chunked_prefill =
       params.batch_forward_type.is_mixed() ||
