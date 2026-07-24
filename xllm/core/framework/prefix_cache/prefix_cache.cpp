@@ -28,16 +28,50 @@ limitations under the License.
 
 namespace xllm {
 
+// LoRA prefix cache isolation: thread-local adapter_id set by BlockManagerPool
+// before calling into PrefixCache::match/insert/compute_hash_keys.
+// When != 0, first-block hash is seeded with adapter_id so different adapters
+// (and base) produce disjoint hash chains for identical tokens. Base
+// (adapter_id == 0) keeps byte-identical hashes with pre-patch behavior.
+thread_local uint64_t g_prefix_cache_adapter_id = 0;
+
+void set_prefix_cache_adapter_id(uint64_t adapter_id) {
+  g_prefix_cache_adapter_id = adapter_id;
+}
+
 void xxh3_128bits_hash(const uint8_t* pre_hash_value,
                        const Slice<int32_t>& token_ids,
                        uint8_t* hash_value) {
   if (pre_hash_value == nullptr) {
-    XXH128_hash_t xxh3_128bits_hash_value =
-        XXH3_128bits_withSeed(reinterpret_cast<const void*>(token_ids.data()),
-                              sizeof(int32_t) * token_ids.size(),
-                              FLAGS_xxh3_128bits_seed);
-    memcpy(
-        hash_value, &xxh3_128bits_hash_value, sizeof(xxh3_128bits_hash_value));
+    // LoRA prefix cache isolation: when adapter_id != 0, prepend it to the
+    // hashed data so that adapter chains diverge from base chain at block 0.
+    if (g_prefix_cache_adapter_id != 0) {
+      uint8_t key[1024];
+      size_t offset = 0;
+      memcpy(
+          key, &g_prefix_cache_adapter_id, sizeof(g_prefix_cache_adapter_id));
+      offset += sizeof(g_prefix_cache_adapter_id);
+      const size_t token_bytes = sizeof(int32_t) * token_ids.size();
+      CHECK_GT(sizeof(key), offset + token_bytes) << "key size is too small";
+      memcpy(key + offset,
+             reinterpret_cast<const void*>(token_ids.data()),
+             token_bytes);
+      XXH128_hash_t xxh3_128bits_hash_value =
+          XXH3_128bits_withSeed(reinterpret_cast<const void*>(key),
+                                offset + token_bytes,
+                                FLAGS_xxh3_128bits_seed);
+      memcpy(hash_value,
+             &xxh3_128bits_hash_value,
+             sizeof(xxh3_128bits_hash_value));
+    } else {
+      XXH128_hash_t xxh3_128bits_hash_value =
+          XXH3_128bits_withSeed(reinterpret_cast<const void*>(token_ids.data()),
+                                sizeof(int32_t) * token_ids.size(),
+                                FLAGS_xxh3_128bits_seed);
+      memcpy(hash_value,
+             &xxh3_128bits_hash_value,
+             sizeof(xxh3_128bits_hash_value));
+    }
   } else {
     uint8_t key[1024];
 

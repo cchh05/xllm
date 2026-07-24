@@ -35,6 +35,12 @@ limitations under the License.
 
 namespace xllm {
 
+// LoRA prefix cache isolation: sets a thread-local adapter_id used by
+// PrefixCache hash computation to seed the first block. adapter_id == 0
+// means base (no seeding, byte-identical to pre-patch). Caller must reset
+// to 0 after each match/insert to avoid cross-request contamination.
+void set_prefix_cache_adapter_id(uint64_t adapter_id);
+
 inline size_t round_down(size_t n, size_t multiple) {
   return (n / multiple) * multiple;
 }

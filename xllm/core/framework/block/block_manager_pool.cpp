@@ -21,6 +21,7 @@ limitations under the License.
 #include "block_manager_impl.h"
 #include "common/global_flags.h"
 #include "concurrent_block_manager_impl.h"
+#include "framework/prefix_cache/prefix_cache.h"
 #include "framework/xtensor/page_allocator.h"
 #include "framework/xtensor/phy_page_pool.h"
 #include "framework/xtensor/xtensor_block_manager_impl.h"
@@ -327,6 +328,9 @@ bool BlockManagerPool::process_beam_search(Sequence* sequence, bool need_swap) {
 void BlockManagerPool::allocate_shared(Sequence* sequence) {
   // only allocate shared blocks for prefill sequences
   if (options_.enable_prefix_cache()) {
+    // LoRA prefix cache isolation: seed hash with adapter_id so requests
+    // to different adapters (and base) get disjoint prefix chains.
+    set_prefix_cache_adapter_id(sequence->adapter_id());
     int32_t dp_rank = get_dp_rank(sequence);
     const auto& existed_shared_blocks = sequence->kv_state().kv_blocks().slice(
         0, sequence->kv_state().shared_kv_blocks_num());
@@ -336,16 +340,21 @@ void BlockManagerPool::allocate_shared(Sequence* sequence) {
         block_managers_[dp_rank]->allocate_shared(sequence->tokens(),
                                                   existed_shared_blocks);
     sequence->add_shared_kv_blocks(std::move(shared_blocks));
+    set_prefix_cache_adapter_id(0);
   }
 }
 
 void BlockManagerPool::cache(Sequence* sequence) {
+  // LoRA prefix cache isolation: seed hash with adapter_id so cached blocks
+  // are stored on the adapter-specific chain.
+  set_prefix_cache_adapter_id(sequence->adapter_id());
   int32_t dp_rank = get_dp_rank(sequence);
   const auto token_ids = sequence->cached_tokens();
   auto* blocks = sequence->kv_state().mutable_kv_blocks();
   auto existed_shared_blocks_num = sequence->kv_state().shared_kv_blocks_num();
   block_managers_[dp_rank]->cache(
       token_ids, *blocks, existed_shared_blocks_num);
+  set_prefix_cache_adapter_id(0);
 }
 
 void BlockManagerPool::get_merged_kvcache_event(KvCacheEvent* event) const {
