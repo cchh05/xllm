@@ -7,6 +7,7 @@ Licensed under the Apache License, Version 2.0.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include "common/global_flags.h"
 #include "framework/lora/lora_config.h"
 #include "framework/lora/lora_context.h"
 #include "framework/lora/lora_runtime.h"
@@ -32,6 +33,20 @@ LoRARowParallelLinearImpl::LoRARowParallelLinearImpl(
   // can fold the LoRA delta into the base's partial output and reduce both
   // together in a single collective.
   fused_ar_ = FLAGS_enable_lora_row_parallel_fused_ar;
+  // Fused-AR mode forces base's enable_result_reduction=false so the wrapper
+  // can take over the final all-reduce (which folds the LoRA delta into the
+  // base partial). That gate also naturally shadows the base MM+AR fusion
+  // (enable_npu_mm_all_reduce_fusion): the fused kernel path in
+  // RowParallelLinearImpl::forward requires enable_result_reduction_==true,
+  // which is false here. Log once per wrapper construction when both flags
+  // are on so operators know fused-AR wins.
+  if (fused_ar_ && FLAGS_enable_npu_mm_all_reduce_fusion) {
+    LOG_FIRST_N(WARNING, 1)
+        << "Both --enable_lora_row_parallel_fused_ar and "
+        << "--enable_npu_mm_all_reduce_fusion are ON. Fused-AR takes "
+        << "precedence for the LoRA row-parallel path; the NPU MM+AR fusion "
+        << "kernel is bypassed here. Turn one off to eliminate ambiguity.";
+  }
   const bool base_reduce = fused_ar_ ? false : enable_result_reduction;
   // NOT register_module'd on this wrapper: keeps checkpoint keys unchanged.
   // (Same rationale as LoRAQKVParallelLinearImpl.)

@@ -164,4 +164,27 @@ ProcessGroupImpl::ProcessGroupImpl(int rank,
       comm_(comm),
       comm_stream_(c10_npu::getNPUStreamFromPool(device.index())) {}
 
+std::string ProcessGroupImpl::get_hccl_comm_name() {
+  // The two ctors that build pg_ (rank+world+port and rank+group_ranks+port
+  // overloads) install a c10d_npu::ProcessGroupHCCL — pg_ is the base-class
+  // protected member.
+  //
+  // The rare comm-only ctor (rank + world + device + HcclComm) does NOT build
+  // pg_; it stashes an HcclComm directly. In that codepath there's no
+  // ProcessGroupHCCL to consult, so we return an empty string and the caller
+  // (RowParallelLinearImpl::forward) falls back to the legacy path.
+  if (pg_ == nullptr) {
+    return "";
+  }
+  auto* hccl_pg = dynamic_cast<c10d_npu::ProcessGroupHCCL*>(pg_.get());
+  if (hccl_pg == nullptr) {
+    return "";
+  }
+  // getHcclCommName(rankid, init_comm=true) — lazily initializes the underlying
+  // comm if this is the first call. Uses local rank inside the group (rank()
+  // returns the group-local rank, matching the ctor arg passed to
+  // ProcessGroupHCCL).
+  return hccl_pg->getHcclCommName(rank(), /*init_comm=*/true);
+}
+
 }  // namespace xllm

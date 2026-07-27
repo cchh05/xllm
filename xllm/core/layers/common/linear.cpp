@@ -18,6 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include "common/global_flags.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
@@ -813,6 +814,38 @@ torch::Tensor RowParallelLinearImpl::forward(torch::Tensor input) {
     if (!input_is_parallelized_) {
       input = xllm::parallel_state::scatter(input, process_group_);
     }
+#if defined(USE_NPU)
+    // Fused MM+AllReduce fast path (NPU only, grayscale-gated).
+    // Replaces the two-op `matmul + parallel_state::reduce` below with a
+    // single torch_npu::npu_mm_all_reduce_base kernel launch, saving ~1ms
+    // HCCL setup latency per row-parallel forward.
+    //
+    // Requirements:
+    //   - flag on
+    //   - result reduction requested (base is producing full-out output)
+    //   - genuine multi-rank group (world_size > 1)
+    //   - HCCL comm name resolvable (empty => single-rank or non-NPU pg)
+    //
+    // Weight in RowParallelLinear is stored as [out, in_local]; the fused
+    // kernel expects [in_local, out]. MVP transposes on every forward via
+    // `.t().contiguous()`; a follow-up CL can cache the transposed weight
+    // at load time to remove the per-forward allocation.
+    if (FLAGS_enable_npu_mm_all_reduce_fusion && enable_result_reduction_ &&
+        world_size_ > 1) {
+      const std::string hcom = process_group_->get_hccl_comm_name();
+      if (!hcom.empty()) {
+        xllm::kernel::MmAllReduceParams mm_ar_params;
+        mm_ar_params.a = input;
+        mm_ar_params.b = weight_.t().contiguous();
+        mm_ar_params.hcom_name = hcom;
+        // TP convention: only rank 0 supplies bias so the reduce-sum does
+        // not double-count. `bias` above is already conditioned on rank_==0.
+        mm_ar_params.bias = bias;
+        return xllm::kernel::mm_all_reduce(mm_ar_params);
+      }
+      // hcom empty => fall through to legacy matmul + reduce (safe default).
+    }
+#endif
     xllm::kernel::MatmulParams matmul_params;
     matmul_params.a = input;
     matmul_params.b = weight_;

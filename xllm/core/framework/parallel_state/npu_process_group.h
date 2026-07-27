@@ -55,6 +55,12 @@ class ProcessGroupImpl : public ProcessGroup {
   // Destructor.
   ~ProcessGroupImpl() override;
 
+  // Return the HCCL communicator name string for this rank. Used by
+  // torch_npu::npu_mm_all_reduce_base's `hcom` parameter to bind the fused
+  // MM+AllReduce kernel to this comm. init_comm=true (upstream default) so
+  // the underlying comm is lazily initialized on first call.
+  std::string get_hccl_comm_name() override;
+
  private:
   HcclComm comm_ = nullptr;
   c10_npu::NPUStream comm_stream_;

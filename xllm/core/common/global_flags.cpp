@@ -160,6 +160,15 @@ DEFINE_bool(enable_schedule_overlap,
             false,
             "Whether to enable schedule overlap.");
 
+DEFINE_bool(
+    enable_npu_mm_all_reduce_fusion,
+    false,
+    "Fuse MatMul and AllReduce in RowParallelLinear via "
+    "torch_npu::npu_mm_all_reduce_base. NPU-only, grayscale rollout. "
+    "Saves the ~1ms HCCL setup latency per row-parallel forward on NPU "
+    "by replacing separate matmul + allreduce with a single fused kernel. "
+    "Non-NPU builds and quantized paths fall back to legacy matmul + reduce.");
+
 DEFINE_double(prefill_scheduling_memory_usage_threshold,
               0.95,
               "The memory usage threshold during prefill scheduling.");

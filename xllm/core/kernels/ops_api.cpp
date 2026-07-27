@@ -315,6 +315,20 @@ torch::Tensor matmul(MatmulParams& params) {
 #endif
 }
 
+torch::Tensor mm_all_reduce(MmAllReduceParams& params) {
+  // NPU-only fused path. Callers must gate on
+  // FLAGS_enable_npu_mm_all_reduce_fusion AND on a non-empty hcom_name before
+  // entering this API.
+#if defined(USE_NPU)
+  return npu::mm_all_reduce_base(
+      params.a, params.b, params.hcom_name, params.bias);
+#else
+  (void)params;
+  LOG(FATAL) << "mm_all_reduce is NPU-only; other backends must not enter "
+             << "this path. Caller should gate on Platform::is_npu().";
+#endif
+}
+
 torch::Tensor group_gemm(GroupGemmParams& params) {
 #if defined(USE_MLU)
   return mlu::group_gemm(params.a,

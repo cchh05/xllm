@@ -44,6 +44,13 @@ void fused_layernorm(FusedLayerNormParams& params);
 
 torch::Tensor matmul(MatmulParams& params);
 
+// Fused MatMul + AllReduce for row-parallel linear on NPU. Executes
+//   output = all_reduce_sum(params.a @ params.b + params.bias)
+// as a single kernel launch. Available only when USE_NPU is defined and
+// callers have obtained a non-empty HCCL comm name; non-NPU builds
+// LOG(FATAL) so miswiring surfaces at compile/link time in review.
+torch::Tensor mm_all_reduce(MmAllReduceParams& params);
+
 torch::Tensor group_gemm(GroupGemmParams& params);
 
 std::tuple<torch::Tensor, torch::Tensor> moe_active_topk(

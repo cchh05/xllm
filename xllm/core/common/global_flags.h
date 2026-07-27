@@ -149,6 +149,8 @@ DECLARE_int32(max_concurrent_requests);
 
 DECLARE_bool(enable_schedule_overlap);
 
+DECLARE_bool(enable_npu_mm_all_reduce_fusion);
+
 DECLARE_double(prefill_scheduling_memory_usage_threshold);
 
 DECLARE_int32(expert_parallel_degree);

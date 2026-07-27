@@ -96,6 +96,13 @@ class ProcessGroup {
       bool async_op = false,
       c10::intrusive_ptr<c10d::Work>* async_work = nullptr);
 
+  // Return the HCCL communicator name string for use with NPU fused
+  // MM+AllReduce (torch_npu::npu_mm_all_reduce_base's `hcom` parameter).
+  // NPU-only; returns an empty string on non-NPU backends and on world_size==1
+  // groups. Callers must fall back to legacy allreduce when the return value is
+  // empty.
+  virtual std::string get_hccl_comm_name();
+
  private:
   // rank of current process.
   int32_t rank_ = 0;

@@ -12,6 +12,7 @@ cc_library(
     attention.cpp
     fused_layernorm.cpp
     matmul.cpp
+    mm_all_reduce.cpp
     npu_grouped_matmul.cpp
     npu_moe_gating_topk_softmax.cpp
     npu_moe_init_routing_v2.cpp

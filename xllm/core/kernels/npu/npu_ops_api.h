@@ -61,6 +61,22 @@ torch::Tensor matmul(const torch::Tensor& a,
                      const torch::Tensor& b,
                      const std::optional<torch::Tensor>& bias);
 
+// Fused MatMul + AllReduce for row-parallel linear on NPU. Equivalent to
+// `all_reduce(input @ weight_t + bias, sum)` executed as a single fused
+// kernel launch. Wraps torch_npu::npu_mm_all_reduce_base.
+//
+//   input   : [T, in_local]     activation sharded on in-dim
+//   weight_t: [in_local, out]   weight PRE-TRANSPOSED (caller responsibility)
+//   hcom    : HCCL comm name string from ProcessGroup::get_hccl_comm_name()
+//   bias    : rank-0-only bias (nullopt on other ranks)
+//
+// bf16/fp16 unquantized path only. Quantized RowParallelLinear branches keep
+// the legacy matmul + reduce fallback.
+torch::Tensor mm_all_reduce_base(const torch::Tensor& input,
+                                 const torch::Tensor& weight_t,
+                                 const std::string& hcom_name,
+                                 const std::optional<torch::Tensor>& bias);
+
 torch::Tensor active(const torch::Tensor& input, const std::string& act_mode);
 
 torch::Tensor rms_norm(const torch::Tensor& input,

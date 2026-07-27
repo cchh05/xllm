@@ -225,4 +225,11 @@ std::unique_ptr<ProcessGroup> create_process_group(
                                             device);
 }
 #endif
+
+std::string ProcessGroup::get_hccl_comm_name() {
+  // Default no-op: non-NPU backends and single-rank groups have no HCCL comm.
+  // NPU backend overrides this in npu_process_group.cpp.
+  return "";
+}
+
 }  // namespace xllm

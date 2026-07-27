@@ -306,6 +306,25 @@ struct MatmulParams {
   double beta = 0.0;
 };
 
+struct MmAllReduceParams {
+  // Activation tensor. Sharded on in-dim across TP ranks.
+  // Shape: [T, in_local] where in_local = in_full / tp_world_size.
+  // Dtype: float16 or bfloat16 (quantized paths fall back to legacy).
+  torch::Tensor a;
+  // Weight tensor, PRE-TRANSPOSED by the caller.
+  // Shape: [in_local, out] (transposed from the base RowParallelLinear
+  // storage layout [out, in_local]).
+  torch::Tensor b;
+  // HCCL communicator name string. Obtained via
+  // ProcessGroup::get_hccl_comm_name(rank). Empty string signals the caller
+  // has already decided the fused path is not applicable (single-rank group,
+  // non-NPU backend); ops_api::mm_all_reduce must not be entered in that case.
+  std::string hcom_name;
+  // Optional bias. By TP convention only rank 0 supplies a bias tensor;
+  // other ranks pass std::nullopt to avoid double-adding under all-reduce sum.
+  std::optional<torch::Tensor> bias;
+};
+
 struct GroupGemmParams {
   // Input activation tensor.
   // Shape: 2D [M, K] if trans_a==false; [K, M] if trans_a==true.
