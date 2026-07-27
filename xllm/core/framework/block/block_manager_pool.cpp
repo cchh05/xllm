@@ -23,6 +23,8 @@ limitations under the License.
 #include "composite_block_manager.h"
 #include "concurrent_block_manager_impl.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/service_config.h"
+#include "core/framework/prefix_cache/block_hasher.h"
 #include "framework/model/model_input_params.h"
 #include "framework/xtensor/page_allocator.h"
 #include "framework/xtensor/phy_page_pool.h"
@@ -286,18 +288,27 @@ void BlockManagerPool::allocate_shared(Sequence* sequence) {
   if (!options_.enable_prefix_cache()) {
     return;
   }
+  // LoRA prefix cache isolation: seed hash with adapter_id so requests
+  // to different adapters (and base) get disjoint prefix hash chains.
+  // Reset to 0 after the call to avoid contaminating unrelated hash ops.
+  set_prefix_cache_adapter_id(sequence->adapter_id());
   int32_t dp_rank = get_dp_rank(sequence);
   static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get())
       ->allocate_shared_for_sequence(sequence);
+  set_prefix_cache_adapter_id(0);
 }
 
 void BlockManagerPool::cache(Sequence* sequence) {
   if (!options_.enable_prefix_cache()) {
     return;
   }
+  // LoRA prefix cache isolation: seed hash with adapter_id so cached blocks
+  // are stored on the adapter-specific chain.
+  set_prefix_cache_adapter_id(sequence->adapter_id());
   int32_t dp_rank = get_dp_rank(sequence);
   static_cast<CompositeBlockManager*>(block_managers_[dp_rank].get())
       ->cache_for_sequence(sequence);
+  set_prefix_cache_adapter_id(0);
 }
 
 void BlockManagerPool::cache(Sequence* sequence, size_t num_tokens) {
