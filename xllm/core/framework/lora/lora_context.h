@@ -42,6 +42,11 @@ limitations under the License.
 
 namespace xllm {
 
+// Forward decl: defined in lora_batch_info.h. The frame keeps a
+// non-owning pointer so LoRA wrappers can consult pre-built Punica
+// metadata (sort permutation, group_list, etc.) without recomputing.
+struct LoRABatchInfo;
+
 struct LoRAContextFrame {
   // Per-sequence adapter routing. Empty when the batch is pure-base or
   // when LoRA is disabled globally.
@@ -74,6 +79,17 @@ struct LoRAContextFrame {
   // "layers.{L}.mlp.gate_proj", etc. Other archs may vary; the wrapper
   // uses this + a proj-name hint to compose the LoRARuntime lookup key.
   std::string arch = "qwen3";
+
+  // Punica-style batched routing metadata. Built once per forward by
+  // build_lora_batch_info() at batch-build time (or by the model's
+  // forward entry) and consumed by every LoRA*ParallelLinear wrapper
+  // in the forward. nullptr disables the batched path — wrappers fall
+  // back to their existing single-adapter fast path / per-seq slow path.
+  //
+  // Ownership: the LoRABatchInfo lifetime is managed by whoever built it
+  // (typically ModelInputParams or a scoped local in the forward entry).
+  // The frame only borrows a raw pointer that must outlive the frame.
+  const LoRABatchInfo* batch_info = nullptr;
 };
 
 // Push a new frame. Returns a token used to pop it.

@@ -23,6 +23,7 @@ cc_library(
     lora_runtime.h
     lora_context.h
     lora_metrics.h
+    lora_batch_info.h
   SRCS
     lora_config.cpp
     lora_registry.cpp
@@ -30,6 +31,7 @@ cc_library(
     lora_runtime.cpp
     lora_context.cpp
     lora_metrics.cpp
+    lora_batch_info.cpp
   DEPS
     :state_dict
     glog::glog
