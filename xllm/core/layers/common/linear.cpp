@@ -18,6 +18,9 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <atomic>
+#include <exception>
+
 #include "common/global_flags.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
@@ -25,6 +28,26 @@ limitations under the License.
 
 namespace xllm {
 namespace layer {
+
+namespace {
+// Runtime disable flag for the fused MM+AllReduce fast path.
+//
+// The fused kernel `torch_npu::npu_mm_all_reduce_base` links at build time
+// (torch_npu ships the C++ binding) but is not guaranteed to have a matching
+// kernel binary registered in `binary_info_config.json` for every SoC. On
+// CANN 8.5 in particular the MatmulAllReduce op is only compiled for arch32
+// (A2 / ascend910b) and not for ascend910_93 (A3). CANN 9.0 ships a dynamic
+// compile path for it, so the same binary works on some hosts and fails on
+// others.
+//
+// Rather than gate this at build time or force operators to know their SoC,
+// we probe at runtime: try the fused kernel on the first call; if it throws,
+// permanently disable the fast path for this process and fall through to the
+// legacy `matmul + parallel_state::reduce` sequence. The warning fires once
+// so the operator learns the fusion was silently downgraded, without spamming
+// per-forward. Flag=off is unaffected.
+std::atomic<bool> g_mm_all_reduce_fusion_disabled{false};
+}  // namespace
 
 namespace {
 
@@ -831,7 +854,8 @@ torch::Tensor RowParallelLinearImpl::forward(torch::Tensor input) {
     // `.t().contiguous()`; a follow-up CL can cache the transposed weight
     // at load time to remove the per-forward allocation.
     if (FLAGS_enable_npu_mm_all_reduce_fusion && enable_result_reduction_ &&
-        world_size_ > 1) {
+        world_size_ > 1 &&
+        !g_mm_all_reduce_fusion_disabled.load(std::memory_order_relaxed)) {
       const std::string hcom = process_group_->get_hccl_comm_name();
       if (!hcom.empty()) {
         xllm::kernel::MmAllReduceParams mm_ar_params;
@@ -841,7 +865,27 @@ torch::Tensor RowParallelLinearImpl::forward(torch::Tensor input) {
         // TP convention: only rank 0 supplies bias so the reduce-sum does
         // not double-count. `bias` above is already conditioned on rank_==0.
         mm_ar_params.bias = bias;
-        return xllm::kernel::mm_all_reduce(mm_ar_params);
+        // Runtime probe: the fused kernel links at build time but its aclnn
+        // op binary may not be registered for the current SoC (notably CANN
+        // 8.5 ascend910_93 has no MatmulAllReduce entry). Try the fast path;
+        // if it throws, permanently disable it for the process and fall
+        // through to the legacy matmul + parallel_state::reduce.
+        try {
+          return xllm::kernel::mm_all_reduce(mm_ar_params);
+        } catch (const std::exception& e) {
+          bool expected = false;
+          if (g_mm_all_reduce_fusion_disabled.compare_exchange_strong(
+                  expected, true, std::memory_order_relaxed)) {
+            LOG(WARNING)
+                << "[LoRA MM+AR fusion] npu_mm_all_reduce_base kernel "
+                   "unavailable on this SoC (aclnn op likely not registered "
+                   "in binary_info_config.json). Downgrading to legacy "
+                   "matmul + all_reduce path for the rest of the process. "
+                   "First-call error: "
+                << e.what();
+          }
+          // Fall through to legacy path below.
+        }
       }
       // hcom empty => fall through to legacy matmul + reduce (safe default).
     }
