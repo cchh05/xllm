@@ -87,14 +87,6 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
   // M10 per-request per-proj real LoRA. QKV wrapper concatenates Q/K/V
   // deltas along the last dim to match the base's fused output.
   const auto* ctx = current_lora_context();
-  // DEBUG P1G: dump wrapper's view of context (rate limited)
-  LOG_EVERY_N(ERROR, 200) << "[P1G_QKV_FWD] ctx=" << (ctx ? "ok" : "null")
-                          << " aids_ptr="
-                          << (ctx && ctx->adapter_ids ? "ok" : "null")
-                          << " layer_idx=" << (ctx ? ctx->layer_index : -99)
-                          << " aids_size="
-                          << (ctx && ctx->adapter_ids ? ctx->adapter_ids->size()
-                                                      : 0);
   if (ctx == nullptr || ctx->adapter_ids == nullptr ||
       ctx->q_seq_lens_vec == nullptr || ctx->layer_index < 0) {
     return y;

@@ -315,11 +315,6 @@ void BatchInputBuilder::process_single_sequence(
   state.kv_cache_tokens_nums.emplace_back(n_kv_cache_tokens);
 #if defined(USE_NPU)
   state.adapter_ids.push_back(sequence->adapter_id());
-  LOG_EVERY_N(ERROR, 10) << "[V71_ADAPTER_ID] seq_index=" << seq_index
-                         << " req_id=" << sequence->request_id()
-                         << " adapter_id=" << sequence->adapter_id()
-                         << " state.adapter_ids.size="
-                         << state.adapter_ids.size();
   state.seq_lens.push_back(seq_len);
   state.q_seq_lens.push_back(padded_q_seq_len);
 #elif defined(USE_MLU) || defined(USE_CUDA) || defined(USE_ILU)
@@ -622,9 +617,6 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
 
   input_params.embedding_ids = std::move(state_.embedding_ids);
   input_params.request_ids = std::move(state_.request_ids);
-  LOG(ERROR) << "[V72_STATE_TO_INPUT] state_.adapter_ids.size="
-             << state_.adapter_ids.size()
-             << " state_.q_seq_lens.size=" << state_.q_seq_lens.size();
   input_params.adapter_ids = std::move(state_.adapter_ids);
   input_params.extra_token_ids = std::move(state_.extra_token_ids);
   if (!state_.mtp_shifted_token_ids.empty()) {

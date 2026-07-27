@@ -203,14 +203,7 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
     {
       const auto& _aids = input_params_new.adapter_ids;
       const auto& _qsl = input_params_new.q_seq_lens_vec;
-      size_t _nonz = 0;
-      for (auto _id : _aids)
-        if (_id != 0) ++_nonz;
-      LOG_EVERY_N(ERROR, 5)
-          << "[P1G_Q3_FWD] adapter_ids.size=" << _aids.size()
-          << " q_seq_lens.size=" << _qsl.size() << " nonzero=" << _nonz
-          << " first_id=" << (_aids.empty() ? 0 : _aids[0])
-          << " token_numel=" << tokens.numel();
+      (void)_qsl;
     }
     // M10 per-proj LoRA: push a LoRAContext frame so Linear wrappers can
     // read per-sequence adapter routing. This mirrors the same push in

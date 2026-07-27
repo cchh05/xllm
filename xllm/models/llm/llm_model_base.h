@@ -114,19 +114,12 @@ class LlmModelImplBase : public torch::nn::Module {
     lora_frame.q_seq_lens_vec = &modified_input_params.q_seq_lens_vec;
     // Phase A W2 v2: device-side per-token adapter tensor (built in
     // ModelInputParams::to(device); may be undefined() for pure-base).
-    lora_frame.adapter_ids_per_token = &modified_input_params.adapter_ids_per_token;
+    lora_frame.adapter_ids_per_token =
+        &modified_input_params.adapter_ids_per_token;
     lora_frame.layer_index = -1;
     // DEBUG P1G: dump adapter_ids state at forward entry
     {
-      const auto& _aids = modified_input_params.adapter_ids;
-      const auto& _qsl = modified_input_params.q_seq_lens_vec;
-      size_t _nonz = 0;
-      for (auto _id : _aids)
-        if (_id != 0) ++_nonz;
-      LOG_EVERY_N(ERROR, 5)
-          << "[P1G_MODEL_FWD] adapter_ids.size=" << _aids.size()
-          << " q_seq_lens.size=" << _qsl.size() << " nonzero=" << _nonz
-          << " first_id=" << (_aids.empty() ? 0 : _aids[0]);
+      (void)modified_input_params;
     }
     LoRAScope _lora_scope(lora_frame);
 
