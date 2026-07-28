@@ -18,8 +18,8 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
-#include <sstream>
 #include <numeric>
+#include <sstream>
 #include <vector>
 
 #include "framework/lora/lora_context.h"
@@ -56,7 +56,7 @@ std::vector<uint64_t> collect_distinct_adapters(
 // the scalar back (device->host is permitted; only host->device inside
 // forward is forbidden by CANN 8.5 + torch_npu 2.7.1).
 inline bool per_token_slow_path_safe(const torch::Tensor& per_token,
-                                      const torch::Tensor& combine_idx) {
+                                     const torch::Tensor& combine_idx) {
   // W2 v2 fix: after we correctly index combine_idx via (combine_idx / topk),
   // the resulting token indices are bounded to [0, T_tokens) by construction
   // (expand_row_ids values encode token_idx * topk + k_idx). So we only need
@@ -245,7 +245,12 @@ FusedMoEImpl::FusedMoEImpl(const ModelArgs& model_args,
                                  /*enable_result_reduction=*/false,
                                  quant_args,
                                  tp_pg_,
-                                 options));
+                                 options,
+                                 // Route LoRA lookups for this DenseMLP
+                                 // under "shared_expert.*" keys so they
+                                 // do not collide with the regular
+                                 // per-layer MLP entries.
+                                 /*lora_proj_prefix=*/"shared_expert."));
     shared_expert_gate_ = register_module(
         "shared_expert_gate",
         torch::nn::Linear(
@@ -433,8 +438,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
       if (slow_path) {
         const torch::Tensor* per_token = ctx->adapter_ids_per_token;
         const bool safe = per_token != nullptr &&
-            per_token_slow_path_safe(*per_token,
-                                     selected_expert_info.combine_idx);
+                          per_token_slow_path_safe(
+                              *per_token, selected_expert_info.combine_idx);
         if (safe) {
           // W2 v2 correct semantics (per user's diagnosis 07-20):
           // combine_idx is the pre-routing flat index into a [T_tokens*topk]
@@ -457,8 +462,7 @@ torch::Tensor FusedMoEImpl::forward_expert(
           // decode forwards that dominate LOG_EVERY_N sampling.
         } else {
           LOG_EVERY_N(WARNING, 100)
-              << "[Phase A W2 v2] mixed batch of "
-              << distinct_adapters.size()
+              << "[Phase A W2 v2] mixed batch of " << distinct_adapters.size()
               << " adapters but per-token tensor missing; falling back to "
               << "first-adapter-only for gate/up delta";
         }
@@ -486,8 +490,7 @@ torch::Tensor FusedMoEImpl::forward_expert(
 
         torch::Tensor mask_col;  // [T_exp, 1], only in slow path
         if (have_mask) {
-          mask_col = sel_adapter_row
-                         .eq(static_cast<int64_t>(adapter_id))
+          mask_col = sel_adapter_row.eq(static_cast<int64_t>(adapter_id))
                          .to(gemm1_out.dtype())
                          .unsqueeze(-1);
         }
@@ -510,8 +513,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
           p2.split_item = 2;
           p2.group_type = 0;
           p2.group_list_type = 1;
-          torch::Tensor delta_gate = xllm::kernel::group_gemm(p2)
-                                          .to(gemm1_out.dtype());
+          torch::Tensor delta_gate =
+              xllm::kernel::group_gemm(p2).to(gemm1_out.dtype());
           if (have_mask) delta_gate = delta_gate * mask_col;
           gemm1_out.slice(-1, 0, I_local).add_(delta_gate, med->scaling);
         }
@@ -533,8 +536,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
           p2.split_item = 2;
           p2.group_type = 0;
           p2.group_list_type = 1;
-          torch::Tensor delta_up = xllm::kernel::group_gemm(p2)
-                                        .to(gemm1_out.dtype());
+          torch::Tensor delta_up =
+              xllm::kernel::group_gemm(p2).to(gemm1_out.dtype());
           if (have_mask) delta_up = delta_up * mask_col;
           gemm1_out.slice(-1, I_local, 2 * I_local)
               .add_(delta_up, med->scaling);
@@ -588,8 +591,8 @@ torch::Tensor FusedMoEImpl::forward_expert(
       if (slow_path) {
         const torch::Tensor* per_token = ctx->adapter_ids_per_token;
         const bool safe = per_token != nullptr &&
-            per_token_slow_path_safe(*per_token,
-                                     selected_expert_info.combine_idx);
+                          per_token_slow_path_safe(
+                              *per_token, selected_expert_info.combine_idx);
         if (safe) {
           // W2 v2 correct semantics (see gate/up block for full explanation).
           auto per_token_pre_routing =
@@ -629,13 +632,13 @@ torch::Tensor FusedMoEImpl::forward_expert(
         p2.split_item = 2;
         p2.group_type = 0;
         p2.group_list_type = 1;
-        torch::Tensor delta_down = xllm::kernel::group_gemm(p2)
-                                        .to(gemm2_out.dtype());
+        torch::Tensor delta_down =
+            xllm::kernel::group_gemm(p2).to(gemm2_out.dtype());
         if (have_mask) {
-          torch::Tensor mask_col = sel_adapter_row
-                                       .eq(static_cast<int64_t>(adapter_id))
-                                       .to(gemm2_out.dtype())
-                                       .unsqueeze(-1);
+          torch::Tensor mask_col =
+              sel_adapter_row.eq(static_cast<int64_t>(adapter_id))
+                  .to(gemm2_out.dtype())
+                  .unsqueeze(-1);
           delta_down = delta_down * mask_col;
         }
         gemm2_out.add_(delta_down, med->scaling);

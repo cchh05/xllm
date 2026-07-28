@@ -40,7 +40,18 @@ class DenseMLPImpl : public torch::nn::Module {
                bool enable_result_reduction,
                const QuantArgs& quant_args,
                ProcessGroup* process_group,
-               const torch::TensorOptions& options);
+               const torch::TensorOptions& options,
+               // Optional prefix for the underlying LoRA wrapper proj names.
+               // "" (default) = regular per-layer MLP; the wrappers register
+               // as "gate_up_proj" / "down_proj" and read deltas keyed by
+               // "gate_proj" / "up_proj" / "down_proj". Pass e.g.
+               // "shared_expert." so this DenseMLP instance (used as the
+               // MoE shared expert in Qwen3.5-122B / DeepSeek-V2/V3 /
+               // GLM4-MoE) reads deltas keyed by
+               // "shared_expert.gate_proj" / "shared_expert.up_proj" /
+               // "shared_expert.down_proj" and does not collide with the
+               // regular per-layer MLP entries in per_proj_device_pool_.
+               const std::string& lora_proj_prefix = "");
 
   torch::Tensor forward(const torch::Tensor& hidden_states);
 

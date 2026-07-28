@@ -621,7 +621,20 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
     // last-dot split: proj is the tail after the final '.'
     const auto last_dot = prefix.rfind('.');
     if (last_dot == std::string::npos) return std::nullopt;
-    const std::string proj = prefix.substr(last_dot + 1);
+    std::string proj = prefix.substr(last_dot + 1);
+    // Distinguish shared_expert MLP from regular MLP: without this, keys
+    // like "layers.5.mlp.shared_expert.gate_proj" would parse to proj
+    // "gate_proj" and collide with the regular "layers.5.mlp.gate_proj"
+    // in per_proj_device_pool_ --- classic silent no-op for the shared
+    // expert adapter. Qwen3.5-122B, Qwen3-MoE-Instruct, DeepSeek-V2/V3 and
+    // GLM4-MoE all use `mlp.shared_expert.` (or the plural
+    // `mlp.shared_experts.`) as the submodule prefix.
+    const std::string kSharedExpertPrefix = ".mlp.shared_expert.";
+    const std::string kSharedExpertsPrefix = ".mlp.shared_experts.";
+    if (prefix.find(kSharedExpertPrefix) != std::string::npos ||
+        prefix.find(kSharedExpertsPrefix) != std::string::npos) {
+      proj = "shared_expert." + proj;
+    }
     return std::make_tuple(layer_index, proj, is_a);
   };
 

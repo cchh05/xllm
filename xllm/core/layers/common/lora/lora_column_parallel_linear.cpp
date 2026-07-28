@@ -25,8 +25,23 @@ LoRAColumnParallelLinearImpl::LoRAColumnParallelLinearImpl(
     const LinearExtraArgs& linear_extra_args)
     : proj_name_(proj_name),
       in_features_(in_features),
-      out_features_(out_features),
-      is_fused_gate_up_(proj_name == "gate_up_proj") {
+      out_features_(out_features) {
+  // is_fused_gate_up_: true for the fused gate+up column-parallel wrapper.
+  // Accepts both the plain "gate_up_proj" (regular per-layer MLP) and the
+  // prefixed "shared_expert.gate_up_proj" (MoE shared-expert DenseMLP).
+  // shared_prefix_: pool-key prefix for per-proj delta lookups. Regular
+  // MLP: "". Shared expert: "shared_expert.". Any name of the form
+  // "<prefix>.gate_up_proj" (or "<prefix>.o_proj" in the future) contributes
+  // its prefix (with trailing dot) so the delta pool stays disjoint from
+  // the regular per-layer MLP entries.
+  const auto last_dot = proj_name.rfind('.');
+  const std::string tail = last_dot == std::string::npos
+                               ? proj_name
+                               : proj_name.substr(last_dot + 1);
+  is_fused_gate_up_ = (tail == "gate_up_proj");
+  shared_prefix_ = last_dot == std::string::npos
+                       ? std::string()
+                       : proj_name.substr(0, last_dot + 1);
   base_ = ColumnParallelLinear(in_features,
                                out_features,
                                bias,
@@ -86,10 +101,10 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
     if (single_adapter && sole_aid != 0) {
       auto& runtime = LoRARuntime::instance();
       if (is_fused_gate_up_) {
-        const auto* gate_pd =
-            runtime.get_per_proj_delta(sole_aid, ctx->layer_index, "gate_proj");
-        const auto* up_pd =
-            runtime.get_per_proj_delta(sole_aid, ctx->layer_index, "up_proj");
+        const auto* gate_pd = runtime.get_per_proj_delta(
+            sole_aid, ctx->layer_index, shared_prefix_ + "gate_proj");
+        const auto* up_pd = runtime.get_per_proj_delta(
+            sole_aid, ctx->layer_index, shared_prefix_ + "up_proj");
         if (gate_pd == nullptr && up_pd == nullptr) return y;
         auto shrink_expand =
             [&](const LoRARuntime::ProjDelta* pd) -> torch::Tensor {
@@ -147,10 +162,10 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
 
     if (is_fused_gate_up_) {
       // Fused gate_up: lookup gate_proj + up_proj deltas, concat.
-      const auto* gate_pd =
-          runtime.get_per_proj_delta(aid, ctx->layer_index, "gate_proj");
-      const auto* up_pd =
-          runtime.get_per_proj_delta(aid, ctx->layer_index, "up_proj");
+      const auto* gate_pd = runtime.get_per_proj_delta(
+          aid, ctx->layer_index, shared_prefix_ + "gate_proj");
+      const auto* up_pd = runtime.get_per_proj_delta(
+          aid, ctx->layer_index, shared_prefix_ + "up_proj");
       if (gate_pd == nullptr && up_pd == nullptr) {
         tok_off += seq_len;
         continue;

@@ -77,6 +77,12 @@ class LoRAColumnParallelLinearImpl : public torch::nn::Module {
   int64_t out_size_local_ = 0;    // per-rank, matches base
   int64_t inter_size_local_ = 0;  // per-rank, half of out_size_local_ if fused
   bool is_fused_gate_up_ = false;
+  // Empty for the regular per-layer MLP; "shared_expert." when this
+  // wrapper backs the MoE shared-expert DenseMLP (Qwen3.5-122B,
+  // DeepSeek-V2/V3, GLM4-MoE). Prepended to per-proj delta lookups so
+  // the shared expert has its own slot in per_proj_device_pool_ and does
+  // not collide with the regular gate_proj / up_proj entries.
+  std::string shared_prefix_;
   int64_t tp_rank_ = 0;
   int64_t tp_world_size_ = 1;
 };

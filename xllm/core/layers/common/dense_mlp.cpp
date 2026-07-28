@@ -31,7 +31,8 @@ DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
                            bool enable_result_reduction,
                            const QuantArgs& quant_args,
                            ProcessGroup* process_group,
-                           const torch::TensorOptions& options)
+                           const torch::TensorOptions& options,
+                           const std::string& lora_proj_prefix)
     : is_gated_(is_gated),
       intermediate_size_(intermediate_size),
       process_group_(process_group),
@@ -59,6 +60,12 @@ DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
 
   // 1. gate + up
   int64_t out_feature = is_gated_ ? intermediate_size_ * 2 : intermediate_size_;
+  // For regular per-layer MLP lora_proj_prefix is empty and this is
+  // "gate_up_proj" / "down_proj" as before. For the MoE shared expert
+  // it becomes "shared_expert.gate_up_proj" / "shared_expert.down_proj"
+  // so the LoRA wrapper looks up per_proj_device_pool_ under distinct keys.
+  const std::string gate_up_proj_name = lora_proj_prefix + "gate_up_proj";
+  const std::string down_proj_name = lora_proj_prefix + "down_proj";
   gate_up_proj_ =
       register_module("gate_up_proj",
                       LoRAColumnParallelLinear(hidden_size,
@@ -68,7 +75,7 @@ DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
                                                quant_args,
                                                process_group_,
                                                options,
-                                               /*proj_name=*/"gate_up_proj",
+                                               /*proj_name=*/gate_up_proj_name,
                                                gate_up_proj_extra_args));
 
   act_ = register_module("act", Activation(hidden_act_, is_gated_));
@@ -84,7 +91,7 @@ DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
                                             quant_args,
                                             process_group_,
                                             options,
-                                            /*proj_name=*/"down_proj"));
+                                            /*proj_name=*/down_proj_name));
 }
 
 torch::Tensor DenseMLPImpl::forward(const torch::Tensor& hidden_states) {
