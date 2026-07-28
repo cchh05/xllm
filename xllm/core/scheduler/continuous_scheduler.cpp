@@ -994,18 +994,52 @@ std::vector<Batch> ContinuousScheduler::prepare_batch() {
     kv_cache_manager_->transfer_blocks(batches);
 
     // W4-A4: observe batch-level LoRA distribution for scheduler visibility.
-    // Fast path = 0 or 1 distinct adapter (wrapper hot loop),
-    // slow path = 2+ (fused_moe per-token mask). Gateway adapter-affinity
-    // dispatch should keep this near 1.0 fast-path ratio in practice.
+    //
+    // The wrapper hot-loop fast path is taken only when *all* sequences in
+    // the batch route to the same non-zero adapter (see the
+    // `single_adapter && sole_aid != 0` gate in
+    // lora_{qkv,column,row}_parallel_linear.cpp). Anything else --- a
+    // second adapter, or a base (aid=0) sequence mixed in with an
+    // adapter-bearing one --- drops the batch onto the per-seq slow path
+    // and pays a per-collective launch premium for every adapter-bearing
+    // sequence.
+    //
+    // Previously this metric counted only `distinct non-zero adapters`,
+    // which reported fast_path even when a base+LoRA mixed batch had
+    // silently entered the slow-path loop. Now it mirrors the wrapper
+    // classification exactly so operators reading /vars see the same
+    // fast/slow split as the wrapper computes at forward time.
+    //
+    // A LoRA-free batch (only base sequences) does not exercise either
+    // wrapper branch --- ctx->adapter_ids emits an all-zero vector and
+    // the wrappers early-return before hitting the fast/slow gate. Skip
+    // both counters in that case so the fast/slow ratio reflects only
+    // batches that actually reach the LoRA wrapper.
     {
       std::unordered_set<uint64_t> distinct;
+      bool has_base_seq = false;
+      bool has_lora_seq = false;
       for (const Sequence* seq : running_sequences_) {
         if (seq == nullptr) continue;
         const uint64_t aid = seq->adapter_id();
-        if (aid != 0) distinct.insert(aid);
+        if (aid == 0) {
+          has_base_seq = true;
+        } else {
+          has_lora_seq = true;
+          distinct.insert(aid);
+        }
       }
-      LoRAMetrics::instance().observe_batch_lora(distinct.size(),
-                                                 running_sequences_.size());
+      if (has_lora_seq) {
+        // Fast path condition: exactly one adapter and no base sequence
+        // mixed in. Otherwise report >=2 so observe_batch_lora bumps
+        // slow_path_total. The distinct_adapters histogram gets the
+        // same shifted count so p50/p95 stay comparable across batches.
+        const size_t effective_distinct =
+            (distinct.size() == 1 && !has_base_seq) ? 1u
+                                                    : (distinct.size() + 1);
+        LoRAMetrics::instance().observe_batch_lora(effective_distinct,
+                                                   running_sequences_.size());
+      }
     }
   } else {
     kv_cache_manager_->transfer_blocks();
