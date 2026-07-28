@@ -858,9 +858,17 @@ torch::Tensor RowParallelLinearImpl::forward(torch::Tensor input) {
         !g_mm_all_reduce_fusion_disabled.load(std::memory_order_relaxed)) {
       const std::string hcom = process_group_->get_hccl_comm_name();
       if (!hcom.empty()) {
+        // Lazily build a transposed contiguous view of the weight on the
+        // first fused call. Reused for every subsequent forward until the
+        // process exits, replacing the per-step .t().contiguous()
+        // allocation (~30-60MB per proj on 30B-A3B / rank; the pre-cache
+        // version paid this per token per proj per layer).
+        std::call_once(weight_t_cache_once_, [this]() {
+          weight_t_cache_ = weight_.t().contiguous();
+        });
         xllm::kernel::MmAllReduceParams mm_ar_params;
         mm_ar_params.a = input;
-        mm_ar_params.b = weight_.t().contiguous();
+        mm_ar_params.b = weight_t_cache_;
         mm_ar_params.hcom_name = hcom;
         // TP convention: only rank 0 supplies bias so the reduce-sum does
         // not double-count. `bias` above is already conditioned on rank_==0.

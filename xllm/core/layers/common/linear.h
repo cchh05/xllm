@@ -18,6 +18,8 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <mutex>
+
 #include "core/framework/model_context.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/quant_args.h"
@@ -243,6 +245,24 @@ class RowParallelLinearImpl : public torch::nn::Module {
   DEFINE_WEIGHT(per_channel_scale);
   DEFINE_WEIGHT(smooth);
   DEFINE_WEIGHT(bias);
+
+  // Lazily-cached transposed contiguous view of `weight_` for the fused
+  // MM+AllReduce fast path. Populated on the first fused-branch call and
+  // reused for every subsequent forward, replacing the per-step
+  // .t().contiguous() that would otherwise allocate O(out * in_local *
+  // sizeof(dtype)) bytes each token (~30-60MB per proj on a 30B-A3B
+  // rank; multiply by 48 layers and every decode step is 1.4-2.9GB of
+  // wasted transient allocation). Only touched when the fusion flag is
+  // ON *and* actually reaches the fused branch, so flag=off / non-NPU
+  // builds pay nothing.
+  //
+  // mutable so forward() can populate it while remaining logically
+  // read-only w.r.t. RowParallelLinearImpl state. once_flag guards
+  // against the theoretical case of two threads racing the first
+  // forward on a shared proj (single-forward-thread-per-rank is the
+  // norm, but the cost is one atomic and we get correctness for free).
+  mutable torch::Tensor weight_t_cache_;
+  mutable std::once_flag weight_t_cache_once_;
 
   // FP8 quantization parameters
   DEFINE_WEIGHT(weight_scale);  // FP8 weight scale
