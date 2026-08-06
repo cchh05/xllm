@@ -68,17 +68,9 @@ class LoRARowParallelLinearImpl : public torch::nn::Module {
 
   torch::Tensor forward(torch::Tensor input);
 
-  // Mirror of RowParallelLinearImpl::forward(input, reduce_mode) added upstream
-  // for flash_comm1 sequence-sharded fc1 (see linear.h:263). No LoRA target
-  // participates in flash_comm1 fc1 today (o_proj / down_proj on Qwen family
-  // stay on the fused-AR path), so this overload just delegates to the 1-arg
-  // forward and ignores reduce_mode; it exists purely as a drop-in signature
-  // match so DenseMLPImpl / attention wire-up compile the same way as the
-  // non-LoRA row-parallel base. If a future LoRA target needs sharded reduce
-  // semantics, plumb reduce_mode into the delta path here.
-  torch::Tensor forward(torch::Tensor input, RowParallelReduceMode reduce_mode);
-
   void load_state_dict(const StateDict& state_dict);
+
+  bool is_weight_loaded() const { return base_->is_weight_loaded(); }
 
   void pretty_print(std::ostream& stream) const {
     stream << name() << " (LoRA-wrapped/" << proj_name_

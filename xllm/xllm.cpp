@@ -57,6 +57,8 @@ namespace py = pybind11;
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/config/speculative_config.h"
+#include "core/framework/lora/lora_config.h"
+#include "core/framework/lora/lora_runtime.h"
 #include "core/framework/xtensor/global_xtensor.h"
 #include "core/framework/xtensor/options.h"
 #include "core/framework/xtensor/xtensor_allocator.h"
@@ -584,18 +586,14 @@ int main(int argc, char** argv) {
   google::InitGoogleLogging("xllm");
   initialize_configs();
 
-  const ServiceConfig& service_config = ServiceConfig::get_instance();
-  const DistributedConfig& distributed_config =
-      DistributedConfig::get_instance();
-  const std::string verbose_trace_log_path =
-      resolve_verbose_trace_log_path(service_config.verbose_trace_log_path(),
-                                     distributed_config.nnodes(),
-                                     distributed_config.node_rank());
-  VerboseTraceLogger::get_instance().initialize(
-      service_config.enable_verbose_trace_log(),
-      verbose_trace_log_path,
-      service_config.verbose_trace_log_max_size_mb(),
-      service_config.verbose_trace_log_max_files());
+  // Bootstrap the LoRA runtime from CLI flags. When --enable_lora=false
+  // (default) this only stores the config; no adapters get loaded and the
+  // model forward path skips the delta step for zero cost.
+  {
+    xllm::LoRAConfig lora_cfg;
+    lora_cfg.load_from_flags();
+    xllm::LoRARuntime::instance().init(lora_cfg);
+  }
 
   // Check if model path is provided
   if (::xllm::ModelConfig::get_instance().model().empty()) {

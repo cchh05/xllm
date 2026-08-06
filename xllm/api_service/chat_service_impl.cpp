@@ -501,10 +501,17 @@ void ChatServiceImpl::add_model_master(const std::string& model,
 LLMMaster* ChatServiceImpl::get_model_master(const std::string& model) const {
   std::shared_lock<std::shared_mutex> lock(llm_model_to_master_mutex_);
   auto it = llm_model_to_master_.find(model);
-  if (it == llm_model_to_master_.end()) {
-    return nullptr;
+  if (it != llm_model_to_master_.end()) {
+    return it->second;
   }
-  return it->second;
+  // LoRA fallback: if `model` is a registered LoRA adapter, route it through
+  // the default (base) master since LoRA adapters share the same base engine.
+  if (xllm::LoRARuntime::instance().enabled()) {
+    if (xllm::LoRARuntime::instance().registry().lookup(model).has_value()) {
+      return master_;
+    }
+  }
+  return nullptr;
 }
 
 void ChatServiceImpl::process_rec_chat_request(std::shared_ptr<ChatCall> call) {
@@ -670,12 +677,17 @@ void ChatServiceImpl::process_async_rpc_impl(
     return;
   }
 
-  // check if model is supported
+  // check if model is supported (or a registered LoRA adapter)
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
-  if (unlikely(!models_.contains(model))) {
+  std::optional<xllm::LoRARegistry::PinnedAdapter> lora_pinned_local;
+  if (xllm::LoRARuntime::instance().enabled()) {
+    lora_pinned_local =
+        xllm::LoRARuntime::instance().registry().lookup_and_pin(model);
+  }
+  if (unlikely(!lora_pinned_local.has_value() && !models_.contains(model))) {
     CALLBACK_WITH_ERROR(StatusCode::UNKNOWN,
-                        "Model not supported",
+                        "Model not supported or lora draining: " + model,
                         service_request_id,
                         target_xservice_addr);
     return;

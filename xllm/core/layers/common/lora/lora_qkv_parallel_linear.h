@@ -74,6 +74,8 @@ class LoRAQKVParallelLinearImpl : public torch::nn::Module {
 
   // Passthrough accessors -- keeps wrapper drop-in compatible with
   // QKVParallelLinearImpl for callers that peek at the base state.
+  bool is_weight_loaded() const { return base_->is_weight_loaded(); }
+
   void pretty_print(std::ostream& stream) const {
     stream << name()
            << " (LoRA-wrapped)  base_weight=" << base_->weight().sizes()

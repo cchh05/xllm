@@ -64,6 +64,8 @@ class LoRAColumnParallelLinearImpl : public torch::nn::Module {
     return base_->get_input_scale();
   }
 
+  bool is_weight_loaded() const { return base_->is_weight_loaded(); }
+
   void pretty_print(std::ostream& stream) const {
     stream << name() << " (LoRA-wrapped/" << proj_name_
            << ")  base_weight=" << base_->weight().sizes();

@@ -55,21 +55,6 @@ LoRARowParallelLinearImpl::LoRARowParallelLinearImpl(
   wrapper_owns_reduction_ = fused_ar_ && tp_world_size_ > 1;
 }
 
-torch::Tensor LoRARowParallelLinearImpl::forward(
-    torch::Tensor input,
-    RowParallelReduceMode reduce_mode) {
-  // The base row-parallel forward(input, reduce_mode) overload is only
-  // meaningful on NPU (see linear.cpp:1412 which overrides reduce_mode on
-  // non-NPU backends). The LoRA wrapper owns its own reduction bookkeeping
-  // via fused_ar_ / wrapper_owns_reduction_, and none of the current LoRA
-  // targets (o_proj, down_proj on Qwen family) participates in flash_comm1
-  // sequence-sharded fc1 yet, so we simply route to the 1-arg path. If a
-  // future target needs the sharded reduce mode, the reduce_mode plumbing
-  // will need to land in the LoRA delta path too.
-  (void)reduce_mode;
-  return forward(input);
-}
-
 torch::Tensor LoRARowParallelLinearImpl::forward(torch::Tensor input) {
   auto y = base_->forward(input);
 
