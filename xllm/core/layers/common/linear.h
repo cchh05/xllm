@@ -283,7 +283,6 @@ class RowParallelLinearImpl : public torch::nn::Module {
     }
     return std::nullopt;
   }
-  bool is_weight_loaded() const { return weight_is_loaded_; }
   ProcessGroup* process_group() const { return process_group_; }
 
   bool is_weight_loaded() const {

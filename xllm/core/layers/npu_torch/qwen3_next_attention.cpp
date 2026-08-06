@@ -70,16 +70,18 @@ Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
                             quant_args,
                             /*q_has_gate=*/attn_output_gate_));
 
-  // 2. O proj
-  o_proj_ = register_module("o_proj",
-                            RowParallelLinear(total_num_heads * head_dim_,
-                                              args.hidden_size(),
-                                              /*bias=*/false,
-                                              /*input_is_parallelized=*/true,
-                                              /*if_reduce_results=*/true,
-                                              quant_args,
-                                              parallel_args.tp_group_,
-                                              options));
+  // 2. O proj (LoRA-wrapped for Qwen3.5-122B adapter delta injection).
+  o_proj_ =
+      register_module("o_proj",
+                      LoRARowParallelLinear(total_num_heads * head_dim_,
+                                            args.hidden_size(),
+                                            /*bias=*/false,
+                                            /*input_is_parallelized=*/true,
+                                            /*enable_result_reduction=*/true,
+                                            quant_args,
+                                            parallel_args.tp_group_,
+                                            options,
+                                            /*proj_name=*/"o_proj"));
 
   // 3. Q norm
   q_norm_ = register_module(

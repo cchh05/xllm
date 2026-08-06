@@ -2387,6 +2387,9 @@ inline void deserialize_forward_input_payload(
   }
   read_string_vector(context, input_params.embedding.request_ids);
   read_vector(context, input_params.embedding.extra_token_ids);
+  // LoRA multi-tenant adapter routing (v0.10 flat buffer serialization).
+  // Mirror of write in serialize_forward_input_sections.
+  read_vector(context, input_params.adapter_ids);
   // Keep upstream's root mtp_shifted_token_ids serialization (consumed by
   // non-CP MTP paths + minimax / qwen3-next models). The CP path additionally
   // reads embedding.mtp_shifted_token_ids below. shared_blocks_num was
@@ -2744,6 +2747,9 @@ inline void serialize_forward_input_sections(
   write_linear_state_cache_ops(context, input_params.linear_state_cache_ops);
   write_string_vector(context.descriptor, input_params.embedding.request_ids);
   write_vector(context.descriptor, input_params.embedding.extra_token_ids);
+  // LoRA multi-tenant adapter routing (v0.10 flat buffer serialization).
+  // Mirror this in deserialize_forward_input_payload.
+  write_vector(context.descriptor, input_params.adapter_ids);
   // Mirror the read_* layout: write root + embedding mtp paths so the
   // deserializer sees both fields. Order MUST match the read_* sequence.
   write_tensor(context, input_params.mtp_shifted_token_ids);

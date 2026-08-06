@@ -150,6 +150,7 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
 
     std::optional<torch::Tensor> residual = std::nullopt;
     for (size_t i = 0; i < layers_.size(); i++) {
+      set_lora_context_layer(static_cast<int32_t>(i));
       auto& layer = layers_[i];
       h = layer->forward(h,
                          residual,

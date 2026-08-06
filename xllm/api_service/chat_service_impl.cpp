@@ -784,6 +784,19 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
 
   RequestParams request_params(
       rpc_request, call->get_x_request_id(), call->get_x_request_time());
+
+  // LoRA adapter_id propagation: if `model` names a registered LoRA adapter,
+  // pin it and set request_params.adapter_id so LLMMaster::generate_request
+  // routes it to RequestState -> SequenceParams -> Sequence -> BatchInput.
+  std::optional<xllm::LoRARegistry::PinnedAdapter> lora_pinned_impl;
+  if (xllm::LoRARuntime::instance().enabled()) {
+    lora_pinned_impl =
+        xllm::LoRARuntime::instance().registry().lookup_and_pin(model);
+    if (lora_pinned_impl.has_value()) {
+      request_params.adapter_id = lora_pinned_impl->int_id;
+    }
+  }
+
   std::vector<Message> messages;
   messages.reserve(rpc_request.messages_size());
   for (const auto& message : rpc_request.messages()) {
