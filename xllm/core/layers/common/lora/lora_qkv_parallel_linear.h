@@ -72,6 +72,22 @@ class LoRAQKVParallelLinearImpl : public torch::nn::Module {
                        const std::vector<std::string>& prefixes);
   void load_state_dict(const StateDict& state_dict);
 
+  bool is_weight_loaded() const { return base_->is_weight_loaded(); }
+
+  // Passthrough accessors for quantized-weight attention wire-up. Mirrors
+  // the QKVParallelLinearImpl API so attention layers can reorder per-channel
+  // FP8 scale / offset tensors after weight load without knowing whether the
+  // module is LoRA-wrapped. No LoRA side effect - delta is applied at
+  // forward time and is orthogonal to base-quant scale/offset.
+  torch::Tensor weight_scale() const { return base_->weight_scale(); }
+  torch::Tensor weight_offset() const { return base_->weight_offset(); }
+  bool is_weight_scale_loaded() const {
+    return base_->is_weight_scale_loaded();
+  }
+  bool is_weight_offset_loaded() const {
+    return base_->is_weight_offset_loaded();
+  }
+
   // Passthrough accessors -- keeps wrapper drop-in compatible with
   // QKVParallelLinearImpl for callers that peek at the base state.
   void pretty_print(std::ostream& stream) const {

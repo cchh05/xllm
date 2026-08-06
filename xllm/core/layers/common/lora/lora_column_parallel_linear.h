@@ -53,6 +53,8 @@ class LoRAColumnParallelLinearImpl : public torch::nn::Module {
   torch::Tensor forward(torch::Tensor input);
 
   void load_state_dict(const StateDict& state_dict);
+
+  bool is_weight_loaded() const { return base_->is_weight_loaded(); }
   void load_state_dict(const StateDict& state_dict,
                        const std::vector<std::string>& prefixes);
   void load_state_dict(const StateDict& state_dict,

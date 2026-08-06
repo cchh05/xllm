@@ -80,6 +80,8 @@ class LoRARowParallelLinearImpl : public torch::nn::Module {
 
   void load_state_dict(const StateDict& state_dict);
 
+  bool is_weight_loaded() const { return base_->is_weight_loaded(); }
+
   void pretty_print(std::ostream& stream) const {
     stream << name() << " (LoRA-wrapped/" << proj_name_
            << ")  base_weight=" << base_->weight().sizes();
