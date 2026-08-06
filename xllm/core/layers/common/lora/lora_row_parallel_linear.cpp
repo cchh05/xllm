@@ -244,5 +244,14 @@ void LoRARowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
   base_->load_state_dict(state_dict);
 }
 
+// 2-arg overload for FlashComm1 sequence-parallel dispatch.
+// Delegates to the single-arg forward; LoRA delta does not participate in
+// sequence-parallel reduce.
+torch::Tensor LoRARowParallelLinearImpl::forward(
+    torch::Tensor input,
+    xllm::RowParallelReduceMode reduce_mode) {
+  return this->forward(input);
+}
+
 }  // namespace layer
 }  // namespace xllm

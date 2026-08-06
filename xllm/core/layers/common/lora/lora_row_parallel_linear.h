@@ -37,6 +37,7 @@ You may obtain a copy of the License at
 #include <string>
 #include <vector>
 
+#include "core/common/flash_comm1_context.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
@@ -67,6 +68,8 @@ class LoRARowParallelLinearImpl : public torch::nn::Module {
       const LinearExtraArgs& linear_extra_args = LinearExtraArgs());
 
   torch::Tensor forward(torch::Tensor input);
+  torch::Tensor forward(torch::Tensor input,
+                        xllm::RowParallelReduceMode reduce_mode);
 
   void load_state_dict(const StateDict& state_dict);
 
