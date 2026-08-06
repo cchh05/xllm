@@ -501,10 +501,17 @@ void ChatServiceImpl::add_model_master(const std::string& model,
 LLMMaster* ChatServiceImpl::get_model_master(const std::string& model) const {
   std::shared_lock<std::shared_mutex> lock(llm_model_to_master_mutex_);
   auto it = llm_model_to_master_.find(model);
-  if (it == llm_model_to_master_.end()) {
-    return nullptr;
+  if (it != llm_model_to_master_.end()) {
+    return it->second;
   }
-  return it->second;
+  // Multi-tenant LoRA fallback: if the requested model is a registered LoRA
+  // adapter name (loaded via /v1/load_lora_adapter or --lora-modules), route
+  // it through the base master since LoRA adapters share the base engine.
+  if (LoRARuntime::instance().enabled() &&
+      LoRARuntime::instance().registry().lookup(model).has_value()) {
+    return master_;
+  }
+  return nullptr;
 }
 
 void ChatServiceImpl::process_rec_chat_request(std::shared_ptr<ChatCall> call) {
