@@ -154,6 +154,14 @@ class RemoteWorker : public WorkerClient {
 
   folly::SemiFuture<bool> wakeup_async(const WakeupOptions& options) override;
 
+  folly::SemiFuture<bool> load_lora_adapter_async(
+      const std::string& lora_name,
+      const std::string& lora_path,
+      const std::string& base_model_name) override;
+
+  folly::SemiFuture<bool> unload_lora_adapter_async(
+      const std::string& lora_name) override;
+
   folly::SemiFuture<bool> update_weights_async(
       const std::string& weights_path) override;
 

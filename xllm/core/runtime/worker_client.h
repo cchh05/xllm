@@ -49,6 +49,14 @@ class WorkerClient {
 
   virtual folly::SemiFuture<bool> wakeup_async(const WakeupOptions& options);
 
+  virtual folly::SemiFuture<bool> load_lora_adapter_async(
+      const std::string& lora_name,
+      const std::string& lora_path,
+      const std::string& base_model_name);
+
+  virtual folly::SemiFuture<bool> unload_lora_adapter_async(
+      const std::string& lora_name);
+
   virtual folly::SemiFuture<bool> update_weights_async(
       const std::string& weights_path);
 

@@ -257,6 +257,44 @@ folly::SemiFuture<bool> Worker::wakeup_async(const WakeupOptions& options) {
   return future;
 }
 
+bool Worker::load_lora_adapter(const std::string& lora_name,
+                               const std::string& lora_path,
+                               const std::string& base_model_name) {
+  return impl_->load_lora_adapter(lora_name, lora_path, base_model_name);
+}
+
+folly::SemiFuture<bool> Worker::load_lora_adapter_async(
+    const std::string& lora_name,
+    const std::string& lora_path,
+    const std::string& base_model_name) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        lora_name,
+                        lora_path,
+                        base_model_name,
+                        promise = std::move(promise)]() mutable {
+    promise.setValue(
+        this->load_lora_adapter(lora_name, lora_path, base_model_name));
+  });
+  return future;
+}
+
+bool Worker::unload_lora_adapter(const std::string& lora_name) {
+  return impl_->unload_lora_adapter(lora_name);
+}
+
+folly::SemiFuture<bool> Worker::unload_lora_adapter_async(
+    const std::string& lora_name) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule(
+      [this, lora_name, promise = std::move(promise)]() mutable {
+        promise.setValue(this->unload_lora_adapter(lora_name));
+      });
+  return future;
+}
+
 bool Worker::start_profile() { return impl_->start_profile(); }
 
 bool Worker::stop_profile() { return impl_->stop_profile(); }

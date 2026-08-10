@@ -198,6 +198,19 @@ folly::SemiFuture<bool> WorkerClient::wakeup_async(
   return worker_->wakeup_async(options);
 }
 
+folly::SemiFuture<bool> WorkerClient::load_lora_adapter_async(
+    const std::string& lora_name,
+    const std::string& lora_path,
+    const std::string& base_model_name) {
+  return worker_->load_lora_adapter_async(
+      lora_name, lora_path, base_model_name);
+}
+
+folly::SemiFuture<bool> WorkerClient::unload_lora_adapter_async(
+    const std::string& lora_name) {
+  return worker_->unload_lora_adapter_async(lora_name);
+}
+
 folly::SemiFuture<bool> WorkerClient::update_weights_async(
     const std::string& /*weights_path*/) {
   LOG(FATAL) << "WorkerClient Method update_weights is UnImplemented.";

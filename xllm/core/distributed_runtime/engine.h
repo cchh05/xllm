@@ -174,6 +174,18 @@ class Engine {
     return false;
   };
 
+  virtual bool load_lora_broadcast(const std::string& lora_name,
+                                   const std::string& lora_path,
+                                   const std::string& base_model_name) {
+    LOG(FATAL) << " load_lora_broadcast is not implemented!";
+    return false;
+  };
+
+  virtual bool unload_lora_broadcast(const std::string& lora_name) {
+    LOG(FATAL) << " unload_lora_broadcast is not implemented!";
+    return false;
+  };
+
   // Start/stop online timeline profiling on all workers. CUDA only for now.
   virtual bool start_profile() {
     LOG(ERROR) << "start_profile is not implemented for this engine!";

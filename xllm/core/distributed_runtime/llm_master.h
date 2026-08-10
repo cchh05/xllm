@@ -88,6 +88,12 @@ class LLMMaster : public Master {
 
   bool wakeup(const WakeupOptions& options) override;
 
+  bool load_lora_broadcast(const std::string& lora_name,
+                           const std::string& lora_path,
+                           const std::string& base_model_name) override;
+
+  bool unload_lora_broadcast(const std::string& lora_name) override;
+
   bool update_weights(const std::string& weights_path) override;
 
   bool link_p2p(const std::vector<std::string>& remote_addrs) override;

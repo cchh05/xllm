@@ -56,6 +56,20 @@ class Worker {
 
   folly::SemiFuture<bool> wakeup_async(const WakeupOptions& options);
 
+  bool load_lora_adapter(const std::string& lora_name,
+                         const std::string& lora_path,
+                         const std::string& base_model_name);
+
+  folly::SemiFuture<bool> load_lora_adapter_async(
+      const std::string& lora_name,
+      const std::string& lora_path,
+      const std::string& base_model_name);
+
+  bool unload_lora_adapter(const std::string& lora_name);
+
+  folly::SemiFuture<bool> unload_lora_adapter_async(
+      const std::string& lora_name);
+
   // Start/stop online timeline profiling on this worker's device.
   bool start_profile();
 

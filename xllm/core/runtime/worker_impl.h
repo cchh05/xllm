@@ -156,6 +156,12 @@ class WorkerImpl {
 
   virtual bool wakeup(const WakeupOptions& options);
 
+  virtual bool load_lora_adapter(const std::string& lora_name,
+                                 const std::string& lora_path,
+                                 const std::string& base_model_name);
+
+  virtual bool unload_lora_adapter(const std::string& lora_name);
+
   // RL deep-sleep: reload model weights in place from disk (vllm-ascend
   // `reload_weights`). `weights_path` empty = reuse the original model path.
   virtual bool update_weights(const std::string& weights_path);

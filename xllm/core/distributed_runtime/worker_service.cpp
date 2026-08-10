@@ -722,6 +722,38 @@ void WorkerService::Wakeup(::google::protobuf::RpcController* controller,
   return;
 }
 
+void WorkerService::LoadLoraAdapter(
+    ::google::protobuf::RpcController* controller,
+    const proto::LoadLoraAdapterRequest* req,
+    proto::Status* resp,
+    ::google::protobuf::Closure* done) {
+  // Runs on worker's threadpool_. Same executor as ExecuteModel, so the
+  // torch_npu opapi memcpy stream is already primed for this thread and
+  // .to(device) succeeds. This is the whole reason the adapter load has
+  // to be broadcast to the worker instead of run inline in the API
+  // handler thread.
+  threadpool_->schedule([this, controller, req, resp, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    bool status = worker_->load_lora_adapter(
+        req->lora_name(), req->lora_path(), req->base_model_name());
+    resp->set_ok(status);
+  });
+  return;
+}
+
+void WorkerService::UnloadLoraAdapter(
+    ::google::protobuf::RpcController* controller,
+    const proto::UnloadLoraAdapterRequest* req,
+    proto::Status* resp,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, req, resp, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    bool status = worker_->unload_lora_adapter(req->lora_name());
+    resp->set_ok(status);
+  });
+  return;
+}
+
 void WorkerService::StartProfile(::google::protobuf::RpcController* controller,
                                  const proto::Empty* req,
                                  proto::Status* resp,
