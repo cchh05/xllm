@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 #include <folly/MPMCQueue.h>
 
 #include <cstdint>
@@ -192,6 +194,45 @@ class SchedulerPolicy {
 
   BatchMode batch_mode_;
   const ContinuousScheduler::Options& options_;
+
+  // ---- 2026-08-10 Adapter-affinity batching state ------------------------
+  //
+  // AffinityGate is a stack-scoped helper used inside
+  // schedule_decode_from_queue. It tracks the distinct adapter_ids (base=0
+  // counts as one slot too) admitted into the batch under construction and
+  // decides whether the queue's head can join or must be deferred.
+  //
+  // Fast forward path predicate (see lora_qkv_parallel_linear.cpp) requires
+  //   (a) all seqs share a single non-zero adapter_id AND
+  //   (b) no base seq is mixed in.
+  // K=1 keeps a batch strictly on the fast path. K>=2 admits mixed batches
+  // (slow path) as a capacity release valve.
+  //
+  // defer_counts_ is *policy-owned* state, not gate-scoped: a deferred
+  // request must accumulate its defer count across scheduler ticks so the
+  // anti-starvation guard can force-admit after max_defer_steps ticks.
+  struct AffinityGate {
+    enum Decision { ADMIT, DEFER, FORCE_ADMIT };
+    absl::flat_hash_set<uint64_t> active_ids;
+    int32_t K = 1;
+    int32_t max_defer = 4;
+    bool enabled = false;
+
+    Decision decide(uint64_t aid, uint32_t defer_cnt) const {
+      if (!enabled) return ADMIT;
+      if (active_ids.contains(aid)) return ADMIT;
+      if (static_cast<int32_t>(active_ids.size()) < K) return ADMIT;
+      if (static_cast<int32_t>(defer_cnt) >= max_defer) return FORCE_ADMIT;
+      return DEFER;
+    }
+    void record_admit(uint64_t aid) { active_ids.insert(aid); }
+    size_t size() const { return active_ids.size(); }
+  };
+
+  // Per-request consecutive defer count. Keyed by Request::request_id().
+  // Erased when the request is admitted; erased in bulk after each tick's
+  // finished collection so cancelled requests never leak.
+  absl::flat_hash_map<std::string, uint32_t> defer_counts_;
 };
 
 // =============================================================================

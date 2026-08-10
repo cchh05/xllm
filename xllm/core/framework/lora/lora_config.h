@@ -78,6 +78,28 @@ struct LoRAConfig {
   // false, only the static --lora-modules set is served.
   bool allow_runtime_lora_updating = true;
 
+  // ---- Adapter-affinity batching (2026-08-10) -----------------------------
+  //
+  // Engine-side counterpart to the network gateway adapter-affinity
+  // dispatch. When enabled, ContinuousScheduler picks decode requests so
+  // each batch keeps its distinct adapter count within K, and mixed-adapter
+  // batches (which fall to the slow forward path) are avoided. The gateway
+  // still ideally colocates same-adapter requests upstream; this is the
+  // fallback that keeps the fast forward path hit-rate at 99%+ when the
+  // gateway drops the ball.
+
+  // Master switch. Default true iff enable_lora=true. When false, restore
+  // strict-FIFO behaviour (byte-identical to baseline).
+  bool enable_lora_adapter_affinity = true;
+
+  // Max distinct adapter_ids (base=0 counts as one slot too) in a single
+  // decode batch. Default 1 -> pure fast path. Clamped to max_loras.
+  int32_t lora_max_adapters_per_batch = 1;
+
+  // Bound on consecutive ticks a request may be deferred before the gate
+  // force-admits (accepting one slow-path step). Default 4.
+  int32_t lora_max_defer_steps = 4;
+
   // Parse the raw --lora-modules CLI value ("name1=path1,name2=path2") into
   // the vector form. Bad tokens are logged and skipped.
   static std::vector<std::pair<std::string, std::string>> parse_modules(
@@ -100,3 +122,6 @@ DECLARE_string(lora_modules);
 DECLARE_bool(allow_runtime_lora_updating);
 DECLARE_bool(enable_lora_row_parallel_all_reduce);
 DECLARE_bool(enable_lora_row_parallel_fused_ar);
+DECLARE_bool(enable_lora_adapter_affinity);
+DECLARE_int32(lora_max_adapters_per_batch);
+DECLARE_int32(lora_max_defer_steps);
