@@ -135,6 +135,13 @@ class LoRAMetrics {
   // fast_path = (distinct_count <= 1), slow_path = (distinct_count >= 2)
   void observe_batch_lora(size_t distinct_count, size_t total_seqs);
 
+  // 2026-08-10: adapter-affinity scheduler gate counters. Called by
+  // SchedulerPolicy::schedule_decode_from_queue when a request is skipped
+  // to preserve batch homogeneity (reason="deferred") or force-admitted
+  // after hitting max_defer_steps (reason="forced_admit"). Both are Adders,
+  // labelled by reason.
+  void inc_affinity_deferred(const char* reason);
+
   // For test / debug: how many adapters are currently tracked.
   size_t adapter_count() const;
 
@@ -166,6 +173,12 @@ class LoRAMetrics {
   std::unique_ptr<bvar::Adder<int64_t>> batch_fast_path_total_;
   std::unique_ptr<bvar::Adder<int64_t>> batch_slow_path_total_;
   std::unique_ptr<bvar::LatencyRecorder> batch_distinct_adapters_;
+
+  // 2026-08-10: adapter-affinity gate counters. Two labels: deferred /
+  // forced_admit. Split as two counters (simpler than a MultiDimension)
+  // since we only have 2 label values.
+  std::unique_ptr<bvar::Adder<int64_t>> affinity_deferred_total_;
+  std::unique_ptr<bvar::Adder<int64_t>> affinity_forced_admit_total_;
 };
 
 }  // namespace xllm

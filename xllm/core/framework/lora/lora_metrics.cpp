@@ -6,6 +6,8 @@ Licensed under the Apache License, Version 2.0.
 
 #include <glog/logging.h>
 
+#include <cstring>
+
 namespace xllm {
 
 namespace {
@@ -53,6 +55,11 @@ LoRAMetrics::LoRAMetrics() {
       std::make_unique<bvar::Adder<int64_t>>("xllm_lora_batch_slow_path_total");
   batch_distinct_adapters_ = std::make_unique<bvar::LatencyRecorder>(
       "xllm_lora_batch_distinct_adapters");
+  // 2026-08-10: adapter-affinity gate counters.
+  affinity_deferred_total_ = std::make_unique<bvar::Adder<int64_t>>(
+      "xllm_lora_adapter_affinity_deferred_total");
+  affinity_forced_admit_total_ = std::make_unique<bvar::Adder<int64_t>>(
+      "xllm_lora_adapter_affinity_forced_admit_total");
   LOG(INFO) << "[LoRAMetrics] initialised";
 }
 
@@ -289,6 +296,17 @@ void LoRAMetrics::observe_batch_lora(size_t distinct_count, size_t total_seqs) {
     if (batch_fast_path_total_) (*batch_fast_path_total_) << 1;
   } else {
     if (batch_slow_path_total_) (*batch_slow_path_total_) << 1;
+  }
+}
+
+void LoRAMetrics::inc_affinity_deferred(const char* reason) {
+  // reason is "deferred" or "forced_admit". Anything else is silently
+  // dropped so a typo in the caller doesn't crash a running server.
+  if (reason == nullptr) return;
+  if (strcmp(reason, "deferred") == 0) {
+    if (affinity_deferred_total_) (*affinity_deferred_total_) << 1;
+  } else if (strcmp(reason, "forced_admit") == 0) {
+    if (affinity_forced_admit_total_) (*affinity_forced_admit_total_) << 1;
   }
 }
 

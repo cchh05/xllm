@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "core/framework/lora/lora_runtime.h"
 #include "models.pb.h"
 
 namespace xllm {
@@ -47,6 +48,7 @@ bool ModelsServiceImpl::list_models(const proto::ModelListRequest* request,
 std::string ModelsServiceImpl::list_model_versions() {
   nlohmann::json model_states_array = nlohmann::json::array();
 
+  // Base models: emitted with version from launch-time registry.
   for (size_t i = 0; i < model_versions_.size(); ++i) {
     nlohmann::json model_state;
     // The repository index reports the model directory name (carried by
@@ -57,6 +59,19 @@ std::string ModelsServiceImpl::list_model_versions() {
     model_state["state"] = "READY";
     model_state["reason"] = "normal";
     model_states_array.push_back(model_state);
+  }
+
+  // LoRA adapters: enumerate live registry alongside the base models so
+  // /v1/repository/index reflects both. Version is the numeric int_id
+  // stringified so downstream tools that treat version as string still work.
+  const auto adapters = LoRARuntime::instance().registry().list();
+  for (const auto& a : adapters) {
+    nlohmann::json adapter_state;
+    adapter_state["name"] = a.lora_name;
+    adapter_state["version"] = std::to_string(a.lora_int_id);
+    adapter_state["state"] = "READY";
+    adapter_state["reason"] = "lora_adapter";
+    model_states_array.push_back(adapter_state);
   }
 
   return model_states_array.dump();

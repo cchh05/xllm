@@ -28,6 +28,8 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "framework/batch/batch_factory.h"
+#include "framework/lora/lora_config.h"
+#include "framework/lora/lora_metrics.h"
 #include "framework/request/priority_comparator.h"
 #include "util/timer.h"
 #include "util/utils.h"
@@ -148,6 +150,9 @@ std::vector<std::shared_ptr<Request>> SchedulerPolicy::collect_finished(
     if (request->finished() || request->cancelled()) {
       clear_mtp_bootstrap(request.get(), state);
       state.kv_cache_manager->deallocate(request.get());
+      // Release any adapter-affinity defer counter -- request will not be
+      // scheduled again so the counter would leak otherwise.
+      defer_counts_.erase(request->request_id());
       finished_requests.emplace_back(request);
       *it = nullptr;
     }
@@ -466,12 +471,44 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
     return;
   }
 
+  // 2026-08-10: adapter-affinity gate. Built from LoRA gflags each tick so
+  // /flags-set changes take effect immediately. When enabled=false the
+  // decide() below returns ADMIT unconditionally, preserving the legacy
+  // strict-FIFO behaviour byte-for-byte.
+  AffinityGate gate;
+  gate.enabled = FLAGS_enable_lora && FLAGS_enable_lora_adapter_affinity;
+  gate.K = FLAGS_lora_max_adapters_per_batch;
+  gate.max_defer = FLAGS_lora_max_defer_steps;
+  std::vector<std::shared_ptr<Request>> deferred;
+
   while (!queue->empty() &&
          budget.remaining_token_budget >
              static_cast<size_t>(state.min_speculative_tokens_required) &&
          budget.latency_budget > budget.estimate_latency &&
          budget.remaining_seq_budget > 0) {
     std::shared_ptr<Request> request = queue->top();
+
+    // Adapter-affinity gate: skip requests that would over-diversify the
+    // batch. Bounded by max_defer so no request waits forever.
+    if (gate.enabled) {
+      const uint64_t aid =
+          !request->sequences().empty() && request->sequences()[0]
+              ? request->sequences()[0]->adapter_id()
+              : 0;
+      auto it = defer_counts_.find(request->request_id());
+      const uint32_t dc = (it == defer_counts_.end()) ? 0 : it->second;
+      const auto decision = gate.decide(aid, dc);
+      if (decision == AffinityGate::DEFER) {
+        queue->pop_top();
+        deferred.emplace_back(request);
+        defer_counts_[request->request_id()] = dc + 1;
+        LoRAMetrics::instance().inc_affinity_deferred("deferred");
+        continue;
+      }
+      if (decision == AffinityGate::FORCE_ADMIT) {
+        LoRAMetrics::instance().inc_affinity_deferred("forced_admit");
+      }
+    }
 
     const size_t num_sequences = request->sequences().size();
     std::vector<Sequence*> candidate_sequences;
@@ -626,6 +663,15 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
     if (has_enough_budget && has_enough_blocks) {
       queue->pop_top();
       state.running_requests.emplace_back(request);
+      // Record admit into the affinity gate + release any defer counter.
+      if (gate.enabled) {
+        const uint64_t aid =
+            !request->sequences().empty() && request->sequences()[0]
+                ? request->sequences()[0]->adapter_id()
+                : 0;
+        gate.record_admit(aid);
+        defer_counts_.erase(request->request_id());
+      }
       state.running_sequences.insert(state.running_sequences.end(),
                                      candidate_sequences.begin(),
                                      candidate_sequences.end());
@@ -689,6 +735,18 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
                                    allocated_estimate_latency,
                                    /*budget_exhausted=*/false);
     break;
+  }
+
+  // Restore deferred requests for the next tick. Priority is preserved
+  // implicitly by queue->push() (heap re-heapifies on insert).
+  for (auto& r : deferred) {
+    queue->push(r);
+  }
+  // Emit batch-level LoRA affinity metric. gate.size() == distinct adapter
+  // count admitted in this batch (0 if nothing scheduled).
+  if (gate.enabled) {
+    LoRAMetrics::instance().observe_batch_lora(gate.size(),
+                                               state.running_sequences.size());
   }
 }
 

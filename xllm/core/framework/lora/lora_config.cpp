@@ -113,6 +113,33 @@ DEFINE_bool(
     "RowParallelLinearWithShardedLoRA pattern). Cuts per-layer AR count "
     "from 2 to 1. Supersedes enable_lora_row_parallel_all_reduce when true.");
 
+// ---- Adapter-affinity batching (2026-08-10) -----------------------------
+// Engine-side scheduler avoids mixed-adapter batches (which would drop into
+// the per-seq slow forward path). See LoRAConfig header for the full
+// rationale.
+DEFINE_bool(
+    enable_lora_adapter_affinity,
+    true,
+    "When enable_lora=true, gate the decode scheduler so each batch keeps "
+    "its distinct adapter count within --lora_max_adapters_per_batch. "
+    "Fast forward path requires a batch of homogeneous non-zero adapter "
+    "ids and no base seq; setting this false restores strict-FIFO "
+    "(byte-identical baseline behaviour).");
+
+DEFINE_int32(
+    lora_max_adapters_per_batch,
+    1,
+    "Max distinct adapter_ids per decode batch (base=0 counts as one slot). "
+    "Default 1 keeps the batch in the fast forward path. Clamped to "
+    "--max_loras at load time.");
+
+DEFINE_int32(
+    lora_max_defer_steps,
+    4,
+    "Consecutive scheduler ticks a request may be deferred by the adapter-"
+    "affinity gate before it is force-admitted. Bounds tail latency at "
+    "approximately lora_max_defer_steps * scheduler_tick_period.");
+
 namespace xllm {
 
 namespace {
@@ -164,6 +191,17 @@ void LoRAConfig::load_from_flags() {
   lora_modules = parse_modules(FLAGS_lora_modules);
   allow_runtime_lora_updating = FLAGS_allow_runtime_lora_updating;
 
+  enable_lora_adapter_affinity = FLAGS_enable_lora_adapter_affinity;
+  lora_max_adapters_per_batch = FLAGS_lora_max_adapters_per_batch;
+  lora_max_defer_steps = FLAGS_lora_max_defer_steps;
+  // Clamp K to max_loras -- the gate cannot distinguish more adapters than
+  // the pool can hold anyway. Also floor at 1 so K=0 never accidentally
+  // disables the scheduler entirely.
+  if (lora_max_adapters_per_batch < 1) lora_max_adapters_per_batch = 1;
+  if (lora_max_adapters_per_batch > max_loras)
+    lora_max_adapters_per_batch = max_loras;
+  if (lora_max_defer_steps < 0) lora_max_defer_steps = 0;
+
   if (enable_lora) {
     LOG(INFO) << "[LoRAConfig] enabled: max_loras=" << max_loras
               << " max_cpu_loras=" << max_cpu_loras
@@ -171,7 +209,11 @@ void LoRAConfig::load_from_flags() {
               << " target_modules=" << lora_target_modules.size()
               << " static_modules=" << lora_modules.size()
               << " runtime_updates="
-              << (allow_runtime_lora_updating ? "on" : "off");
+              << (allow_runtime_lora_updating ? "on" : "off")
+              << " adapter_affinity="
+              << (enable_lora_adapter_affinity ? "on" : "off")
+              << " K=" << lora_max_adapters_per_batch
+              << " max_defer=" << lora_max_defer_steps;
   }
 }
 
