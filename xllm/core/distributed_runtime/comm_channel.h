@@ -126,6 +126,12 @@ class CommChannel {
 
   virtual bool wakeup(const WakeupOptions& options);
 
+  virtual bool load_lora_adapter(const std::string& lora_name,
+                                 const std::string& lora_path,
+                                 const std::string& base_model_name);
+
+  virtual bool unload_lora_adapter(const std::string& lora_name);
+
   virtual bool start_profile();
 
   virtual bool stop_profile();

@@ -583,6 +583,16 @@ bool LLMMaster::wakeup(const WakeupOptions& options) {
   return engine_->wakeup(opts);
 }
 
+bool LLMMaster::load_lora_broadcast(const std::string& lora_name,
+                                    const std::string& lora_path,
+                                    const std::string& base_model_name) {
+  return engine_->load_lora_broadcast(lora_name, lora_path, base_model_name);
+}
+
+bool LLMMaster::unload_lora_broadcast(const std::string& lora_name) {
+  return engine_->unload_lora_broadcast(lora_name);
+}
+
 bool LLMMaster::update_weights(const std::string& weights_path) {
   return engine_->update_weights(weights_path);
 }

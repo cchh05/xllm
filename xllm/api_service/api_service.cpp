@@ -20,7 +20,10 @@ limitations under the License.
 #include <json2pb/json_to_pb.h>
 #include <json2pb/pb_to_json.h>
 
+#include <chrono>
 #include <filesystem>
+#include <nlohmann/json.hpp>
+#include <thread>
 
 #include "api_service/chat_json_parser.h"
 #include "api_service/completion_json_parser.h"
@@ -40,6 +43,8 @@ limitations under the License.
 #include "core/distributed_runtime/vlm_master.h"
 #include "core/framework/config/distributed_config.h"
 #include "core/framework/config/profile_config.h"
+#include "core/framework/lora/lora_metrics.h"
+#include "core/framework/lora/lora_runtime.h"
 #include "core/util/closure_guard.h"
 #include "embedding.pb.h"
 #include "image_generation.pb.h"
@@ -1688,6 +1693,279 @@ void APIService::ResumeHttp(::google::protobuf::RpcController* controller,
   std::string json_output;
   json2pb::ProtoMessageToJson(*resp_pb, &json_output, nullptr);
   ctrl->response_attachment().append(json_output);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-tenant LoRA (M9). All four handlers hand-parse the JSON body via
+// nlohmann::json and delegate to LoRARuntime, keeping this layer thin so
+// vLLM-compatible extensions (load_inplace, priority) can land later
+// without proto churn.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Small helper: fill an HTTP response with a JSON string and a status
+// header. The brpc HTTP layer will forward the status code back to the
+// client. Returning early on error is easier than plumbing a Status
+// object through every path here.
+void write_json_response(brpc::Controller* ctrl,
+                         int http_status,
+                         const nlohmann::json& body) {
+  ctrl->http_response().set_status_code(http_status);
+  ctrl->http_response().set_content_type("application/json");
+  ctrl->response_attachment().append(body.dump());
+}
+
+// Read the whole request attachment into a std::string. brpc already
+// gave us an IOBuf; std::string is easier to feed to nlohmann::json.
+std::string read_body(brpc::Controller* ctrl) {
+  butil::IOBuf& buf = ctrl->request_attachment();
+  return buf.to_string();
+}
+
+}  // namespace
+
+void APIService::LoadLoraAdapterHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = reinterpret_cast<brpc::Controller*>(controller);
+
+  auto& runtime = LoRARuntime::instance();
+  if (!runtime.enabled()) {
+    write_json_response(
+        ctrl, 400, {{"error", "LoRA is disabled; start with --enable_lora"}});
+    return;
+  }
+
+  const std::string body = read_body(ctrl);
+  nlohmann::json j;
+  try {
+    j = nlohmann::json::parse(body);
+  } catch (const std::exception& e) {
+    write_json_response(
+        ctrl, 400, {{"error", std::string("bad json: ") + e.what()}});
+    return;
+  }
+  if (!j.is_object() || !j.contains("lora_name") || !j.contains("lora_path")) {
+    write_json_response(
+        ctrl,
+        400,
+        {{"error", "expected {\"lora_name\":..., \"lora_path\":...}"}});
+    return;
+  }
+  const std::string lora_name = j["lora_name"].get<std::string>();
+  const std::string lora_path = j["lora_path"].get<std::string>();
+  const std::string base_model_name =
+      j.value("base_model_name", std::string(""));
+
+  // Broadcast to all workers so the CPU->NPU copy runs on each worker's
+  // own thread (which has torch_npu's opapi memcpy stream primed).
+  // Doing the load inline in this API handler thread reproducibly
+  // crashes with aclrtMemcpy 107017 on CANN 8.5 -- see the P0-B
+  // rationale in the commit message.
+  Master* master = master_;
+  if (master == nullptr) {
+    // Fall back to any registered per-model master.
+    for (const auto& [_, m] : masters_) {
+      master = m;
+      break;
+    }
+  }
+  if (master == nullptr) {
+    write_json_response(
+        ctrl,
+        500,
+        {{"error", "no master registered"}, {"lora_name", lora_name}});
+    return;
+  }
+  const bool broadcast_ok =
+      master->load_lora_broadcast(lora_name, lora_path, base_model_name);
+  if (!broadcast_ok) {
+    write_json_response(ctrl,
+                        400,
+                        {{"error", "load failed; see server log for details"},
+                         {"lora_name", lora_name}});
+    return;
+  }
+  // Register in the API-side registry so /v1/lora_adapters lists it.
+  // This is a bookkeeping-only entry; the real weights live inside each
+  // worker's own LoRARuntime.
+  LoRARequest api_req{lora_name, /*int_id=*/0, lora_path, base_model_name};
+  auto id_opt = LoRARuntime::instance().registry().register_adapter(api_req);
+  const uint64_t int_id = id_opt.value_or(0);
+  write_json_response(
+      ctrl,
+      200,
+      {{"status", "ok"}, {"lora_name", lora_name}, {"lora_int_id", int_id}});
+}
+
+void APIService::UnloadLoraAdapterHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = reinterpret_cast<brpc::Controller*>(controller);
+
+  const std::string body = read_body(ctrl);
+  nlohmann::json j;
+  try {
+    j = nlohmann::json::parse(body);
+  } catch (const std::exception& e) {
+    write_json_response(
+        ctrl, 400, {{"error", std::string("bad json: ") + e.what()}});
+    return;
+  }
+  if (!j.is_object() || !j.contains("lora_name")) {
+    write_json_response(ctrl, 400, {{"error", "expected {\"lora_name\":...}"}});
+    return;
+  }
+  const std::string lora_name = j["lora_name"].get<std::string>();
+
+  // P1-A.4: optional drain_timeout_s (int seconds, default 30, max 300).
+  // Client can pass 0 to return immediately without polling.
+  int32_t drain_timeout_s = 30;
+  if (j.contains("drain_timeout_s")) {
+    try {
+      drain_timeout_s = j["drain_timeout_s"].get<int32_t>();
+    } catch (const std::exception&) {
+      drain_timeout_s = 30;
+    }
+    if (drain_timeout_s < 0) drain_timeout_s = 0;
+    if (drain_timeout_s > 300) drain_timeout_s = 300;
+  }
+
+  // Snapshot the int_id BEFORE unregister so we can poll contains() for
+  // the drain outcome. lookup by name returns nullopt once unloading is
+  // set, but the entry itself lives until refcount drops to zero.
+  auto pinned_before = LoRARuntime::instance().registry().lookup(lora_name);
+  const uint64_t int_id_snapshot =
+      pinned_before.has_value() ? pinned_before->lora_int_id : 0;
+
+  Master* master = master_;
+  if (master == nullptr) {
+    for (const auto& [_, m] : masters_) {
+      master = m;
+      break;
+    }
+  }
+  if (master != nullptr) {
+    (void)master->unload_lora_broadcast(lora_name);
+  }
+  // Fix (08-07): the broadcast above dispatches to all worker clients
+  // including rank 0, which lives in this same process and shares the
+  // LoRARuntime singleton -- so LoRARuntime::instance().unload() has
+  // already been called by WorkerImpl::unload_lora_adapter on the worker
+  // threadpool by the time we reach here. Do NOT call unload() again on
+  // the main thread; the pre-broadcast pinned_before snapshot is the
+  // ground truth for whether the adapter existed.
+  if (!pinned_before.has_value()) {
+    write_json_response(
+        ctrl, 404, {{"error", "adapter not found"}, {"lora_name", lora_name}});
+    return;
+  }
+
+  // If we have an int_id to track, poll contains() until it disappears
+  // or the timeout expires. This keeps the /v1/unload_lora_adapter caller
+  // synchronous with the drain when the client wants that guarantee.
+  bool drained = true;
+  if (int_id_snapshot != 0 && drain_timeout_s > 0) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(drain_timeout_s);
+    while (LoRARuntime::instance().registry().contains(int_id_snapshot)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        drained = false;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  } else if (int_id_snapshot != 0 && drain_timeout_s == 0) {
+    // Client explicitly opted out of waiting; report drain status only.
+    drained = !LoRARuntime::instance().registry().contains(int_id_snapshot);
+  }
+
+  if (!drained) {
+    write_json_response(ctrl,
+                        202,
+                        {{"status", "drain_pending"},
+                         {"lora_name", lora_name},
+                         {"drain_timeout_s", drain_timeout_s}});
+    return;
+  }
+  write_json_response(ctrl, 200, {{"status", "ok"}, {"lora_name", lora_name}});
+}
+
+void APIService::ListLoraAdaptersHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = reinterpret_cast<brpc::Controller*>(controller);
+
+  const auto adapters = LoRARuntime::instance().registry().list();
+  nlohmann::json arr = nlohmann::json::array();
+  for (const auto& a : adapters) {
+    arr.push_back({{"lora_name", a.lora_name},
+                   {"lora_int_id", a.lora_int_id},
+                   {"lora_path", a.lora_path},
+                   {"base_model_name", a.base_model_name}});
+  }
+  write_json_response(ctrl, 200, {{"data", arr}});
+}
+
+void APIService::ListLoraStatsHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  brpc::ClosureGuard done_guard(done);
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+  auto* ctrl = reinterpret_cast<brpc::Controller*>(controller);
+
+  const auto snapshots = LoRAMetrics::instance().snapshot_all();
+  nlohmann::json arr = nlohmann::json::array();
+  for (const auto& s : snapshots) {
+    // active_state legend: 0=pending, 1=active, 2=draining. Matches
+    // LoRAMetrics::set_state semantics.
+    const char* state_str = "pending";
+    if (s.active_state == 1)
+      state_str = "active";
+    else if (s.active_state == 2)
+      state_str = "draining";
+    arr.push_back({
+        {"lora_name", s.lora_name},
+        {"state", state_str},
+        {"requests_total", s.requests_total},
+        {"tokens_prompt_total", s.tokens_prompt_total},
+        {"tokens_generated_total", s.tokens_generated_total},
+        {"errors_total", s.errors_total},
+        {"device_slots", s.device_slots},
+        {"ttft_p50_ms", s.ttft_p50_ms},
+        {"ttft_p99_ms", s.ttft_p99_ms},
+        {"e2e_p50_ms", s.e2e_p50_ms},
+        {"e2e_p99_ms", s.e2e_p99_ms},
+        {"qps", s.qps},
+    });
+  }
+  write_json_response(ctrl, 200, {{"data", arr}});
 }
 
 }  // namespace xllm

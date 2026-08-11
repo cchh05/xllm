@@ -59,6 +59,16 @@ message AllocateKVCacheRequest {
   KVCacheShape kv_cache_shape = 1;
 }
 
+message LoadLoraAdapterRequest {
+  string lora_name = 1;
+  string lora_path = 2;
+  string base_model_name = 3;
+}
+
+message UnloadLoraAdapterRequest {
+  string lora_name = 1;
+}
+
 message SleepRequest {
   MasterStatus master_status = 1;
 }
@@ -415,4 +425,6 @@ service DistributeWorker {
   rpc UpdateWeights (UpdateWeightsRequest) returns (Status);
   rpc StartProfile (Empty) returns (Status);
   rpc StopProfile (Empty) returns (Status);
+  rpc LoadLoraAdapter (LoadLoraAdapterRequest) returns (Status);
+  rpc UnloadLoraAdapter (UnloadLoraAdapterRequest) returns (Status);
 }

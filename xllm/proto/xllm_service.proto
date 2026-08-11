@@ -135,6 +135,17 @@ service XllmAPIService {
   rpc StartProfileHttp (HttpRequest) returns (HttpResponse);
   rpc StopProfileHttp (HttpRequest) returns (HttpResponse);
 
+  // Multi-tenant LoRA (M9). All four receive JSON in the HTTP body.
+  //   POST /v1/load_lora_adapter    { lora_name, lora_path,
+  //                                   base_model_name (optional) }
+  //   POST /v1/unload_lora_adapter  { lora_name }
+  //   GET  /v1/lora_adapters        (empty body)
+  //   GET  /v1/lora_stats           (empty body, per-adapter metrics)
+  rpc LoadLoraAdapterHttp (HttpRequest) returns (HttpResponse);
+  rpc UnloadLoraAdapterHttp (HttpRequest) returns (HttpResponse);
+  rpc ListLoraAdaptersHttp (HttpRequest) returns (HttpResponse);
+  rpc ListLoraStatsHttp (HttpRequest) returns (HttpResponse);
+
   rpc LinkP2P (P2PLinkRequest) returns (Status);
   rpc LinkP2PHttp (HttpRequest) returns (HttpResponse);
 

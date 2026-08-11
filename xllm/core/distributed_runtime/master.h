@@ -43,6 +43,16 @@ class Master {
 
   virtual bool wakeup(const WakeupOptions& options) { return false; }
 
+  virtual bool load_lora_broadcast(const std::string& lora_name,
+                                   const std::string& lora_path,
+                                   const std::string& base_model_name) {
+    return false;
+  }
+
+  virtual bool unload_lora_broadcast(const std::string& lora_name) {
+    return false;
+  }
+
   virtual bool update_weights(const std::string& weights_path) { return false; }
 
   virtual bool link_p2p(const std::vector<std::string>& remote_addrs) {
