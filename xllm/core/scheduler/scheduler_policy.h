@@ -208,31 +208,28 @@ class SchedulerPolicy {
   // K=1 keeps a batch strictly on the fast path. K>=2 admits mixed batches
   // (slow path) as a capacity release valve.
   //
-  // defer_counts_ is *policy-owned* state, not gate-scoped: a deferred
-  // request must accumulate its defer count across scheduler ticks so the
-  // anti-starvation guard can force-admit after max_defer_steps ticks.
+  // Anti-starvation is bounded by wall-clock: a request whose age
+  // (now - created_time) exceeds max_wait_ms is force-admitted regardless
+  // of adapter mix. Age is computed inside decide() from
+  // Request::get_elapsed_time_ms(), so the gate holds no cross-tick state
+  // (SGLang-aligned; see reference_multilora_engines).
   struct AffinityGate {
     enum Decision { ADMIT, DEFER, FORCE_ADMIT };
     absl::flat_hash_set<uint64_t> active_ids;
     int32_t K = 1;
-    int32_t max_defer = 4;
+    int32_t max_wait_ms = 200;
     bool enabled = false;
 
-    Decision decide(uint64_t aid, uint32_t defer_cnt) const {
+    Decision decide(uint64_t aid, int32_t elapsed_ms) const {
       if (!enabled) return ADMIT;
       if (active_ids.contains(aid)) return ADMIT;
       if (static_cast<int32_t>(active_ids.size()) < K) return ADMIT;
-      if (static_cast<int32_t>(defer_cnt) >= max_defer) return FORCE_ADMIT;
+      if (elapsed_ms >= max_wait_ms) return FORCE_ADMIT;
       return DEFER;
     }
     void record_admit(uint64_t aid) { active_ids.insert(aid); }
     size_t size() const { return active_ids.size(); }
   };
-
-  // Per-request consecutive defer count. Keyed by Request::request_id().
-  // Erased when the request is admitted; erased in bulk after each tick's
-  // finished collection so cancelled requests never leak.
-  absl::flat_hash_map<std::string, uint32_t> defer_counts_;
 };
 
 // =============================================================================

@@ -97,9 +97,11 @@ struct LoRAConfig {
   // Set to 1 for strict affinity. Clamped to [1, max_loras].
   int32_t max_loras_per_batch = 16;
 
-  // Bound on consecutive ticks a request may be deferred before the gate
-  // force-admits (accepting one slow-path step). Default 4.
-  int32_t lora_drain_wait_thresh = 4;
+  // Wall-clock milliseconds a request may wait in the queue before the
+  // adapter-affinity gate force-admits it (bypassing the K-limit and
+  // accepting one slow-path step). Default 200 ms. Set 0 to disable
+  // deferral entirely.
+  int32_t lora_drain_wait_thresh = 200;
 
   // Parse the raw --lora-modules CLI value ("name1=path1,name2=path2") into
   // the vector form. Bad tokens are logged and skipped.
