@@ -156,6 +156,16 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
         const_cast<ModelInputParams&>(input_params);
     std::vector<torch::Tensor> deep_stacks;
 
+    // Dense Qwen3 LoRA (mirror qwen3_next_hybrid_base.h fix #1): push
+    // LoRAContextFrame so wrapped Linear layers see adapter_ids/layer_index.
+    // Without this the wrapper fast-returns and LoRA delta never applies.
+    LoRAContextFrame lora_frame;
+    lora_frame.adapter_ids = &input_params_new.adapter_ids;
+    lora_frame.q_seq_lens_vec = &input_params_new.attention.host.q_seq_lens;
+    lora_frame.adapter_ids_per_token = &input_params_new.adapter_ids_per_token;
+    lora_frame.layer_index = -1;
+    LoRAScope _lora_scope(lora_frame);
+
     if (tokens.numel() == 0) {
       tokens = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
       positions = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
@@ -190,6 +200,7 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
 
     std::optional<torch::Tensor> residual;
     for (size_t i = 0; i < layers_.size(); i++) {
+      set_lora_context_layer(static_cast<int32_t>(i));
       if (is_rec_multi_round_mode() && input_params_new.has_llmrec_params()) {
         const auto& llmrec_params = input_params_new.llmrec_params();
         attn_metadata.full_k_cache = llmrec_params->full_k_caches[i];
