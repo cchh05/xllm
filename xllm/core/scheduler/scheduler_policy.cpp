@@ -476,9 +476,10 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
   // decide() below returns ADMIT unconditionally, preserving the legacy
   // strict-FIFO behaviour byte-for-byte.
   AffinityGate gate;
-  gate.enabled = FLAGS_enable_lora && FLAGS_enable_lora_adapter_affinity;
-  gate.K = FLAGS_lora_max_adapters_per_batch;
-  gate.max_defer = FLAGS_lora_max_defer_steps;
+  gate.enabled =
+      FLAGS_enable_lora && FLAGS_max_loras_per_batch < FLAGS_max_loras;
+  gate.K = FLAGS_max_loras_per_batch;
+  gate.max_defer = FLAGS_lora_drain_wait_thresh;
   std::vector<std::shared_ptr<Request>> deferred;
 
   while (!queue->empty() &&

@@ -113,32 +113,25 @@ DEFINE_bool(
     "RowParallelLinearWithShardedLoRA pattern). Cuts per-layer AR count "
     "from 2 to 1. Supersedes enable_lora_row_parallel_all_reduce when true.");
 
-// ---- Adapter-affinity batching (2026-08-10) -----------------------------
+// ---- Adapter-affinity batching (2026-08-10, SGLang-aligned flag surface) --
 // Engine-side scheduler avoids mixed-adapter batches (which would drop into
 // the per-seq slow forward path). See LoRAConfig header for the full
 // rationale.
-DEFINE_bool(
-    enable_lora_adapter_affinity,
-    true,
-    "When enable_lora=true, gate the decode scheduler so each batch keeps "
-    "its distinct adapter count within --lora_max_adapters_per_batch. "
-    "Fast forward path requires a batch of homogeneous non-zero adapter "
-    "ids and no base seq; setting this false restores strict-FIFO "
-    "(byte-identical baseline behaviour).");
-
 DEFINE_int32(
-    lora_max_adapters_per_batch,
-    1,
+    max_loras_per_batch,
+    16,
     "Max distinct adapter_ids per decode batch (base=0 counts as one slot). "
-    "Default 1 keeps the batch in the fast forward path. Clamped to "
-    "--max_loras at load time.");
+    "Set to 1 for strict fast-path affinity. Set equal to --max_loras "
+    "(the default) to disable affinity gating and restore strict-FIFO. "
+    "Clamped to [1, max_loras] at load time.");
 
 DEFINE_int32(
-    lora_max_defer_steps,
+    lora_drain_wait_thresh,
     4,
     "Consecutive scheduler ticks a request may be deferred by the adapter-"
     "affinity gate before it is force-admitted. Bounds tail latency at "
-    "approximately lora_max_defer_steps * scheduler_tick_period.");
+    "approximately this_value * scheduler_tick_period. Set 0 to disable "
+    "deferral entirely (all requests admit immediately).");
 
 namespace xllm {
 
@@ -191,18 +184,19 @@ void LoRAConfig::load_from_flags() {
   lora_modules = parse_modules(FLAGS_lora_modules);
   allow_runtime_lora_updating = FLAGS_allow_runtime_lora_updating;
 
-  enable_lora_adapter_affinity = FLAGS_enable_lora_adapter_affinity;
-  lora_max_adapters_per_batch = FLAGS_lora_max_adapters_per_batch;
-  lora_max_defer_steps = FLAGS_lora_max_defer_steps;
-  // Clamp K to max_loras -- the gate cannot distinguish more adapters than
-  // the pool can hold anyway. Also floor at 1 so K=0 never accidentally
-  // disables the scheduler entirely.
-  if (lora_max_adapters_per_batch < 1) lora_max_adapters_per_batch = 1;
-  if (lora_max_adapters_per_batch > max_loras)
-    lora_max_adapters_per_batch = max_loras;
-  if (lora_max_defer_steps < 0) lora_max_defer_steps = 0;
+  max_loras_per_batch = FLAGS_max_loras_per_batch;
+  lora_drain_wait_thresh = FLAGS_lora_drain_wait_thresh;
+  // Clamp to [1, max_loras]. K=0 would disable the scheduler entirely
+  // (nothing admitted); K>max_loras is meaningless since the slot pool
+  // caps the actually-in-flight adapter count anyway.
+  if (max_loras_per_batch < 1) max_loras_per_batch = 1;
+  if (max_loras_per_batch > max_loras) max_loras_per_batch = max_loras;
+  if (lora_drain_wait_thresh < 0) lora_drain_wait_thresh = 0;
 
   if (enable_lora) {
+    // Gate is effectively off when K == max_loras (any admissible request
+    // fits by pigeonhole). Report that plainly to avoid confusion.
+    const bool affinity_active = max_loras_per_batch < max_loras;
     LOG(INFO) << "[LoRAConfig] enabled: max_loras=" << max_loras
               << " max_cpu_loras=" << max_cpu_loras
               << " max_lora_rank=" << max_lora_rank
@@ -210,10 +204,9 @@ void LoRAConfig::load_from_flags() {
               << " static_modules=" << lora_modules.size()
               << " runtime_updates="
               << (allow_runtime_lora_updating ? "on" : "off")
-              << " adapter_affinity="
-              << (enable_lora_adapter_affinity ? "on" : "off")
-              << " K=" << lora_max_adapters_per_batch
-              << " max_defer=" << lora_max_defer_steps;
+              << " affinity_gate=" << (affinity_active ? "on" : "off")
+              << " max_loras_per_batch=" << max_loras_per_batch
+              << " drain_wait_thresh=" << lora_drain_wait_thresh;
   }
 }
 
