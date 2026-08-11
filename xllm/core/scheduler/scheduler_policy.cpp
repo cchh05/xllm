@@ -150,9 +150,6 @@ std::vector<std::shared_ptr<Request>> SchedulerPolicy::collect_finished(
     if (request->finished() || request->cancelled()) {
       clear_mtp_bootstrap(request.get(), state);
       state.kv_cache_manager->deallocate(request.get());
-      // Release any adapter-affinity defer counter -- request will not be
-      // scheduled again so the counter would leak otherwise.
-      defer_counts_.erase(request->request_id());
       finished_requests.emplace_back(request);
       *it = nullptr;
     }
@@ -479,7 +476,7 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
   gate.enabled =
       FLAGS_enable_lora && FLAGS_max_loras_per_batch < FLAGS_max_loras;
   gate.K = FLAGS_max_loras_per_batch;
-  gate.max_defer = FLAGS_lora_drain_wait_thresh;
+  gate.max_wait_ms = FLAGS_lora_drain_wait_thresh;
   std::vector<std::shared_ptr<Request>> deferred;
 
   while (!queue->empty() &&
@@ -490,19 +487,18 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
     std::shared_ptr<Request> request = queue->top();
 
     // Adapter-affinity gate: skip requests that would over-diversify the
-    // batch. Bounded by max_defer so no request waits forever.
+    // batch. Anti-starvation bounded by wall-clock age (max_wait_ms).
     if (gate.enabled) {
       const uint64_t aid =
           !request->sequences().empty() && request->sequences()[0]
               ? request->sequences()[0]->adapter_id()
               : 0;
-      auto it = defer_counts_.find(request->request_id());
-      const uint32_t dc = (it == defer_counts_.end()) ? 0 : it->second;
-      const auto decision = gate.decide(aid, dc);
+      request->set_elapsed_time_ms();
+      const int32_t elapsed_ms = request->get_elapsed_time_ms();
+      const auto decision = gate.decide(aid, elapsed_ms);
       if (decision == AffinityGate::DEFER) {
         queue->pop_top();
         deferred.emplace_back(request);
-        defer_counts_[request->request_id()] = dc + 1;
         LoRAMetrics::instance().inc_affinity_deferred("deferred");
         continue;
       }
@@ -671,7 +667,6 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
                 ? request->sequences()[0]->adapter_id()
                 : 0;
         gate.record_admit(aid);
-        defer_counts_.erase(request->request_id());
       }
       state.running_sequences.insert(state.running_sequences.end(),
                                      candidate_sequences.begin(),

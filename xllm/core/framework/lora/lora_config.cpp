@@ -127,11 +127,11 @@ DEFINE_int32(
 
 DEFINE_int32(
     lora_drain_wait_thresh,
-    4,
-    "Consecutive scheduler ticks a request may be deferred by the adapter-"
-    "affinity gate before it is force-admitted. Bounds tail latency at "
-    "approximately this_value * scheduler_tick_period. Set 0 to disable "
-    "deferral entirely (all requests admit immediately).");
+    200,
+    "Wall-clock milliseconds a request may wait in the queue before the "
+    "adapter-affinity gate force-admits it (bypassing the K-limit and "
+    "accepting one slow-path step). Bounds tail latency directly. Set 0 "
+    "to disable deferral entirely (all requests admit immediately).");
 
 namespace xllm {
 
