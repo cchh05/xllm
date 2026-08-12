@@ -32,6 +32,7 @@ cc_library(
     lora/lora_qkv_parallel_linear.h
     lora/lora_row_parallel_linear.h
     lora/lora_column_parallel_linear.h
+    lora/lora_grouped_matmul_helper.h
   SRCS
     oxygen_vision_attention.cpp
     qwen2_attention.cpp
@@ -58,6 +59,7 @@ cc_library(
     lora/lora_qkv_parallel_linear.cpp
     lora/lora_row_parallel_linear.cpp
     lora/lora_column_parallel_linear.cpp
+    lora/lora_grouped_matmul_helper.cpp
   DEPS
     "-Wl,--whole-archive"
     "-Wl,--no-whole-archive"
