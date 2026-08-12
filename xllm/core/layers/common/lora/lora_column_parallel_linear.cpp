@@ -7,8 +7,10 @@ Licensed under the Apache License, Version 2.0.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include "framework/lora/lora_config.h"
 #include "framework/lora/lora_context.h"
 #include "framework/lora/lora_runtime.h"
+#include "layers/common/lora/lora_grouped_matmul_helper.h"
 
 namespace xllm {
 namespace layer {
@@ -128,6 +130,111 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
         y.add_(delta);
         return y;
       }
+    }
+  }
+
+  // Grouped-matmul slow path (opt-in via --enable_lora_grouped_matmul).
+  // Handles both fused gate_up and the reserved single-proj path.
+  if (FLAGS_enable_lora_grouped_matmul) {
+    auto& runtime_gm = LoRARuntime::instance();
+    auto spec = build_grouped_lora_spec(adapter_ids, q_seq_lens, input);
+    const int64_t n_groups = static_cast<int64_t>(spec.distinct_aids.size());
+    auto slice_B_shard = [&](const torch::Tensor& B,
+                             int64_t out_size) -> torch::Tensor {
+      if (tp_world_size_ > 1 && B.size(0) > out_size) {
+        const int64_t start = tp_rank_ * out_size;
+        return B.slice(0, start, start + out_size).contiguous();
+      }
+      return B.contiguous();
+    };
+    if (is_fused_gate_up_) {
+      std::vector<torch::Tensor> gateA, gateB, upA, upB;
+      std::vector<float> gate_scale, up_scale;
+      gateA.reserve(n_groups);
+      gateB.reserve(n_groups);
+      upA.reserve(n_groups);
+      upB.reserve(n_groups);
+      gate_scale.reserve(n_groups);
+      up_scale.reserve(n_groups);
+      int64_t r_max = 0;
+      auto zero_A = torch::zeros({1, in_features_}, input.options());
+      auto zero_B = torch::zeros({inter_size_local_, 1}, input.options());
+      for (uint64_t aid : spec.distinct_aids) {
+        const auto* gate_pd =
+            runtime_gm.get_per_proj_delta(aid, ctx->layer_index, "gate_proj");
+        const auto* up_pd =
+            runtime_gm.get_per_proj_delta(aid, ctx->layer_index, "up_proj");
+        if (gate_pd != nullptr) {
+          gateA.emplace_back(gate_pd->A.contiguous());
+          gateB.emplace_back(slice_B_shard(gate_pd->B, inter_size_local_));
+          gate_scale.emplace_back(gate_pd->scaling);
+          r_max = std::max(r_max, static_cast<int64_t>(gate_pd->r));
+        } else {
+          gateA.emplace_back(zero_A);
+          gateB.emplace_back(zero_B);
+          gate_scale.emplace_back(0.0f);
+        }
+        if (up_pd != nullptr) {
+          upA.emplace_back(up_pd->A.contiguous());
+          upB.emplace_back(slice_B_shard(up_pd->B, inter_size_local_));
+          up_scale.emplace_back(up_pd->scaling);
+          r_max = std::max(r_max, static_cast<int64_t>(up_pd->r));
+        } else {
+          upA.emplace_back(zero_A);
+          upB.emplace_back(zero_B);
+          up_scale.emplace_back(0.0f);
+        }
+      }
+      if (r_max == 0) {
+        return y;
+      }
+      auto gate_delta = apply_grouped_lora_delta(spec,
+                                                 gateA,
+                                                 gateB,
+                                                 gate_scale,
+                                                 in_features_,
+                                                 inter_size_local_,
+                                                 r_max);
+      auto up_delta = apply_grouped_lora_delta(
+          spec, upA, upB, up_scale, in_features_, inter_size_local_, r_max);
+      auto fused_delta = torch::cat({gate_delta, up_delta}, /*dim=*/-1);
+      scatter_add_lora_delta_(y, fused_delta, spec);
+      return y;
+    } else {
+      std::vector<torch::Tensor> A_list, B_list;
+      std::vector<float> scale_list;
+      A_list.reserve(n_groups);
+      B_list.reserve(n_groups);
+      scale_list.reserve(n_groups);
+      int64_t r_max = 0;
+      auto zero_A = torch::zeros({1, in_features_}, input.options());
+      auto zero_B = torch::zeros({out_size_local_, 1}, input.options());
+      for (uint64_t aid : spec.distinct_aids) {
+        const auto* pd =
+            runtime_gm.get_per_proj_delta(aid, ctx->layer_index, proj_name_);
+        if (pd != nullptr) {
+          A_list.emplace_back(pd->A.contiguous());
+          B_list.emplace_back(slice_B_shard(pd->B, out_size_local_));
+          scale_list.emplace_back(pd->scaling);
+          r_max = std::max(r_max, static_cast<int64_t>(pd->r));
+        } else {
+          A_list.emplace_back(zero_A);
+          B_list.emplace_back(zero_B);
+          scale_list.emplace_back(0.0f);
+        }
+      }
+      if (r_max == 0) {
+        return y;
+      }
+      auto delta = apply_grouped_lora_delta(spec,
+                                            A_list,
+                                            B_list,
+                                            scale_list,
+                                            in_features_,
+                                            out_size_local_,
+                                            r_max);
+      scatter_add_lora_delta_(y, delta, spec);
+      return y;
     }
   }
 
