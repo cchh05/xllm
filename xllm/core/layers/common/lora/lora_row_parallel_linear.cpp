@@ -11,6 +11,7 @@ Licensed under the Apache License, Version 2.0.
 #include "framework/lora/lora_context.h"
 #include "framework/lora/lora_runtime.h"
 #include "framework/parallel_state/parallel_state.h"
+#include "layers/common/lora/lora_grouped_matmul_helper.h"
 
 namespace xllm {
 namespace layer {
@@ -186,6 +187,70 @@ torch::Tensor LoRARowParallelLinearImpl::forward(torch::Tensor input) {
       }
       return y;
     }
+  }
+
+  // Grouped-matmul slow path (opt-in via --enable_lora_grouped_matmul).
+  //
+  // Only enabled when wrapper_owns_reduction_ is true (fused-AR mode). In
+  // legacy mode a rank-dim reduce sits *between* the two matmuls, so the
+  // grouped helper would need to expose an internal hook -- not worth the
+  // extra API surface for a code path we do not push to production.
+  if (FLAGS_enable_lora_grouped_matmul && wrapper_owns_reduction_) {
+    auto& runtime_gm = LoRARuntime::instance();
+    auto spec = build_grouped_lora_spec(adapter_ids, q_seq_lens, input);
+    const int64_t n_groups = static_cast<int64_t>(spec.distinct_aids.size());
+    std::vector<torch::Tensor> A_list, B_list;
+    std::vector<float> scale_list;
+    A_list.reserve(n_groups);
+    B_list.reserve(n_groups);
+    scale_list.reserve(n_groups);
+    int64_t r_max = 0;
+    // Row-parallel: A is sliced on dim=1 (in-features) per rank; B is
+    // replicated at full [out_features_, r]. delta stays partial on out-
+    // dim; the final wrapper_owns_reduction_ reduce below handles the
+    // combined base+delta all-reduce.
+    auto slice_A_shard = [&](const torch::Tensor& A) -> torch::Tensor {
+      if (tp_world_size_ > 1 && A.size(1) > in_features_local_) {
+        const int64_t start = tp_rank_ * in_features_local_;
+        return A.slice(1, start, start + in_features_local_).contiguous();
+      }
+      return A.contiguous();
+    };
+    auto zero_A = torch::zeros({1, in_features_local_}, input.options());
+    auto zero_B = torch::zeros({out_features_, 1}, input.options());
+    for (uint64_t aid : spec.distinct_aids) {
+      const auto* pd =
+          runtime_gm.get_per_proj_delta(aid, ctx->layer_index, proj_name_);
+      if (pd != nullptr) {
+        A_list.emplace_back(slice_A_shard(pd->A));
+        B_list.emplace_back(pd->B.contiguous());
+        scale_list.emplace_back(pd->scaling);
+        r_max = std::max(r_max, static_cast<int64_t>(pd->r));
+      } else {
+        A_list.emplace_back(zero_A);
+        B_list.emplace_back(zero_B);
+        scale_list.emplace_back(0.0f);
+      }
+    }
+    if (r_max == 0) {
+      // No real delta. Still need the deferred base reduce.
+      if (wrapper_owns_reduction_ && pg != nullptr) {
+        y = xllm::parallel_state::reduce(y, pg);
+      }
+      return y;
+    }
+    auto delta = apply_grouped_lora_delta(spec,
+                                          A_list,
+                                          B_list,
+                                          scale_list,
+                                          in_features_local_,
+                                          out_features_,
+                                          r_max);
+    scatter_add_lora_delta_(y, delta, spec);
+    if (wrapper_owns_reduction_ && pg != nullptr) {
+      y = xllm::parallel_state::reduce(y, pg);
+    }
+    return y;
   }
 
   // Slow path: per-seq, one all-reduce per adapter-bearing seq (legacy) or
