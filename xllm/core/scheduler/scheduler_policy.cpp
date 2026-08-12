@@ -738,10 +738,22 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
   for (auto& r : deferred) {
     queue->push(r);
   }
-  // Emit batch-level LoRA affinity metric. gate.size() == distinct adapter
-  // count admitted in this batch (0 if nothing scheduled).
-  if (gate.enabled) {
-    LoRAMetrics::instance().observe_batch_lora(gate.size(),
+  // Emit batch-level LoRA fast/slow path metric. Always emit when LoRA is
+  // on so gate on/off comparisons include the baseline distribution. When
+  // gate is off the distinct count comes from a scan of the admitted set
+  // rather than gate.active_ids (which was never populated).
+  if (FLAGS_enable_lora) {
+    size_t distinct_count = 0;
+    if (gate.enabled) {
+      distinct_count = gate.size();
+    } else {
+      absl::flat_hash_set<uint64_t> distinct;
+      for (auto* seq : state.running_sequences) {
+        if (seq) distinct.insert(seq->adapter_id());
+      }
+      distinct_count = distinct.size();
+    }
+    LoRAMetrics::instance().observe_batch_lora(distinct_count,
                                                state.running_sequences.size());
   }
 }
