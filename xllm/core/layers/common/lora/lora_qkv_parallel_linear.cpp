@@ -18,8 +18,10 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include "framework/lora/lora_config.h"
 #include "framework/lora/lora_context.h"
 #include "framework/lora/lora_runtime.h"
+#include "layers/common/lora/lora_grouped_matmul_helper.h"
 
 namespace xllm {
 namespace layer {
@@ -187,6 +189,97 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
       y.add_(qkv_delta);
       return y;
     }
+  }
+
+  // Grouped-matmul slow path (opt-in via --enable_lora_grouped_matmul).
+  // Batches the per-seq matmul + slice loop below into two group_gemm calls
+  // per proj plus one index_add scatter. Only kicks in when the batch is
+  // genuinely multi-adapter; single-adapter batches already took the fast
+  // path above.
+  if (FLAGS_enable_lora_grouped_matmul) {
+    auto& runtime = LoRARuntime::instance();
+    auto spec = build_grouped_lora_spec(adapter_ids, q_seq_lens, input);
+    const int64_t n_groups = static_cast<int64_t>(spec.distinct_aids.size());
+    std::vector<torch::Tensor> qA, kA, vA, qB, kB, vB;
+    std::vector<float> q_scale, k_scale, v_scale;
+    qA.reserve(n_groups);
+    kA.reserve(n_groups);
+    vA.reserve(n_groups);
+    qB.reserve(n_groups);
+    kB.reserve(n_groups);
+    vB.reserve(n_groups);
+    q_scale.reserve(n_groups);
+    k_scale.reserve(n_groups);
+    v_scale.reserve(n_groups);
+    int64_t r_max = 0;
+    auto slice_B_shard = [&](const torch::Tensor& B,
+                             int64_t out_size) -> torch::Tensor {
+      if (tp_world_size_ > 1 && B.size(0) > out_size) {
+        const int64_t num_shards = B.size(0) / out_size;
+        const int64_t shard_idx =
+            (num_shards > 0) ? (tp_rank_ * num_shards / tp_world_size_) : 0;
+        const int64_t start = shard_idx * out_size;
+        return B.slice(0, start, start + out_size).contiguous();
+      }
+      return B.contiguous();
+    };
+    // Zero placeholders keep the grouped stacks homogeneous when an
+    // adapter only trained a subset of q/k/v. The scale for the missing
+    // slot is 0.0 so the padded rows never contribute.
+    auto zero_A = torch::zeros({1, hidden_size_}, input.options());
+    auto zero_Bq = torch::zeros({q_size_local_, 1}, input.options());
+    auto zero_Bkv = torch::zeros({kv_size_local_, 1}, input.options());
+    for (uint64_t aid : spec.distinct_aids) {
+      const auto* q_pd =
+          runtime.get_per_proj_delta(aid, ctx->layer_index, "q_proj");
+      const auto* k_pd =
+          runtime.get_per_proj_delta(aid, ctx->layer_index, "k_proj");
+      const auto* v_pd =
+          runtime.get_per_proj_delta(aid, ctx->layer_index, "v_proj");
+      if (q_pd != nullptr) {
+        qA.emplace_back(q_pd->A.contiguous());
+        qB.emplace_back(slice_B_shard(q_pd->B, q_size_local_));
+        q_scale.emplace_back(q_pd->scaling);
+        r_max = std::max(r_max, static_cast<int64_t>(q_pd->r));
+      } else {
+        qA.emplace_back(zero_A);
+        qB.emplace_back(zero_Bq);
+        q_scale.emplace_back(0.0f);
+      }
+      if (k_pd != nullptr) {
+        kA.emplace_back(k_pd->A.contiguous());
+        kB.emplace_back(slice_B_shard(k_pd->B, kv_size_local_));
+        k_scale.emplace_back(k_pd->scaling);
+        r_max = std::max(r_max, static_cast<int64_t>(k_pd->r));
+      } else {
+        kA.emplace_back(zero_A);
+        kB.emplace_back(zero_Bkv);
+        k_scale.emplace_back(0.0f);
+      }
+      if (v_pd != nullptr) {
+        vA.emplace_back(v_pd->A.contiguous());
+        vB.emplace_back(slice_B_shard(v_pd->B, kv_size_local_));
+        v_scale.emplace_back(v_pd->scaling);
+        r_max = std::max(r_max, static_cast<int64_t>(v_pd->r));
+      } else {
+        vA.emplace_back(zero_A);
+        vB.emplace_back(zero_Bkv);
+        v_scale.emplace_back(0.0f);
+      }
+    }
+    if (r_max == 0) {
+      // No adapter contributed a real delta -- everything was placeholder.
+      return y;
+    }
+    auto q_delta = apply_grouped_lora_delta(
+        spec, qA, qB, q_scale, hidden_size_, q_size_local_, r_max);
+    auto k_delta = apply_grouped_lora_delta(
+        spec, kA, kB, k_scale, hidden_size_, kv_size_local_, r_max);
+    auto v_delta = apply_grouped_lora_delta(
+        spec, vA, vB, v_scale, hidden_size_, kv_size_local_, r_max);
+    auto qkv_delta = torch::cat({q_delta, k_delta, v_delta}, /*dim=*/-1);
+    scatter_add_lora_delta_(y, qkv_delta, spec);
+    return y;
   }
 
   // Fallback per-seq apply: slice y along dim=0 by q_seq_lens, look up
