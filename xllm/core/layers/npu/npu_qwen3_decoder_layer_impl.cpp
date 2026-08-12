@@ -27,6 +27,7 @@ limitations under the License.
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/lora/lora_config.h"  // ATB-LoRA-spike: FLAGS_enable_lora
 #include "core/layers/npu/loader/qwen3_decoder_loader.h"
 #include "operations/fusion/mlp/mlp.h"
 #include "util/rec_model_utils.h"
@@ -38,7 +39,41 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
-const uint64_t WEIGHT_COUNT_PER_LAYER = 56;
+// ATB LoRA spike patch #2 (feature/lora-atb-spike-2026-08-12):
+// When enableLora=true, atb_speed decoder_layer registers 15 additional
+// input tensor slots (1 lora_common + 8 lora_attn + 6 lora_mlp; see
+// third_party/xllm_atb_layers/models/base/layer/decoder_layer.cpp:71-76).
+// These sit AFTER the 56 base weight slots and BEFORE the runtime input
+// tensors (hidden_states, kv_cache, etc.). We keep the base weight count
+// at 56 but reserve 15 extra placeholder slots for LoRA A/B and cum_sum
+// at indices 56..70. When --enable_lora=false, these placeholders sit
+// unused; atb_speed only reads them when its own enableLora branch fires.
+static constexpr uint64_t BASE_WEIGHT_COUNT = 56;
+static constexpr uint64_t LORA_SLOT_COUNT = 15;
+const uint64_t WEIGHT_COUNT_PER_LAYER = BASE_WEIGHT_COUNT + LORA_SLOT_COUNT;
+
+// Slot indices (relative to BASE_WEIGHT_COUNT) within lora_common + lora_attn
+// + lora_mlp. Order must match atb_speed inTensorCandidates ordering.
+enum LoraSlotOffset : int {
+  // lora_common (1 slot)
+  LORA_IN_SEQ_LEN_CUM_SUM = 0,
+  // lora_attn (8 slots) — matches base/layer/decoder_layer.cpp:71-73
+  LORA_QKV_A_0 = 1,
+  LORA_QKV_B_0 = 2,
+  LORA_QKV_A_1 = 3,
+  LORA_QKV_B_1 = 4,
+  LORA_QKV_A_2 = 5,
+  LORA_QKV_B_2 = 6,
+  LORA_QKV_DENSE_A = 7,
+  LORA_QKV_DENSE_B = 8,
+  // lora_mlp (6 slots) — matches base/layer/decoder_layer.cpp:75-76
+  LORA_MLP_A_0 = 9,
+  LORA_MLP_B_0 = 10,
+  LORA_MLP_A_1 = 11,
+  LORA_MLP_B_1 = 12,
+  LORA_MLP_DOWN_A = 13,
+  LORA_MLP_DOWN_B = 14,
+};
 
 void NpuQwen3DecoderLayerImpl::param_from_args(
     atb_speed::qwen::QwenLayerParam& param,
@@ -59,6 +94,13 @@ void NpuQwen3DecoderLayerImpl::param_from_args(
   param.enableSplitFuse =
       ::xllm::SchedulerConfig::get_instance().enable_chunked_prefill() &&
       isPrefill;
+  // ATB LoRA spike (feature/lora-atb-spike-2026-08-12):
+  // Turn on atb_speed's built-in LoRA graph nodes when --enable_lora=true.
+  // xllm/core/framework/lora/lora_config.h DECLARE_bool(enable_lora); the
+  // gflag is populated by LoRAConfig from CLI. atb_speed decoder_layer
+  // then registers lora_common/lora_attn/lora_mlp tensor slots (see
+  // third_party/xllm_atb_layers/models/base/layer/decoder_layer.cpp:181).
+  param.enableLora = FLAGS_enable_lora;
   param.loraEnableGMM = false;
   param.enableXattention = is_rec_multi_round_mode();
   const auto& kernel_config = ::xllm::KernelConfig::get_instance();
@@ -361,6 +403,30 @@ void NpuQwen3DecoderLayerImpl::build_node_variant_pack(
       residual_.defined()) {
     residual_tensors_ = atb_speed::Utils::AtTensor2Tensor(residual_);
   }
+
+  // ATB LoRA spike (feature/lora-atb-spike-2026-08-12) — REVERTED FILLER PATH:
+  //
+  // A prior version of this diff filled slots [BASE..BASE+15) with [1]-shape
+  // zero placeholders on the assumption "atb_speed does an Elewise Add with
+  // 0 = identity". That is wrong: atb_speed's LoRA path is a real
+  // matmul (x @ A @ B), not an Add. The kernel shape-checks A as
+  // [rank, hidden] and B as [hidden, rank] and rejects [1] with
+  // ERROR_INVALID_TENSOR_SIZE (Status=8). in_seq_len_cum_sum is likewise
+  // batch-routing metadata that must be [batch+1] int32 filled per step.
+  //
+  // Filling correct shapes here without a real adapter tensor pool is a
+  // dead end for the spike — see project_xllm_multilora_atb_spike memory
+  // for why Phase 0 ends at "startup + atb graph build passes when
+  // enableLora=true" and does not attempt forward. The full wire-up
+  // (LoRARuntime per-proj API, loader dispatching per-layer/per-adapter
+  // slot fills, in_seq_len_cum_sum from scheduler each step) is Phase 1
+  // material, not a spike.
+  //
+  // We keep patch #2 (WEIGHT_COUNT_PER_LAYER = 56 + 15) so that graph
+  // build has the slot capacity it needs; the 15 slots stay at their
+  // ctor-time [1] zero-init, which is enough for graph build but not
+  // for a real forward. Do NOT enable_lora + send curl until Phase 1.
+
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER) = internal_tensors_;
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 1) =
       atb_speed::Utils::AtTensor2Tensor(cos_pos);
