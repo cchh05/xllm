@@ -133,6 +133,21 @@ DEFINE_int32(
     "accepting one slow-path step). Bounds tail latency directly. Set 0 "
     "to disable deferral entirely (all requests admit immediately).");
 
+// Batched slow-path replacement: when a decode batch mixes >=2 distinct
+// non-zero adapters, the LoRA Linear wrappers currently loop per sequence
+// (see lora_qkv/column/row_parallel_linear.cpp) and issue N tiny matmuls
+// plus N slice/scatter memcpys. Switching to npu_grouped_matmul folds the
+// per-adapter matmul into one grouped kernel launch, matching how fused_moe
+// dispatches expert weights. Applies only to slow_path (distinct >= 2); the
+// distinct == 1 fast path is untouched. Default off pending correctness /
+// bench verification (see feature/lora-grouped-matmul-2026-08-12 plan).
+DEFINE_bool(
+    enable_lora_grouped_matmul,
+    false,
+    "Route the LoRA multi-adapter slow path through npu_grouped_matmul "
+    "instead of a per-sequence matmul loop. Fast path (single adapter per "
+    "batch) is unaffected. NPU-only.");
+
 namespace xllm {
 
 namespace {

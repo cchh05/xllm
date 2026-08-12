@@ -127,3 +127,4 @@ DECLARE_bool(enable_lora_row_parallel_all_reduce);
 DECLARE_bool(enable_lora_row_parallel_fused_ar);
 DECLARE_int32(max_loras_per_batch);
 DECLARE_int32(lora_drain_wait_thresh);
+DECLARE_bool(enable_lora_grouped_matmul);
