@@ -88,3 +88,12 @@ if(USE_NPU)
   # Repeat the static-library cycle so NPU RoPE symbols are resolved.
   set_property(TARGET common_layers PROPERTY LINK_INTERFACE_MULTIPLICITY 3)
 endif()
+
+# Compile the LoRA grouped_matmul helper's test hooks into
+# common_layers when tests are enabled so the gtest target can
+# use them at link time. Production builds set BUILD_TESTING=OFF
+# and never see this definition.
+if(BUILD_TESTING)
+  target_compile_definitions(common_layers PRIVATE
+                             XLLM_LORA_ENABLE_TEST_HOOKS)
+endif()

@@ -47,6 +47,8 @@ if(USE_MLU)
   add_subdirectory(mlu)
 endif()
 
+add_subdirectory(lora)
+
 if(USE_NPU)
   add_subdirectory(npu_torch)
 endif()
