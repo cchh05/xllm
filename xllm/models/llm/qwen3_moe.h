@@ -20,6 +20,8 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/layers/common/attention_mask.h"
 #endif
+#include "core/framework/lora/lora_context.h"
+#include "core/framework/lora/lora_runtime.h"
 #include "core/layers/qwen3_moe_decoder_layer.h"
 #include "core/util/rec_model_utils.h"
 #include "llm_model_base.h"
@@ -57,6 +59,52 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
     for (int32_t i = 0; i < model_args.n_layers(); ++i) {
       auto layer = layer::Qwen3MoeDecoderLayer(context, i);
       layers_.push_back(layer);
+    }
+
+    // Qwen3-MoE LoRA (mirror dense qwen3.h fix #1): register device+dtype,
+    // set hotswap config, and preload static per-proj adapters. Same shape
+    // as the dense path -- MoE-experts LoRA lives in a separate installer,
+    // so install_moe_experts=false here (attention + MLP only, which is
+    // what the LoRA Linear wrappers consume).
+    if (LoRARuntime::instance().enabled()) {
+      LoRARuntime::instance().set_model_device_dtype(
+          options.device(), options.dtype().toScalarType());
+      const auto& modules = LoRARuntime::instance().config().lora_modules;
+      auto parallel_args = context.get_parallel_args();
+      const int32_t tp_size =
+          std::max(1, parallel_args.world_size() / parallel_args.dp_size());
+      const int32_t tp_rank = parallel_args.rank() % tp_size;
+      {
+        LoRARuntime::HotswapConfig cfg;
+        cfg.tp = TPInfo{tp_size, tp_rank};
+        cfg.install_per_proj = true;
+        cfg.install_moe_experts = false;
+        LoRARuntime::instance().set_hotswap_config(cfg);
+      }
+      if (!modules.empty()) {
+        LOG(INFO) << "[qwen3_moe M10] preloading " << modules.size()
+                  << " per-proj static adapter(s) on " << options.device();
+        int ok = 0, failed = 0;
+        for (const auto& [name, path] : modules) {
+          auto id =
+              LoRARuntime::instance().install_static_adapter_on_device_per_proj(
+                  name,
+                  path,
+                  /*base_model_name=*/"",
+                  options.device(),
+                  options.dtype().toScalarType(),
+                  TPInfo{tp_size, tp_rank});
+          if (id.has_value()) {
+            ++ok;
+            LOG(INFO) << "[qwen3_moe M10] preloaded " << name << " id=" << *id;
+          } else {
+            ++failed;
+            LOG(ERROR) << "[qwen3_moe M10] failed " << name;
+          }
+        }
+        LOG(INFO) << "[qwen3_moe M10] preload done: ok=" << ok
+                  << " failed=" << failed;
+      }
     }
   }
 
@@ -103,6 +151,21 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& input_params) override {
     ModelInputParams modified_input_params = input_params;
+
+    // Qwen3-MoE LoRA (mirror dense qwen3.h fix #2): push LoRAContextFrame
+    // so wrapped Linear layers see adapter_ids/layer_index. Without this
+    // the wrapper fast-returns and LoRA delta never applies. Frame points
+    // into modified_input_params (local, but whose lifetime spans this
+    // forward call).
+    LoRAContextFrame lora_frame;
+    lora_frame.adapter_ids = &modified_input_params.adapter_ids;
+    lora_frame.q_seq_lens_vec =
+        &modified_input_params.attention.host.q_seq_lens;
+    lora_frame.adapter_ids_per_token =
+        &modified_input_params.adapter_ids_per_token;
+    lora_frame.layer_index = -1;
+    LoRAScope _lora_scope(lora_frame);
+
     if (tokens.numel() == 0) {
       tokens = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
       positions = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
@@ -148,6 +211,7 @@ class Qwen3MoeModelImpl : public LlmModelImplBase<layer::Qwen3MoeDecoderLayer> {
 
     std::optional<torch::Tensor> residual;
     for (size_t i = 0; i < layers_.size(); i++) {
+      set_lora_context_layer(static_cast<int32_t>(i));
       if (llmrec_params != nullptr) {
         attn_metadata.full_k_cache = llmrec_params->full_k_caches[i];
         attn_metadata.full_v_cache = llmrec_params->full_v_caches[i];
