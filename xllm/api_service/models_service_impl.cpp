@@ -51,10 +51,11 @@ std::string ModelsServiceImpl::list_model_versions() {
   // Base models: emitted with version from launch-time registry.
   for (size_t i = 0; i < model_versions_.size(); ++i) {
     nlohmann::json model_state;
-    // The repository index reports the model directory name (carried by
-    // model_versions_), so it stays stable regardless of a user-provided
-    // --model_id.
-    model_state["name"] = model_versions_[i];
+    // Report model_id (model_names_) as name so downstream clients that
+    // rely on the v0.9.x behavior keep working. When --model_id is not
+    // supplied, model_id() falls back to the directory name so this stays
+    // stable in that case too.
+    model_state["name"] = model_names_[i];
     model_state["version"] = model_versions_[i];
     model_state["state"] = "READY";
     model_state["reason"] = "normal";
