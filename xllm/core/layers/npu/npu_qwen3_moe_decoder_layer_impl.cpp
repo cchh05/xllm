@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/lora/lora_config.h"  // Option D patch #1: FLAGS_enable_lora
 namespace xllm {
 namespace layer {
 
@@ -206,6 +207,11 @@ void NpuQwen3MoeDecoderLayerImpl::initialize_mlp_parameters(
     const ParallelArgs& parallel_args) {
   param.hasSharedExpert = (args.n_shared_experts() > 0);
   param.hasSharedExpertGate = false;
+  // Option D patch #1: opt-in atb_speed MoE decoder LoRA branch (if any).
+  // NOTE: No patch #2 (WEIGHT_COUNT + N) here — c3 patch #2 unconditional +15
+  // caused vector out_of_range when enableLora=false; Option D test is
+  // "does atb_speed MoE side accept enableLora=true and still build graph?"
+  param.enableLora = FLAGS_enable_lora;
   param.processLogits = "normalization";
   param.numOfSelectedExperts = {args.num_experts_per_tok()};
 
@@ -304,6 +310,24 @@ int64_t NpuQwen3MoeDecoderLayerImpl::init_node(
     atb_speed::Model::Node& node,
     atb_speed::qwen::MoeDecoderLayerParam& param) {
   atb::Operation* operation = nullptr;
+  if (layer_id_ == 0) {
+    LOG(INFO) << "[atb-debug-30b] layer=" << layer_id_
+              << " numOfExperts=" << param.numOfExperts
+              << " numOfDeviceExperts=" << param.numOfDeviceExperts
+              << " deviceExpert.size=" << param.deviceExpert.size()
+              << " hasMoe=" << param.hasMoe
+              << " hasSharedExpert=" << param.hasSharedExpert
+              << " enableAclnnExternelAddRmsNorm="
+              << param.enableAclnnExternelAddRmsNorm
+              << " enableAclnnAddRmsNorm=" << param.enableAclnnAddRmsNorm
+              << " packQuantType.size=" << param.packQuantType.size();
+    LOG(INFO) << "[atb-debug-30b-tp] rank=" << param.tensorParallelInfo.rank
+              << " worldSize=" << param.tensorParallelInfo.worldSize
+              << " commDomain=" << param.tensorParallelInfo.commDomain
+              << " hcommInfo_null="
+              << (param.tensorParallelInfo.hcommInfo == nullptr)
+              << " mapping.isInitialized=" << param.mapping.isInitialized_;
+  }
   atb_speed::qwen::MoeDecoderLayer(param, &operation);
   node.operation.reset(operation);
   CHECK_NOTNULL(node.operation);

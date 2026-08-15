@@ -20,6 +20,7 @@ limitations under the License.
 #if defined(USE_NPU)
 #include "core/framework/parallel_state/npu_process_group.h"
 #include "xllm_atb_layers/core/include/atb_speed/base/external_comm_manager.h"
+#include "xllm_atb_layers/core/include/atb_speed/utils/hccl_runner.h"
 #include "xllm_atb_layers/core/include/atb_speed/utils/singleton.h"
 #elif defined(USE_MLU)
 #include "mlu_process_group.h"
@@ -258,6 +259,35 @@ CollectiveCommunicator::CollectiveCommunicator(int global_rank,
   auto mapping_data = mapping_npu.to_json();
   atb_speed::base::Mapping mapping;
   mapping.ParseParam(mapping_data);
+
+  // v0.10 ATB backend multi-rank fix: without a rank_tablefile, atb_speed's
+  // ExternalCommManager::Init cannot build a global HCCL communicator on
+  // caihao-cann9 (atb::Comm::CreateHcclComm returns nullptr, hcommInfo stays
+  // null, WordEmbedding/AllReduce build fails). Inject a pre-built HcclComm
+  // via HcclRunner shm rendezvous before InitGlobalCommDomain so the Init
+  // fast-return (external_comm_manager.cpp:74) engages.
+  //
+  // Uses the same pattern already exercised by atb_speed itself in
+  // models/base/model/decoder_model.cpp (MC2 fusion) and
+  // pytorch/adapter/operation/operation_creator.cpp (MatmulAllreduce).
+  //
+  // rankTableFile != "" case: keep original path (CreateHcclCommByRankTableFile
+  // still works for JD prod deployments with a rank table).
+  if (::xllm::EPLBConfig::get_instance().rank_tablefile().empty() &&
+      world_size > 1) {
+    atb_speed::HcclRunner hccl_runner(global_rank, world_size, /*rankRoot=*/0);
+    HcclComm bootstrap_comm =
+        hccl_runner.CreateHcclCommInMulitProcessByRootInfo();
+    if (bootstrap_comm != nullptr) {
+      atb_speed::GetSingleton<atb_speed::ExternalCommManager>().SetGlobalComm(
+          bootstrap_comm);
+    } else {
+      LOG(WARNING)
+          << "HcclRunner shm rendezvous failed, atb_speed will self-init "
+          << "and likely fail without a rank_tablefile";
+    }
+  }
+
   mapping.InitGlobalCommDomain(
       ::xllm::ParallelConfig::get_instance().communication_backend());
   auto moeEpParallelInfo = mapping.Get(atb_speed::base::MOE_EP);
