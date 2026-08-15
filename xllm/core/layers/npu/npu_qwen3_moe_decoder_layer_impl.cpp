@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/lora/lora_config.h"  // Option D patch #1: FLAGS_enable_lora
 namespace xllm {
 namespace layer {
 
@@ -206,6 +207,11 @@ void NpuQwen3MoeDecoderLayerImpl::initialize_mlp_parameters(
     const ParallelArgs& parallel_args) {
   param.hasSharedExpert = (args.n_shared_experts() > 0);
   param.hasSharedExpertGate = false;
+  // Option D patch #1: opt-in atb_speed MoE decoder LoRA branch (if any).
+  // NOTE: No patch #2 (WEIGHT_COUNT + N) here — c3 patch #2 unconditional +15
+  // caused vector out_of_range when enableLora=false; Option D test is
+  // "does atb_speed MoE side accept enableLora=true and still build graph?"
+  param.enableLora = FLAGS_enable_lora;
   param.processLogits = "normalization";
   param.numOfSelectedExperts = {args.num_experts_per_tok()};
 
