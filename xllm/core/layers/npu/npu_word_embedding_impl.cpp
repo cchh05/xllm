@@ -90,6 +90,12 @@ int64_t NpuWordEmbeddingImpl::init_node(
     atb_speed::Model::Node& node,
     atb_speed::common::WordEmbeddingParam& param) {
   atb::Operation* operation = nullptr;
+  LOG(INFO) << "[atb-debug-we] init_node rank=" << param.tensorParallelInfo.rank
+            << " worldSize=" << param.tensorParallelInfo.worldSize
+            << " commDomain=" << param.tensorParallelInfo.commDomain
+            << " hcommInfo_null="
+            << (param.tensorParallelInfo.hcommInfo == nullptr)
+            << " backend=" << param.tensorParallelInfo.backend;
   atb_speed::common::WordEmbedding(param, &operation);
   node.operation.reset(operation);
   if (node.operation == nullptr) {
