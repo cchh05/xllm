@@ -17,6 +17,7 @@ limitations under the License.
 
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/lora/lora_runtime.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_context.h"
 #include "core/framework/parallel_state/npu_dp_ep_padding.h"
@@ -156,6 +157,53 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
       auto block = Qwen3MoeDecoderLayer(context, i);
       layers_.push_back(block);
       blocks_->push_back(block);
+    }
+
+    // Qwen3-MoE ATB path LoRA wire (mirror TORCH path
+    // xllm/models/llm/qwen3_moe.h line 65-107, added by 08-13 PR#7 for TORCH;
+    // ATB path had the identical gap since it's an independent file). Register
+    // device+dtype, set hotswap config, and preload static per-proj adapters.
+    // install_moe_experts=false because attention + dense MLP LoRA is what the
+    // Linear wrappers consume; MoE-experts LoRA lives in a separate installer.
+    if (LoRARuntime::instance().enabled()) {
+      LoRARuntime::instance().set_model_device_dtype(
+          options.device(), options.dtype().toScalarType());
+      const auto& modules = LoRARuntime::instance().config().lora_modules;
+      const int32_t tp_size =
+          std::max(1, parallel_args.world_size() / parallel_args.dp_size());
+      const int32_t tp_rank = parallel_args.rank() % tp_size;
+      {
+        LoRARuntime::HotswapConfig cfg;
+        cfg.tp = TPInfo{tp_size, tp_rank};
+        cfg.install_per_proj = true;
+        cfg.install_moe_experts = false;
+        LoRARuntime::instance().set_hotswap_config(cfg);
+      }
+      if (!modules.empty()) {
+        LOG(INFO) << "[qwen3_moe_atb M10] preloading " << modules.size()
+                  << " per-proj static adapter(s) on " << options.device();
+        int ok = 0, failed = 0;
+        for (const auto& [name, path] : modules) {
+          auto id =
+              LoRARuntime::instance().install_static_adapter_on_device_per_proj(
+                  name,
+                  path,
+                  /*base_model_name=*/"",
+                  options.device(),
+                  options.dtype().toScalarType(),
+                  TPInfo{tp_size, tp_rank});
+          if (id.has_value()) {
+            ++ok;
+            LOG(INFO) << "[qwen3_moe_atb M10] preloaded " << name
+                      << " id=" << *id;
+          } else {
+            ++failed;
+            LOG(ERROR) << "[qwen3_moe_atb M10] failed " << name;
+          }
+        }
+        LOG(INFO) << "[qwen3_moe_atb M10] preload done: ok=" << ok
+                  << " failed=" << failed;
+      }
     }
 
     dp_size_ = parallel_args.dp_size();
