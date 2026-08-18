@@ -137,6 +137,20 @@ class NpuQwen3MoeDecoderLayerImpl : public BaseLayer {
   atb_speed::Model::Node decode_graph_node_;
   atb_speed::Model::Node decode_eager_node_;
 
+  // 2-graph refactor: LoRA variants of the 3 nodes.
+  // Base variants above have supportLora=false (atb graph has NO LoRA nodes).
+  // LoRA variants below have supportLora=true (atb graph has LoRA GMM_A + GMM_B
+  // + Add). Forward dispatches to base_/lora_ based on
+  // input_params.adapter_ids[0]. Only allocated + init when FLAGS_enable_lora
+  // at startup.
+  atb_speed::qwen::MoeDecoderLayerParam prefill_param_lora_;
+  atb_speed::qwen::MoeDecoderLayerParam decode_graph_param_lora_;
+  atb_speed::qwen::MoeDecoderLayerParam decode_eager_param_lora_;
+  atb_speed::Model::Node prefill_node_lora_;
+  atb_speed::Model::Node decode_graph_node_lora_;
+  atb_speed::Model::Node decode_eager_node_lora_;
+  bool lora_variants_built_ = false;
+
   atb::Tensor internal_tensor_;
 
   torch::Tensor tensor_placeholder_;

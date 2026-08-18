@@ -338,11 +338,67 @@ void NpuQwen3MoeDecoderLayerImpl::merge_loaded_weights() {
 int64_t NpuQwen3MoeDecoderLayerImpl::init_layer() {
   name_ = "qwen3_moe_decoder_layer " + std::to_string(layer_id_);
   model_name_ = "Qwen3_Moe";
+
+  // 2-graph refactor: force base variant params to have NO LoRA to guarantee
+  // base variant atb graph contains zero LoRA nodes (Path γ v2 verified path).
+  // This overrides Y-alt2 conditional `has_any_*_adapter()` which may return
+  // true post-preload — but init_layer is called from model ctor BEFORE
+  // preload (see model ctor sequence: decoder ctor → init_layer → preload).
+  // Explicit override is defense-in-depth.
+  prefill_param_.enableLora = false;
+  prefill_param_.enableAttnLora = false;
+  prefill_param_.enableExpertsLora = false;
+  prefill_param_.loraEnableGMM = false;
+  decode_graph_param_.enableLora = false;
+  decode_graph_param_.enableAttnLora = false;
+  decode_graph_param_.enableExpertsLora = false;
+  decode_graph_param_.loraEnableGMM = false;
+  decode_eager_param_.enableLora = false;
+  decode_eager_param_.enableAttnLora = false;
+  decode_eager_param_.enableExpertsLora = false;
+  decode_eager_param_.loraEnableGMM = false;
+
   CHECK_OPERATION_STATUS_RETURN(init_node(prefill_node_, prefill_param_));
   CHECK_OPERATION_STATUS_RETURN(
       init_node(decode_graph_node_, decode_graph_param_));
   CHECK_OPERATION_STATUS_RETURN(
       init_node(decode_eager_node_, decode_eager_param_));
+
+  // 2-graph refactor: build LoRA variants when --enable_lora on.
+  // Same param as base except LoRA flags forced true — atb builds graph with
+  // LoRA GMM_A + GMM_B + Add nodes. Independent op tree from base variant.
+  if (FLAGS_enable_lora) {
+    prefill_param_lora_ = prefill_param_;
+    prefill_param_lora_.enableLora = true;
+    prefill_param_lora_.enableAttnLora = true;
+    prefill_param_lora_.enableExpertsLora = true;
+    prefill_param_lora_.loraEnableGMM = true;
+
+    decode_graph_param_lora_ = decode_graph_param_;
+    decode_graph_param_lora_.enableLora = true;
+    decode_graph_param_lora_.enableAttnLora = true;
+    decode_graph_param_lora_.enableExpertsLora = true;
+    decode_graph_param_lora_.loraEnableGMM = true;
+
+    decode_eager_param_lora_ = decode_eager_param_;
+    decode_eager_param_lora_.enableLora = true;
+    decode_eager_param_lora_.enableAttnLora = true;
+    decode_eager_param_lora_.enableExpertsLora = true;
+    decode_eager_param_lora_.loraEnableGMM = true;
+
+    CHECK_OPERATION_STATUS_RETURN(
+        init_node(prefill_node_lora_, prefill_param_lora_));
+    CHECK_OPERATION_STATUS_RETURN(
+        init_node(decode_graph_node_lora_, decode_graph_param_lora_));
+    CHECK_OPERATION_STATUS_RETURN(
+        init_node(decode_eager_node_lora_, decode_eager_param_lora_));
+    lora_variants_built_ = true;
+    LOG(INFO) << "[2graph] layer=" << layer_id_
+              << " built base + LoRA variants (6 nodes total)";
+  } else {
+    LOG(INFO) << "[2graph] layer=" << layer_id_
+              << " built base variants only (3 nodes, --enable_lora off)";
+  }
 
   return atb::NO_ERROR;
 }
