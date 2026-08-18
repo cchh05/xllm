@@ -795,6 +795,14 @@ void ChatServiceImpl::process_async_impl(std::shared_ptr<ChatCall> call) {
     if (lora_pinned_impl.has_value()) {
       request_params.adapter_id = lora_pinned_impl->int_id;
     }
+    LOG(ERROR) << "[chat-svc-lora-diag] model=" << model
+               << " has_value=" << lora_pinned_impl.has_value() << " int_id="
+               << (lora_pinned_impl.has_value() ? lora_pinned_impl->int_id : 0)
+               << " request_params_adapter_id_set="
+               << request_params.adapter_id.has_value() << " adapter_id_val="
+               << (request_params.adapter_id.has_value()
+                       ? *request_params.adapter_id
+                       : 0);
   }
 
   std::vector<Message> messages;

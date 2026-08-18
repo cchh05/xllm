@@ -367,22 +367,25 @@ int64_t NpuQwen3MoeDecoderLayerImpl::init_layer() {
   // 2-graph refactor: build LoRA variants when --enable_lora on.
   // Same param as base except LoRA flags forced true — atb builds graph with
   // LoRA GMM_A + GMM_B + Add nodes. Independent op tree from base variant.
+  // NOTE M3c: enableAttnLora forced false because moe_zero/moe_strong are
+  // experts-only. If attn LoRA needed later (mixed adapter), rebuild variant
+  // with enableAttnLora=true (may need 4 variants total per phase).
   if (FLAGS_enable_lora) {
     prefill_param_lora_ = prefill_param_;
     prefill_param_lora_.enableLora = true;
-    prefill_param_lora_.enableAttnLora = true;
+    prefill_param_lora_.enableAttnLora = false;
     prefill_param_lora_.enableExpertsLora = true;
     prefill_param_lora_.loraEnableGMM = true;
 
     decode_graph_param_lora_ = decode_graph_param_;
     decode_graph_param_lora_.enableLora = true;
-    decode_graph_param_lora_.enableAttnLora = true;
+    decode_graph_param_lora_.enableAttnLora = false;
     decode_graph_param_lora_.enableExpertsLora = true;
     decode_graph_param_lora_.loraEnableGMM = true;
 
     decode_eager_param_lora_ = decode_eager_param_;
     decode_eager_param_lora_.enableLora = true;
-    decode_eager_param_lora_.enableAttnLora = true;
+    decode_eager_param_lora_.enableAttnLora = false;
     decode_eager_param_lora_.enableExpertsLora = true;
     decode_eager_param_lora_.loraEnableGMM = true;
 
@@ -666,6 +669,60 @@ void NpuQwen3MoeDecoderLayerImpl::build_node_variant_pack(
     if (layer_id_ == 0) {
       LOG(INFO) << "[2graph-m3a-fill71] cum_sum filled, GetInputNum="
                 << node.operation->GetInputNum();
+    }
+
+    // 2-graph M3c: fill slot 72-73 (experts_lora_down A/B) with real moe_delta.
+    // NOTE: LoRA variant param has enableAttnLora=false, so atb candidate skips
+    // lora_attn slots (72-79). Experts_lora_down slots are at 72/73 (right
+    // after lora_common at 71). Offset within LoRA block: A_off=1, B_off=2.
+    // Base curl (adapter_id==0) fallback to id=1 (first preloaded).
+    if (rt_lora.has_any_experts_adapter()) {
+      const bool is_base_curl_m3c =
+          input_params.adapter_ids.empty() || input_params.adapter_ids[0] == 0;
+      const uint64_t adapter_id_m3c =
+          is_base_curl_m3c ? 1 : input_params.adapter_ids[0];
+      auto& rt_m3c = LoRARuntime::instance();
+      const auto* moe_delta =
+          rt_m3c.get_moe_expert_delta(adapter_id_m3c, layer_id_);
+
+      // Non-invasive diag (Action A): no .item()/.sum() (which force NPU->CPU
+      // sync + may break stream state in forward path). Only log
+      // ptr/shape/dtype.
+      if (layer_id_ == 0) {
+        LOG(ERROR) << "[m3-noninvasive-diag] input_adapter_id_0="
+                   << (input_params.adapter_ids.empty()
+                           ? 0
+                           : input_params.adapter_ids[0])
+                   << " is_base_curl=" << is_base_curl_m3c
+                   << " lookup_adapter_id=" << adapter_id_m3c << " A_down_ptr="
+                   << (moe_delta && moe_delta->A_down.defined()
+                           ? moe_delta->A_down.data_ptr()
+                           : nullptr)
+                   << " A_down_shape="
+                   << (moe_delta && moe_delta->A_down.defined()
+                           ? moe_delta->A_down.sizes()
+                           : c10::IntArrayRef())
+                   << " A_down_dtype="
+                   << (moe_delta && moe_delta->A_down.defined()
+                           ? moe_delta->A_down.dtype()
+                           : caffe2::TypeMeta());
+      }
+
+      if (moe_delta && moe_delta->A_down.defined() &&
+          moe_delta->B_down.defined()) {
+        // Slot 72 (index 1 within LoRA block, no attn slots)
+        node.variantPack.inTensors.at(off_m3a + 1) =
+            atb_speed::Utils::AtTensor2Tensor(moe_delta->A_down);
+        // Slot 73 (index 2 within LoRA block)
+        node.variantPack.inTensors.at(off_m3a + 2) =
+            atb_speed::Utils::AtTensor2Tensor(moe_delta->B_down);
+        if (layer_id_ == 0) {
+          LOG(INFO) << "[2graph-m3c-fill72-73] adapter_id=" << adapter_id_m3c
+                    << " is_base_curl=" << is_base_curl_m3c
+                    << " A_down.shape=" << moe_delta->A_down.sizes()
+                    << " B_down.shape=" << moe_delta->B_down.sizes();
+        }
+      }
     }
   }
 
