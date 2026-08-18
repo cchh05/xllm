@@ -281,7 +281,7 @@ IndexedKVCacheTensors create_indexed_kv_cache_tensors(
 QuantizedKVCacheTensors create_quantized_kv_cache_tensors(
     const KVCacheShape& kv_cache_shape,
     const KVCacheCreateOptions& create_options) {
-#if !defined(USE_MLU)
+#if !defined(USE_MLU) && !defined(USE_NPU)
   CHECK(!create_options.enable_kv_cache_quant())
       << "KV cache quantization is only supported on MLU backend.";
 #endif

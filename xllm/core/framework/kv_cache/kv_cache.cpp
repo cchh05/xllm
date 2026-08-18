@@ -53,7 +53,7 @@ std::unique_ptr<KVCacheImpl> create_kv_cache_impl(
     int64_t layer_id) {
   CHECK_GE(layer_id, 0) << "KV cache layer_id must be non-negative.";
 
-#if !defined(USE_MLU)
+#if !defined(USE_MLU) && !defined(USE_NPU)
   CHECK(!create_options.enable_kv_cache_quant())
       << "KV cache quantization is only supported on MLU backend.";
 #endif

@@ -421,7 +421,7 @@ bool WorkerImpl::allocate_kv_cache_storage(
   }
 
   if (enable_kv_cache_quant) {
-#if !defined(USE_MLU)
+#if !defined(USE_MLU) && !defined(USE_NPU)
     LOG(FATAL) << "KV Cache quantization is only supported on MLU backend. "
                << "Current backend does not support this feature.";
 #endif
