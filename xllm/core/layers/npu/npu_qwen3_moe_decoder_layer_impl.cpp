@@ -27,6 +27,14 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/lora/lora_config.h"  // Option D patch #1: FLAGS_enable_lora
+
+// [spike:kv-int8] wire enableKvQuant + enableKvQuantLayer to atb_speed. See
+// feature/kv-int8-spike-2026-08-18.
+DEFINE_bool(kv_int8_wire_atb,
+            false,
+            "[spike] wire enableKvQuant (primary) + enableKvQuantLayer to "
+            "atb_speed qwen3_moe for KV INT8 attention path.");
+
 namespace xllm {
 namespace layer {
 
@@ -197,8 +205,11 @@ void NpuQwen3MoeDecoderLayerImpl::initialize_attention_parameters(
     atb_speed::qwen::MoeDecoderLayerParam& param,
     const ModelArgs& args,
     const ParallelArgs& parallel_args) {
-  param.enableFA3 = false;           // TODO
-  param.enableKvQuantLayer = false;  // TODO
+  param.enableFA3 = false;  // TODO
+  param.enableKvQuant =
+      FLAGS_kv_int8_wire_atb;  // [spike:kv-int8] primary driver
+  param.enableKvQuantLayer =
+      FLAGS_kv_int8_wire_atb;  // [spike:kv-int8] conservative dual-wire
 }
 
 void NpuQwen3MoeDecoderLayerImpl::initialize_mlp_parameters(
