@@ -207,6 +207,15 @@ class LoRARuntime {
   // device weights).
   std::optional<ActiveDelta> get_delta_by_int_id(uint64_t int_id);
 
+  // ---- R3-alt3 Y-alt2 pool-scope queries ----
+  // Used by qwen3_moe_atb param setup to decide independent attn/experts
+  // LoRA graph gates (avoid activating a subgraph that has no installed
+  // adapter — its slots would stay [1] shape and crash downstream ops).
+  bool has_any_attn_adapter() const { return !per_proj_device_pool_.empty(); }
+  bool has_any_experts_adapter() const {
+    return !moe_expert_lora_pool_.empty();
+  }
+
   // ---- M10 per-proj/per-layer delta support ----
   //
   // ProjKey identifies a specific weight in a decoder layer, e.g.
