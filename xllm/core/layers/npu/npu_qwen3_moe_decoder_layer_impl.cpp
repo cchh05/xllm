@@ -650,6 +650,25 @@ void NpuQwen3MoeDecoderLayerImpl::build_node_variant_pack(
   // (only experts slots at offset 0-1), so writing to LORA_QKV_A_0 (slot 1)
   // would collide with LORA_MOE_DOWN_B, corrupting experts LoRA delta.
   auto& rt_lora = LoRARuntime::instance();
+
+  // 2-graph M3a: fill slot 71 (lora_common = in_seq_len_cum_sum) whenever
+  // Node is a LoRA variant (GetInputNum > 71). Unconditional wrt adapter type
+  // because atb LoRA variant graph always has this slot when any lora block
+  // (attn or experts) is on.
+  if (FLAGS_enable_lora && node.operation->GetInputNum() >
+                               BASE_WEIGHT_COUNT + RUNTIME_TENSOR_COUNT) {
+    const int32_t off_m3a = BASE_WEIGHT_COUNT + RUNTIME_TENSOR_COUNT;
+    node.variantPack.inTensors.at(off_m3a + LORA_IN_SEQ_LEN_CUM_SUM) =
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.attention.device.q_cu_seq_lens);
+    node.variantPack.inTensors.at(off_m3a + LORA_IN_SEQ_LEN_CUM_SUM).hostData =
+        const_cast<int32_t*>(input_params.attention.host.q_cu_seq_lens.data());
+    if (layer_id_ == 0) {
+      LOG(INFO) << "[2graph-m3a-fill71] cum_sum filled, GetInputNum="
+                << node.operation->GetInputNum();
+    }
+  }
+
   if (FLAGS_enable_lora && rt_lora.has_any_attn_adapter() &&
       node.operation->GetInputNum() >
           BASE_WEIGHT_COUNT + RUNTIME_TENSOR_COUNT) {
