@@ -160,11 +160,14 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
     }
 
     // Qwen3-MoE ATB path LoRA wire (mirror TORCH path
-    // xllm/models/llm/qwen3_moe.h line 65-107, added by 08-13 PR#7 for TORCH;
-    // ATB path had the identical gap since it's an independent file). Register
-    // device+dtype, set hotswap config, and preload static per-proj adapters.
-    // install_moe_experts=false because attention + dense MLP LoRA is what the
-    // Linear wrappers consume; MoE-experts LoRA lives in a separate installer.
+    // xllm/models/llm/qwen3_moe.h + qwen3_5.h line 55-115 for experts LoRA).
+    // Enable both:
+    //   1. install_per_proj  (attn q/k/v/o LoRA — 08-15 PR #8)
+    //   2. install_moe_experts (experts.{E}.{gate/up/down}_proj LoRA — 08-16
+    //   R3-alt3)
+    // LoRARuntime install_static_adapter_on_moe_experts populates
+    // moe_expert_lora_pool_ with 3D [E_per_rank, hidden/intermediate, r]
+    // tensors consumable by atb_speed SparseMoe experts GMM path.
     if (LoRARuntime::instance().enabled()) {
       LoRARuntime::instance().set_model_device_dtype(
           options.device(), options.dtype().toScalarType());
@@ -172,18 +175,40 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
       const int32_t tp_size =
           std::max(1, parallel_args.world_size() / parallel_args.dp_size());
       const int32_t tp_rank = parallel_args.rank() % tp_size;
+
+      // Experts LoRA install params (mirror qwen3_5.h line 55-70).
+      // 30B-A3B: num_experts_total=128, ep_size=1 → num_experts_per_rank=128,
+      // start_expert_id=0. moe_intermediate=768 (per-expert unfused hidden
+      // dim).
+      const int32_t num_experts_total =
+          static_cast<int32_t>(model_args.num_experts());
+      const int32_t ep_size = std::max(1, parallel_args.ep_size());
+      const int32_t num_experts_per_rank = num_experts_total / ep_size;
+      const int32_t ep_rank = (ep_size > 1) ? parallel_args.rank() : 0;
+      const int32_t start_expert_id = ep_rank * num_experts_per_rank;
+      const int32_t moe_intermediate =
+          static_cast<int32_t>(model_args.moe_intermediate_size());
+
       {
         LoRARuntime::HotswapConfig cfg;
         cfg.tp = TPInfo{tp_size, tp_rank};
         cfg.install_per_proj = true;
-        cfg.install_moe_experts = false;
+        cfg.install_moe_experts = true;
+        cfg.num_experts_total = num_experts_total;
+        cfg.num_experts_per_rank = num_experts_per_rank;
+        cfg.start_expert_id = start_expert_id;
+        cfg.moe_intermediate_size = moe_intermediate;
         LoRARuntime::instance().set_hotswap_config(cfg);
       }
       if (!modules.empty()) {
         LOG(INFO) << "[qwen3_moe_atb M10] preloading " << modules.size()
-                  << " per-proj static adapter(s) on " << options.device();
-        int ok = 0, failed = 0;
+                  << " static adapter(s) on " << options.device()
+                  << " (per-proj + moe-experts)";
+        int per_proj_ok = 0, per_proj_failed = 0;
+        int moe_ok = 0, moe_failed = 0;
         for (const auto& [name, path] : modules) {
+          // 1) per-proj (attn) LoRA (may fail silently for experts-only
+          // adapter)
           auto id =
               LoRARuntime::instance().install_static_adapter_on_device_per_proj(
                   name,
@@ -193,16 +218,41 @@ class Qwen3MoeModelImpl : public torch::nn::Module {
                   options.dtype().toScalarType(),
                   TPInfo{tp_size, tp_rank});
           if (id.has_value()) {
-            ++ok;
-            LOG(INFO) << "[qwen3_moe_atb M10] preloaded " << name
+            ++per_proj_ok;
+            LOG(INFO) << "[qwen3_moe_atb M10] per-proj preloaded " << name
                       << " id=" << *id;
           } else {
-            ++failed;
-            LOG(ERROR) << "[qwen3_moe_atb M10] failed " << name;
+            ++per_proj_failed;
+            LOG(INFO) << "[qwen3_moe_atb M10] per-proj no-op " << name
+                      << " (experts-only or no attn keys)";
+          }
+
+          // 2) experts LoRA (may fail silently for attn-only adapter)
+          auto moe_id =
+              LoRARuntime::instance().install_static_adapter_on_moe_experts(
+                  name,
+                  path,
+                  /*base_model_name=*/"",
+                  options.device(),
+                  options.dtype().toScalarType(),
+                  TPInfo{tp_size, tp_rank},
+                  num_experts_total,
+                  num_experts_per_rank,
+                  start_expert_id,
+                  moe_intermediate);
+          if (moe_id.has_value()) {
+            ++moe_ok;
+            LOG(INFO) << "[qwen3_moe_atb M10-MoE] experts LoRA preloaded "
+                      << name << " id=" << *moe_id;
+          } else {
+            ++moe_failed;
+            LOG(INFO) << "[qwen3_moe_atb M10-MoE] experts LoRA no-op " << name
+                      << " (attn-only or no experts keys)";
           }
         }
-        LOG(INFO) << "[qwen3_moe_atb M10] preload done: ok=" << ok
-                  << " failed=" << failed;
+        LOG(INFO) << "[qwen3_moe_atb M10] preload done: per_proj ok="
+                  << per_proj_ok << " failed=" << per_proj_failed
+                  << ", moe_experts ok=" << moe_ok << " failed=" << moe_failed;
       }
     }
 

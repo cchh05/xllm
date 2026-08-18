@@ -27,10 +27,38 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/lora/lora_config.h"  // Option D patch #1: FLAGS_enable_lora
+#include "core/framework/lora/lora_runtime.h"  // D-A-1: get_per_proj_delta for attn LoRA
 namespace xllm {
 namespace layer {
 
-static const uint64_t WEIGHT_COUNT_PER_LAYER = 55;
+// D-A-1 attn-only LoRA patch #2: reserve 9 additional slot (1 lora_common
+// + 8 lora_attn) after 55 base weights. Loop uses node.operation->GetInputNum()
+// dynamic gate so LoRA-off (55 slots) and LoRA-on (64 slots) both work without
+// vector out_of_range (avoids c3 patch #2 unconditional 越界 trap).
+static constexpr uint64_t BASE_WEIGHT_COUNT = 55;
+// Day 2-C fix (R3-alt3 experts LoRA down-only path Y): attn 9 slot + experts 2
+// slot = 11. Day 1-B originally had 6 experts slot (gate/up/down A+B), but
+// atb_speed side only wires down (Day 2-C, path Y first-cut). Match count to
+// avoid outer scope GetTensorIdx returning UINT32_MAX for undeclared gate/up
+// names. Path X (Day 6-7) will re-add gate/up + LoRARuntime fusion (torch.cat
+// A_gate|A_up).
+static constexpr uint64_t LORA_SLOT_COUNT = 11;
+enum LoraSlotOffset : int {
+  LORA_IN_SEQ_LEN_CUM_SUM = 0,
+  LORA_QKV_A_0 = 1,
+  LORA_QKV_B_0 = 2,
+  LORA_QKV_A_1 = 3,
+  LORA_QKV_B_1 = 4,
+  LORA_QKV_A_2 = 5,
+  LORA_QKV_B_2 = 6,
+  LORA_QKV_DENSE_A = 7,
+  LORA_QKV_DENSE_B = 8,
+  // Down-only experts LoRA (path Y first-cut, gate/up 是 path X Day 6-7)
+  LORA_MOE_DOWN_A = 9,   // A_down [E_per_rank, in_local, r]
+  LORA_MOE_DOWN_B = 10,  // B_down [E_per_rank, r, hidden]
+};
+static const uint64_t WEIGHT_COUNT_PER_LAYER =
+    BASE_WEIGHT_COUNT + LORA_SLOT_COUNT;
 
 NpuQwen3MoeDecoderLayerImpl::NpuQwen3MoeDecoderLayerImpl(
     const ModelContext& context,
@@ -211,7 +239,17 @@ void NpuQwen3MoeDecoderLayerImpl::initialize_mlp_parameters(
   // NOTE: No patch #2 (WEIGHT_COUNT + N) here — c3 patch #2 unconditional +15
   // caused vector out_of_range when enableLora=false; Option D test is
   // "does atb_speed MoE side accept enableLora=true and still build graph?"
-  param.enableLora = FLAGS_enable_lora;
+  param.enableLora = FLAGS_enable_lora;  // legacy compat
+  // R3-alt3 Y-alt2: independent attn/experts LoRA gate based on pool state.
+  // If no attn adapter installed, keep enableAttnLora=false so the attn
+  // graph does not consume undefined LoRA A/B slots (Path 2 dead-end class).
+  if (FLAGS_enable_lora) {
+    auto& rt = LoRARuntime::instance();
+    param.enableAttnLora =
+        rt.has_any_attn_adapter();  // safe: per_proj pool populated
+                                    // conditionally
+    param.enableExpertsLora = FLAGS_enable_lora;  // same
+  }
   param.processLogits = "normalization";
   param.numOfSelectedExperts = {args.num_experts_per_tok()};
 
@@ -336,7 +374,13 @@ int64_t NpuQwen3MoeDecoderLayerImpl::init_node(
   node.outTensors.resize(node.operation->GetOutputNum());
   size_t inTensorId = 1;
 
-  for (size_t weightTensorId = 0; weightTensorId < WEIGHT_COUNT_PER_LAYER;
+  // D-A-1 dynamic gate: LoRA-off atb_speed needs 55 slot, LoRA-on needs 64.
+  // Use GetInputNum() so both scenarios work without vector越界 (c3 patch #2
+  // trap).
+  const size_t actual_input_num = node.operation->GetInputNum();
+  const size_t weight_loop_end =
+      std::min(actual_input_num, static_cast<size_t>(BASE_WEIGHT_COUNT));
+  for (size_t weightTensorId = 0; weightTensorId < weight_loop_end;
        ++weightTensorId) {
     node.inTensors.at(weightTensorId) = &atb_weight_tensors_[weightTensorId];
   }
@@ -414,68 +458,68 @@ void NpuQwen3MoeDecoderLayerImpl::build_node_variant_pack(
   int32_t input_idx = 0;
   auto& dp_ep_padding = input_params.parallel.dp_ep_padding_data;
 
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER) = internal_tensor_;
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 1) =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 0) = internal_tensor_;
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 1) =
       atb_speed::Utils::AtTensor2Tensor(input_params.expert.expert_array);
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 2) =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 2) =
       atb_speed::Utils::AtTensor2Tensor(expert_group_);
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 3) =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 3) =
       atb_speed::Utils::AtTensor2Tensor(one_hot_);
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 4) =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 4) =
       atb_speed::Utils::AtTensor2Tensor(zero_hot_);
 
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 5) =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 5) =
       atb_speed::Utils::AtTensor2Tensor(cos_pos);
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 6) =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 6) =
       atb_speed::Utils::AtTensor2Tensor(sin_pos);
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 7) =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 7) =
       atb_speed::Utils::AtTensor2Tensor(attn_mask);
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 8) =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 8) =
       atb_speed::Utils::AtTensor2Tensor(kv_cache.get_k_cache());
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 9) =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 9) =
       atb_speed::Utils::AtTensor2Tensor(kv_cache.get_v_cache());
 
   if (!input_params.attention.device.block_tables.defined() ||
       input_params.attention.device.block_tables.storage().data() == nullptr) {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10) =
+    node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 10) =
         atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10).hostData =
+    node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 10).hostData =
         const_cast<int32_t*>(placeholder_vec_.data());
   } else {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10) =
+    node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 10) =
         atb_speed::Utils::AtTensor2Tensor(
             input_params.attention.device.kv_seq_lens);
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10).hostData =
+    node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 10).hostData =
         const_cast<int32_t*>(input_params.attention.host.kv_seq_lens.data());
   }
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11) =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 11) =
       atb_speed::Utils::AtTensor2Tensor(tensor_placeholder_);
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 12) =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 12) =
       atb_speed::Utils::AtTensor2Tensor(tensor_placeholder_);
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 12).hostData =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 12).hostData =
       const_cast<int32_t*>(placeholder_vec_.data());
-  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 13) =
+  node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 13) =
       atb_speed::Utils::AtTensor2Tensor(tensor_placeholder_);
   if (!input_params.attention.device.block_tables.defined() ||
       input_params.attention.device.block_tables.storage().data() == nullptr) {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 14) =
+    node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 14) =
         atb_speed::Utils::AtTensor2Tensor(block_tables_placeholder_);
   } else {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 14) =
+    node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 14) =
         atb_speed::Utils::AtTensor2Tensor(
             input_params.attention.device.block_tables);
   }
   if (!input_params.attention.device.block_tables.defined() ||
       input_params.attention.device.block_tables.storage().data() == nullptr) {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
+    node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 15) =
         atb_speed::Utils::AtTensor2Tensor(slot_tensor_placeholder_);
   } else {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
+    node.variantPack.inTensors.at(BASE_WEIGHT_COUNT + 15) =
         atb_speed::Utils::AtTensor2Tensor(
             input_params.attention.device.new_cache_slots);
   }
 
-  input_idx = WEIGHT_COUNT_PER_LAYER + 16;
+  input_idx = BASE_WEIGHT_COUNT + 16;
   if (is_prefill &&
       (::xllm::SchedulerConfig::get_instance().enable_chunked_prefill() ||
        ::xllm::KVCacheConfig::get_instance().enable_prefix_cache())) {
@@ -509,7 +553,207 @@ void NpuQwen3MoeDecoderLayerImpl::build_node_variant_pack(
     node.variantPack.outTensors.at(1) = residual_tensor_;
   }
 
-  for (size_t i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+  // D-A-1 A2-a: unified LoRA slot fill (base + adapter case).
+  // atb_speed supportLora=true graph 需要**全部 9 slot 有真 shape tensor**,
+  // 否则 setup_layer_node RmsNorm invalid dim=1 (error code 9).
+  // Base curl (no adapter): fill zero A/B with shape from pool reference
+  // (delta=0 no-op). Adapter curl: fill real A/B from get_per_proj_delta.
+  // R3-alt3 Y-alt2 offset fix: gate attn fill on has_any_attn_adapter() —
+  // when no attn adapter installed, atb SparseMoe has no attn LoRA slots
+  // (only experts slots at offset 0-1), so writing to LORA_QKV_A_0 (slot 1)
+  // would collide with LORA_MOE_DOWN_B, corrupting experts LoRA delta.
+  auto& rt_lora = LoRARuntime::instance();
+  // Path γ fix: lora_common (in_seq_len_cum_sum) is always emitted by atb
+  // whenever ANY LoRA gate (attn OR experts) is on. Fill unconditionally
+  // to avoid 0-dim inTensor at slot BASE_WEIGHT_COUNT+16 causing setup fail.
+  if (FLAGS_enable_lora && node.operation->GetInputNum() > BASE_WEIGHT_COUNT) {
+    const int32_t off = BASE_WEIGHT_COUNT + 16;
+    node.variantPack.inTensors.at(off + LORA_IN_SEQ_LEN_CUM_SUM) =
+        atb_speed::Utils::AtTensor2Tensor(
+            input_params.attention.device.q_cu_seq_lens);
+    node.variantPack.inTensors.at(off + LORA_IN_SEQ_LEN_CUM_SUM).hostData =
+        const_cast<int32_t*>(input_params.attention.host.q_cu_seq_lens.data());
+  }
+
+  if (FLAGS_enable_lora && rt_lora.has_any_attn_adapter() &&
+      node.operation->GetInputNum() > BASE_WEIGHT_COUNT) {
+    const int32_t off = BASE_WEIGHT_COUNT + 16;
+
+    // 2. Determine A/B source: real adapter delta (if adapter_id != 0) or
+    // zero-fill
+    auto& rt = LoRARuntime::instance();
+    const LoRARuntime::ProjDelta *q_delta = nullptr, *k_delta = nullptr,
+                                 *v_delta = nullptr, *o_delta = nullptr;
+    bool use_real_lora = false;
+    uint64_t adapter_id = 0;
+
+    if (!input_params.adapter_ids.empty() && input_params.adapter_ids[0] != 0) {
+      adapter_id = input_params.adapter_ids[0];
+      for (size_t s = 1; s < input_params.adapter_ids.size(); ++s) {
+        CHECK_EQ(input_params.adapter_ids[s], adapter_id)
+            << "D-A-1 attn LoRA supports single-adapter batch only";
+      }
+      q_delta = rt.get_per_proj_delta(adapter_id, layer_id_, "q_proj");
+      k_delta = rt.get_per_proj_delta(adapter_id, layer_id_, "k_proj");
+      v_delta = rt.get_per_proj_delta(adapter_id, layer_id_, "v_proj");
+      o_delta = rt.get_per_proj_delta(adapter_id, layer_id_, "o_proj");
+      if (q_delta && k_delta && v_delta && o_delta) {
+        use_real_lora = true;
+      }
+    }
+
+    if (use_real_lora) {
+      // 3a. Real LoRA fill
+      if (layer_id_ == 0) {
+        LOG(INFO) << "[atb-debug-lora-shape] REAL adapter=" << adapter_id
+                  << " q_A=" << q_delta->A.sizes()
+                  << " q_B=" << q_delta->B.sizes()
+                  << " k_A=" << k_delta->A.sizes()
+                  << " k_B=" << k_delta->B.sizes()
+                  << " v_A=" << v_delta->A.sizes()
+                  << " v_B=" << v_delta->B.sizes()
+                  << " o_A=" << o_delta->A.sizes()
+                  << " o_B=" << o_delta->B.sizes()
+                  << " scaling=" << q_delta->scaling << " r=" << q_delta->r;
+      }
+      node.variantPack.inTensors.at(off + LORA_QKV_A_0) =
+          atb_speed::Utils::AtTensor2Tensor(q_delta->A);
+      node.variantPack.inTensors.at(off + LORA_QKV_B_0) =
+          atb_speed::Utils::AtTensor2Tensor(q_delta->B);
+      node.variantPack.inTensors.at(off + LORA_QKV_A_1) =
+          atb_speed::Utils::AtTensor2Tensor(k_delta->A);
+      node.variantPack.inTensors.at(off + LORA_QKV_B_1) =
+          atb_speed::Utils::AtTensor2Tensor(k_delta->B);
+      node.variantPack.inTensors.at(off + LORA_QKV_A_2) =
+          atb_speed::Utils::AtTensor2Tensor(v_delta->A);
+      node.variantPack.inTensors.at(off + LORA_QKV_B_2) =
+          atb_speed::Utils::AtTensor2Tensor(v_delta->B);
+      node.variantPack.inTensors.at(off + LORA_QKV_DENSE_A) =
+          atb_speed::Utils::AtTensor2Tensor(o_delta->A);
+      node.variantPack.inTensors.at(off + LORA_QKV_DENSE_B) =
+          atb_speed::Utils::AtTensor2Tensor(o_delta->B);
+    } else {
+      // 3b. Zero-fill (base curl or partial coverage): shape from pool
+      // reference. Try adapter_id=1 (attnctrl was preloaded first) as shape
+      // reference.
+      const auto* ref_delta = rt.get_per_proj_delta(1, layer_id_, "q_proj");
+      if (ref_delta == nullptr) {
+        LOG_IF(WARNING, layer_id_ == 0)
+            << "[atb-debug-lora-shape] NO REFERENCE adapter for zero-fill, "
+            << "adapter_ids_size=" << input_params.adapter_ids.size()
+            << " adapter_id[0]="
+            << (input_params.adapter_ids.empty() ? 0
+                                                 : input_params.adapter_ids[0])
+            << " - atb_speed will see [1] dummy A/B, expect crash";
+      } else {
+        auto A_shape = ref_delta->A.sizes();
+        auto B_shape = ref_delta->B.sizes();
+        auto dtype = ref_delta->A.dtype();
+        auto device = ref_delta->A.device();
+        auto zero_A = torch::zeros(
+            A_shape, torch::TensorOptions().dtype(dtype).device(device));
+        auto zero_B = torch::zeros(
+            B_shape, torch::TensorOptions().dtype(dtype).device(device));
+        if (layer_id_ == 0) {
+          LOG(INFO) << "[atb-debug-lora-shape] ZERO fill (base/partial) "
+                       "adapter_ids_size="
+                    << input_params.adapter_ids.size() << " ref_A=" << A_shape
+                    << " ref_B=" << B_shape << " dtype=" << dtype;
+        }
+        node.variantPack.inTensors.at(off + LORA_QKV_A_0) =
+            atb_speed::Utils::AtTensor2Tensor(zero_A);
+        node.variantPack.inTensors.at(off + LORA_QKV_B_0) =
+            atb_speed::Utils::AtTensor2Tensor(zero_B);
+        node.variantPack.inTensors.at(off + LORA_QKV_A_1) =
+            atb_speed::Utils::AtTensor2Tensor(zero_A);
+        node.variantPack.inTensors.at(off + LORA_QKV_B_1) =
+            atb_speed::Utils::AtTensor2Tensor(zero_B);
+        node.variantPack.inTensors.at(off + LORA_QKV_A_2) =
+            atb_speed::Utils::AtTensor2Tensor(zero_A);
+        node.variantPack.inTensors.at(off + LORA_QKV_B_2) =
+            atb_speed::Utils::AtTensor2Tensor(zero_B);
+        node.variantPack.inTensors.at(off + LORA_QKV_DENSE_A) =
+            atb_speed::Utils::AtTensor2Tensor(zero_A);
+        node.variantPack.inTensors.at(off + LORA_QKV_DENSE_B) =
+            atb_speed::Utils::AtTensor2Tensor(zero_B);
+      }
+    }
+  }
+
+  // R3-alt3 Y-alt2 offset fix: experts MLP LoRA fill with dynamic offset.
+  // atb SparseMoe slot layout depends on enableAttnLora + enableExpertsLora:
+  //   - attn OFF + experts ON: slot 0-1 = experts down A/B (no cum_sum, no qkv)
+  //   - attn ON + experts ON:  slot 0 = cum_sum, 1-8 = qkv, 9-10 = experts down
+  //   A/B
+  // Gate on adapter_id!=0 + GetInputNum() > BASE_WEIGHT_COUNT (any lora slot
+  // exists).
+  if (FLAGS_enable_lora && rt_lora.has_any_experts_adapter() &&
+      node.operation->GetInputNum() > BASE_WEIGHT_COUNT) {
+    // Path γ chicken-egg fix: enableExpertsLora unconditional at ctor time,
+    // so atb graph always has experts LoRA slots even when adapter_id==0 (base
+    // curl). Zero-fill with shape from reference adapter (moe_zero id=1) when
+    // no adapter selected.
+    uint64_t adapter_id =
+        (!input_params.adapter_ids.empty() && input_params.adapter_ids[0] != 0)
+            ? input_params.adapter_ids[0]
+            : 1;
+    auto& rt = LoRARuntime::instance();
+    const auto* moe_delta = rt.get_moe_expert_delta(adapter_id, layer_id_);
+
+    // Shape verification log (layer 0 only)
+    if (layer_id_ == 0) {
+      if (moe_delta && moe_delta->A_gate.defined()) {
+        LOG(INFO) << "[atb-debug-moe-lora-shape] adapter=" << adapter_id
+                  << " layer=" << layer_id_
+                  << " A_gate=" << moe_delta->A_gate.sizes()
+                  << " B_gate=" << moe_delta->B_gate.sizes()
+                  << " A_up=" << moe_delta->A_up.sizes()
+                  << " B_up=" << moe_delta->B_up.sizes()
+                  << " A_down=" << moe_delta->A_down.sizes()
+                  << " B_down=" << moe_delta->B_down.sizes()
+                  << " scaling=" << moe_delta->scaling << " r=" << moe_delta->r;
+      } else {
+        LOG(INFO) << "[atb-debug-moe-lora-shape] adapter=" << adapter_id
+                  << " no moe_expert_delta available (attn-only or empty pool)";
+      }
+    }
+
+    if (layer_id_ == 0) {
+      LOG(INFO) << "[atb-debug-experts-fill] GetInputNum="
+                << node.operation->GetInputNum()
+                << " variantPack.inTensors.size="
+                << node.variantPack.inTensors.size()
+                << " off=" << (BASE_WEIGHT_COUNT + 16) << " experts_a_off="
+                << (rt_lora.has_any_attn_adapter() ? LORA_MOE_DOWN_A : 1)
+                << " experts_b_off="
+                << (rt_lora.has_any_attn_adapter() ? LORA_MOE_DOWN_B : 2)
+                << " has_any_attn=" << rt_lora.has_any_attn_adapter();
+    }
+    if (moe_delta && moe_delta->A_down.defined() &&
+        moe_delta->B_down.defined()) {
+      // Down-only fill (path Y). Gate/up deferred to path X (Day 6-7).
+      // Dynamic offset: attn absent → experts at 0-1, attn present → 9-10.
+      const int32_t off = BASE_WEIGHT_COUNT + 16;
+      const int32_t experts_a_off =
+          rt_lora.has_any_attn_adapter() ? LORA_MOE_DOWN_A : 1;
+      const int32_t experts_b_off =
+          rt_lora.has_any_attn_adapter() ? LORA_MOE_DOWN_B : 2;
+      node.variantPack.inTensors.at(off + experts_a_off) =
+          atb_speed::Utils::AtTensor2Tensor(moe_delta->A_down);
+      node.variantPack.inTensors.at(off + experts_b_off) =
+          atb_speed::Utils::AtTensor2Tensor(moe_delta->B_down);
+    }
+    // If moe_delta null / A_gate undefined: leave slots as default (ctor [1]).
+    // atb_speed SparseMoe side won't consume experts LoRA slots until Day 2
+    // Part 3 wire's up supportLora branch anyway.
+  }
+
+  // Copy staged weights (55 base + 15 LoRA if enableLora). Loop bounded by
+  // actual GetInputNum() to avoid越界 if LoRA off (atb_speed uses 55 slot).
+  const size_t total_input_num = node.operation->GetInputNum();
+  const size_t weight_copy_end =
+      std::min(total_input_num, static_cast<size_t>(BASE_WEIGHT_COUNT));
+  for (size_t i = 0; i < weight_copy_end; ++i) {
     CHECK_THROW(node.inTensors.at(i) == nullptr,
                 model_name_ << " inTensor " << i << " is NULL");
     node.variantPack.inTensors.at(i) = *node.inTensors.at(i);
