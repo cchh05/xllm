@@ -210,6 +210,9 @@ void NpuQwen3MoeDecoderLayerImpl::initialize_attention_parameters(
       FLAGS_kv_int8_wire_atb;  // [spike:kv-int8] primary driver
   param.enableKvQuantLayer =
       FLAGS_kv_int8_wire_atb;  // [spike:kv-int8] conservative dual-wire
+  param.enableRopeQuantKvcache =
+      FLAGS_kv_int8_wire_atb;  // [spike:kv-int8] fusion_attention primary graph
+                               // switch
 }
 
 void NpuQwen3MoeDecoderLayerImpl::initialize_mlp_parameters(
