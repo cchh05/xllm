@@ -464,8 +464,30 @@ torch::Tensor NpuQwen3MoeDecoderLayerImpl::forward(
     std::atomic<bool>* event_flag,
     int node_id) {
   atb::Status st;
+
+  // 2-graph M2a dispatch: select base_ vs lora_ variant based on adapter_id.
+  // - Base curl (adapter_id==0): base variant, atb graph has NO LoRA nodes
+  // - LoRA curl (adapter_id!=0): lora variant, atb graph has LoRA
+  // GMM_A+GMM_B+Add Constraint: batch must be homogeneous (all base or all same
+  // adapter).
+  //             Scheduler affinity gate enforces this at K=1.
+  const bool use_lora_variant = FLAGS_enable_lora && lora_variants_built_ &&
+                                !input_params.adapter_ids.empty() &&
+                                input_params.adapter_ids[0] != 0;
+  if (layer_id_ == 0) {
+    LOG(INFO) << "[2graph-dispatch] use_lora_variant=" << use_lora_variant
+              << " adapter_ids_size=" << input_params.adapter_ids.size()
+              << " adapter_id[0]="
+              << (input_params.adapter_ids.empty()
+                      ? 0
+                      : input_params.adapter_ids[0])
+              << " lora_variants_built=" << lora_variants_built_;
+  }
+
   if (!input_params.meta.batch_forward_type.is_decode()) {
-    build_node_variant_pack(prefill_node_,
+    auto& prefill_target =
+        use_lora_variant ? prefill_node_lora_ : prefill_node_;
+    build_node_variant_pack(prefill_target,
                             x,
                             residual,
                             cos_pos,
@@ -475,16 +497,22 @@ torch::Tensor NpuQwen3MoeDecoderLayerImpl::forward(
                             input_params,
                             true,
                             false);
-    st = execute_node(prefill_node_, node_id, event, event_flag);
+    st = execute_node(prefill_target, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
                            << "execute prefill layer fail, error code: " << st;
   } else {
     const bool use_graph_decode_input =
         ::xllm::ExecutionConfig::get_instance().enable_graph() &&
         input_params.graph.tiling_data.defined();
-    auto& decode_node =
-        use_graph_decode_input ? decode_graph_node_ : decode_eager_node_;
-    build_node_variant_pack(decode_node,
+    atb_speed::Model::Node* decode_target;
+    if (use_lora_variant) {
+      decode_target = use_graph_decode_input ? &decode_graph_node_lora_
+                                             : &decode_eager_node_lora_;
+    } else {
+      decode_target =
+          use_graph_decode_input ? &decode_graph_node_ : &decode_eager_node_;
+    }
+    build_node_variant_pack(*decode_target,
                             x,
                             residual,
                             cos_pos,
@@ -494,7 +522,7 @@ torch::Tensor NpuQwen3MoeDecoderLayerImpl::forward(
                             input_params,
                             false,
                             use_graph_decode_input);
-    st = execute_node(decode_node, node_id + 1000, event, event_flag);
+    st = execute_node(*decode_target, node_id + 1000, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
                            << "execute decode layer fail, error code: " << st;
   }
