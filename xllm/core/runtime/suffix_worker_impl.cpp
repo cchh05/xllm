@@ -331,8 +331,9 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   // Fix4: kernel expects per-token layout matching spec_input_builder.cpp:329
   // (each spec-verify row is one entry). Revert Fix1's per-orig-seq size=8
   // to per-token size=num_sequences*num_val_tokens=48. Value stays 4 (Iter 3).
+  // Revert-nat1: nat value=1 uniform (MTP mirror mtp_worker_impl:2101).
   std::vector<int32_t> accepted_prefix_lengths(num_sequences * num_val_tokens,
-                                               num_speculative_tokens - 1);
+                                               1);
   const auto token_options = validate_input.token_ids.options();
   validate_input.input_params.num_accepted_tokens_host.assign(
       accepted_prefix_lengths.begin(), accepted_prefix_lengths.end());
