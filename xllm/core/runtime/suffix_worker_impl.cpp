@@ -346,8 +346,57 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   // (each spec-verify row is one entry). Revert Fix1's per-orig-seq size=8
   // to per-token size=num_sequences*num_val_tokens=48. Value stays 4 (Iter 3).
   // Revert-nat1: nat value=1 uniform (MTP mirror mtp_worker_impl:2101).
-  std::vector<int32_t> accepted_prefix_lengths(num_sequences * num_val_tokens,
-                                               1);
+  // [spike:suffix-hybrid P1.4] Read per-seq nat from embedding_cache_
+  // (populated by previous step's write_target_context). First step or
+  // missing entries CHECK-fail in read_accepted_prefix_lengths, so guard
+  // with a per-id validity probe and fall back to nat=1 uniform.
+  //
+  // Layout: per-token size (num_sequences * num_val_tokens) — each
+  // spec-verify row in spec_input_builder gets one nat entry. All rows of
+  // one orig seq get the same nat value (that seq's accepted_prefix_len).
+  std::vector<int32_t> accepted_prefix_lengths;
+  accepted_prefix_lengths.reserve(num_sequences * num_val_tokens);
+  const auto& embedding_ids_read =
+      validate_input.input_params.embedding.embedding_ids;
+  bool has_prior_ctx =
+      (embedding_cache_ != nullptr) &&
+      (embedding_ids_read.size() == static_cast<size_t>(num_sequences));
+  std::vector<int32_t> per_seq_nat(num_sequences, 1);
+  if (has_prior_ctx) {
+    // Probe: check we have prior write for all ids. Any missing → treat
+    // whole batch as first-step (uniform nat=1) to avoid CHECK crash.
+    std::vector<EmbeddingCache::DecodeState> probe =
+        embedding_cache_->read_decode_states(embedding_ids_read, {});
+    bool all_valid = true;
+    for (const auto& st : probe) {
+      if (!st.valid || st.correction_token_id < 0) {
+        all_valid = false;
+        break;
+      }
+    }
+    if (all_valid) {
+      std::vector<int32_t> nat_vec =
+          embedding_cache_->read_accepted_prefix_lengths(embedding_ids_read);
+      if (static_cast<int32_t>(nat_vec.size()) == num_sequences) {
+        per_seq_nat = std::move(nat_vec);
+        LOG_EVERY_N(INFO, 200)
+            << "[suffix-hybrid P1.4] read nat from embedding_cache_"
+            << " num_sequences=" << num_sequences
+            << " nat[0]=" << per_seq_nat.front()
+            << " nat[last]=" << per_seq_nat.back();
+      }
+    } else {
+      LOG_EVERY_N(INFO, 200)
+          << "[suffix-hybrid P1.4] embedding_cache_ probe missing, fallback"
+          << " nat=1 uniform num_sequences=" << num_sequences;
+    }
+  }
+  for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+    const int32_t nat = per_seq_nat[seq_id];
+    for (int32_t j = 0; j < num_val_tokens; ++j) {
+      accepted_prefix_lengths.emplace_back(nat);
+    }
+  }
   const auto token_options = validate_input.token_ids.options();
   validate_input.input_params.num_accepted_tokens_host.assign(
       accepted_prefix_lengths.begin(), accepted_prefix_lengths.end());
