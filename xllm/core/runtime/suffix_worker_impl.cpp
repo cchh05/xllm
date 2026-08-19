@@ -319,10 +319,6 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
     validate_input.input_params.parallel.query_start_loc = std::move(qsl);
   }
 
-  // Fix2: write back meta.num_sequences to pre-expansion so any kernel path
-  // that reads it directly sees consistent value.
-  validate_input.input_params.meta.num_sequences = num_sequences;
-
   // [spike:suffix-hybrid] Mirror MTP validate contract
   // (mtp_worker_impl.cpp:2086,2101-2107): mark spec-verify path AND populate
   // num_accepted_tokens so hybrid gated delta net + linear_state_restore
