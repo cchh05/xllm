@@ -15,6 +15,9 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <algorithm>
+#include <cstring>
+#include <iomanip>
 #include <optional>
 #include <sstream>
 #include <tuple>
@@ -738,6 +741,62 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       }
     } else {
       if (use_spec_verify) {
+        // [spike:suffix-diag2] Deeper dump: conv_cache content + spec_verify
+        // chain
+        // + slot validity + kernel args. Purpose: pin kernel EZ9999 root cause.
+        {
+          const int32_t slot_id =
+              linear_state_indices_host.empty()
+                  ? -1
+                  : static_cast<int32_t>(linear_state_indices_host[0]);
+          const int32_t max_slot = static_cast<int32_t>(conv_cache.size(0));
+          LOG(ERROR) << "[suffix-diag2] slot_id=" << slot_id
+                     << " max_slot=" << max_slot;
+          if (slot_id >= 0 && slot_id < max_slot) {
+            auto slot_view = conv_cache.select(0, slot_id).flatten();
+            const int64_t slot_numel = slot_view.numel();
+            auto slot_cpu = slot_view.to(torch::kCPU).contiguous();
+            std::vector<uint8_t> bytes_buf(
+                std::min<int64_t>(16, slot_numel * 2));
+            std::memcpy(
+                bytes_buf.data(), slot_cpu.data_ptr(), bytes_buf.size());
+            std::ostringstream oss;
+            oss << "conv_cache[slot=" << slot_id
+                << "] numel_per_slot=" << slot_numel << " first_16_bytes_hex=";
+            for (uint8_t b : bytes_buf) {
+              oss << std::hex << std::setw(2) << std::setfill('0')
+                  << static_cast<int>(b);
+            }
+            LOG(ERROR) << "[suffix-diag2] " << oss.str();
+          }
+        }
+        LOG(ERROR) << "[suffix-diag2] use_spec_verify_at_layer="
+                   << use_spec_verify << " is_spec_verify_in_params="
+                   << input_params.is_spec_verify << " actual_num_sequences="
+                   << input_params.meta.actual_num_sequences;
+        {
+          const int32_t max_slot = static_cast<int32_t>(conv_cache.size(0));
+          bool any_invalid = false;
+          int64_t min_v = linear_state_indices_host.empty()
+                              ? -1
+                              : linear_state_indices_host[0];
+          int64_t max_v = min_v;
+          for (int64_t idx : linear_state_indices_host) {
+            if (idx < 0 || idx >= max_slot) any_invalid = true;
+            if (idx < min_v) min_v = idx;
+            if (idx > max_v) max_v = idx;
+          }
+          LOG(ERROR) << "[suffix-diag2] linear_state_indices max_slot="
+                     << max_slot << " any_invalid=" << any_invalid
+                     << " min=" << min_v << " max=" << max_v;
+        }
+        LOG(ERROR) << "[suffix-diag2] kernel_args"
+                   << " run_mode=Update("
+                   << static_cast<int>(xllm::npu::kCausalConv1dRunModeUpdate)
+                   << ") activation=Silu("
+                   << static_cast<int>(xllm::npu::kCausalConv1dActivationSilu)
+                   << ") pad_slot_id="
+                   << xllm::npu::kCausalConv1dGraphPadSlotId;
         // [spike:suffix-diag] Non-invasive dump kernel params before crash.
         // Only shape/dtype/numel/size - no .item()/.sum().item().
         {
