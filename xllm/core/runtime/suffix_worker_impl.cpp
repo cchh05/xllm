@@ -316,7 +316,7 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   // value.
   const int32_t num_sequences_spec =
       validate_input.input_params.meta.num_sequences;
-  std::vector<int32_t> accepted_prefix_lengths(num_sequences_spec, 1);
+  std::vector<int32_t> accepted_prefix_lengths(num_sequences_spec, 0);
   const auto token_options = validate_input.token_ids.options();
   validate_input.input_params.num_accepted_tokens_host.assign(
       accepted_prefix_lengths.begin(), accepted_prefix_lengths.end());
