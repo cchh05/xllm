@@ -443,6 +443,39 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
     return std::nullopt;
   }
+
+  // [spike:suffix-hybrid P1.3] Write per-request accepted context to
+  // embedding_cache_ so step_decode next step can read
+  // num_accepted_tokens via read_accepted_prefix_lengths.
+  //
+  // Mirrors MTPWorkerImpl::flush_pending_target_context
+  // (mtp_worker_impl.cpp:1638). We pass:
+  //   embedding_ids  = input_params.embedding.embedding_ids
+  //   request_ids    = input_params.embedding.request_ids
+  //   accepted_tokens = val_output.next_tokens viewed [num_seq,num_val]
+  //   accepted_embeddings = val_output.embeddings viewed
+  //                         [num_seq, num_val, hidden]
+  //
+  // read_accepted_prefix_lengths only consumes correction_token_id and
+  // correction_position_offset fields of DecodeState, which the
+  // write_target_context loop fills in [119-179 embedding_cache.cpp].
+  const auto& embedding_ids_write = input.input_params.embedding.embedding_ids;
+  const auto& request_ids_write = input.input_params.embedding.request_ids;
+  if (embedding_cache_ != nullptr && val_output.next_tokens.defined() &&
+      val_output.embeddings.defined() &&
+      embedding_ids_write.size() == static_cast<size_t>(num_sequences) &&
+      request_ids_write.size() == static_cast<size_t>(num_sequences)) {
+    torch::Tensor accepted_tokens_2d =
+        val_output.next_tokens.view({num_sequences, num_val_tokens});
+    torch::Tensor accepted_embeddings_3d = val_output.embeddings.view(
+        {num_sequences, num_val_tokens, val_output.embeddings.size(-1)});
+    embedding_cache_->write_target_context(embedding_ids_write,
+                                           request_ids_write,
+                                           accepted_tokens_2d,
+                                           accepted_embeddings_3d,
+                                           num_speculative_tokens);
+  }
+
   val_output.embeddings = torch::Tensor();
   target_output.sample_output = val_output;
   return target_output;
