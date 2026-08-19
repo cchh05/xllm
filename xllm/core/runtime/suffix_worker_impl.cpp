@@ -284,6 +284,12 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
 
+  // [spike:suffix-hybrid] Mirror MTP validate contract
+  // (mtp_worker_impl.cpp:2086): mark spec-verify path so hybrid gated
+  // delta net + linear_state_restore take the spec branch instead of
+  // asserting on q_seq_len contract. Suffix engine has already expanded
+  // the validate batch by num_speculative_tokens+1 rows above.
+  validate_input.input_params.is_spec_verify = true;
   timer.reset();
   auto future = impl_->step_async(validate_input);
   ForwardOutput target_output = std::move(future).get().value();
