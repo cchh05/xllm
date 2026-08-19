@@ -112,13 +112,25 @@ void restore_linear_state_slots(
   if (num_slots == 0) {
     return;
   }
-  CHECK_EQ(cache_ops.size(), validity_mask.size())
-      << "linear state validity mask must be sized to the cache_ops batch "
-         "before "
-      << "restore, cache_ops=" << cache_ops.size()
-      << ", validity_mask=" << validity_mask.size();
+  // [spike:suffix-hybrid] Spec-verify path expands validate batch by
+  // (num_speculative_tokens + 1) rows per sequence while cache_ops
+  // stays at num_sequences. Allow validity_mask to be an integer
+  // multiple of cache_ops.size() and repeat each per-op decision.
+  CHECK_GT(cache_ops.size(), 0)
+      << "cache_ops must not be empty when restore requested";
+  CHECK_EQ(validity_mask.size() % cache_ops.size(), 0)
+      << "validity_mask size must be an integer multiple of cache_ops "
+         "size, cache_ops="
+      << cache_ops.size() << ", validity_mask=" << validity_mask.size();
+  const size_t validity_repeat = validity_mask.size() / cache_ops.size();
   const auto slot_in_range = [num_slots](int32_t slot_id) {
     return slot_id >= 0 && slot_id < num_slots;
+  };
+  const auto write_mask = [&validity_mask, validity_repeat](size_t i,
+                                                            int32_t value) {
+    for (size_t r = 0; r < validity_repeat; ++r) {
+      validity_mask[i * validity_repeat + r] = value;
+    }
   };
 
   for (size_t i = 0; i < cache_ops.size(); ++i) {
@@ -137,7 +149,7 @@ void restore_linear_state_slots(
     // forward does not treat reused kv blocks as warm recurrent state.
     if (src_slot_id < 0 || !slot_in_range(live_slot_id) ||
         !slot_in_range(src_slot_id)) {
-      validity_mask[i] = 0;
+      write_mask(i, 0);
       continue;
     }
     // Scheduler invariant: a resolved src slot implies a restore request. The
@@ -154,10 +166,10 @@ void restore_linear_state_slots(
                     "layer was copied; falling back to cold start. "
                     "live_slot_id="
                  << live_slot_id << ", src_slot_id=" << src_slot_id;
-      validity_mask[i] = 0;
+      write_mask(i, 0);
       continue;
     }
-    validity_mask[i] = 1;
+    write_mask(i, 1);
     VLOG(1) << "Qwen3.5 linear state checkpoint restored; live_slot_id="
             << live_slot_id << ", src_slot_id=" << src_slot_id;
   }
