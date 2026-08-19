@@ -332,10 +332,10 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   // num_accepted_tokens: mirror MTP default=1 per seq. Represents the initial
   // input token accepted from prefill. Kernel size CHECK only; MTP-tested
   // value.
-  // Use pre-expansion num_sequences (line 177) — post-expansion validate_input
-  // meta has num_sequences * num_val_tokens which sizes accepted_prefix_lengths
-  // wrong. Kernel expects size = original num_sequences.
-  std::vector<int32_t> accepted_prefix_lengths(num_sequences,
+  // Fix4: kernel expects per-token layout matching spec_input_builder.cpp:329
+  // (each spec-verify row is one entry). Revert Fix1's per-orig-seq size=8
+  // to per-token size=num_sequences*num_val_tokens=48. Value stays 4 (Iter 3).
+  std::vector<int32_t> accepted_prefix_lengths(num_sequences * num_val_tokens,
                                                num_speculative_tokens - 1);
   const auto token_options = validate_input.token_ids.options();
   validate_input.input_params.num_accepted_tokens_host.assign(
