@@ -285,10 +285,22 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
               timer.elapsed_seconds());
 
   // [spike:suffix-hybrid] Mirror MTP validate contract
-  // (mtp_worker_impl.cpp:2086): mark spec-verify path so hybrid gated
-  // delta net + linear_state_restore take the spec branch instead of
-  // asserting on q_seq_len contract. Suffix engine has already expanded
-  // the validate batch by num_speculative_tokens+1 rows above.
+  // (mtp_worker_impl.cpp:2086,2101-2107): mark spec-verify path AND populate
+  // num_accepted_tokens so hybrid gated delta net + linear_state_restore
+  // take the spec branch. Suffix engine has already expanded the validate
+  // batch by (num_speculative_tokens+1) rows above.
+  //
+  // num_accepted_tokens: mirror MTP default=1 per seq. Represents the initial
+  // input token accepted from prefill. Kernel size CHECK only; MTP-tested
+  // value.
+  const int32_t num_sequences_spec =
+      validate_input.input_params.meta.num_sequences;
+  std::vector<int32_t> accepted_prefix_lengths(num_sequences_spec, 1);
+  const auto token_options = validate_input.token_ids.options();
+  validate_input.input_params.num_accepted_tokens_host.assign(
+      accepted_prefix_lengths.begin(), accepted_prefix_lengths.end());
+  validate_input.input_params.num_accepted_tokens =
+      torch::tensor(accepted_prefix_lengths, token_options);
   validate_input.input_params.is_spec_verify = true;
   timer.reset();
   auto future = impl_->step_async(validate_input);
