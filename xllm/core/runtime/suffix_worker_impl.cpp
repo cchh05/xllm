@@ -305,6 +305,24 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
         std::move(q_cu_seq_lens_vec);
   }
 
+  // Fix2: patch parallel.query_start_loc (kernel eager path reads this,
+  // not attention.host.q_cu_seq_lens). Same size + values pattern:
+  // [0, num_val_tokens, 2*num_val_tokens, ..., num_sequences*num_val_tokens].
+  // Kernel + all non-spec branches expect size = num_sequences + 1.
+  {
+    std::vector<int64_t> qsl;
+    qsl.reserve(num_sequences + 1);
+    qsl.emplace_back(0);
+    for (int32_t s = 0; s < num_sequences; ++s) {
+      qsl.emplace_back(qsl.back() + num_val_tokens);
+    }
+    validate_input.input_params.parallel.query_start_loc = std::move(qsl);
+  }
+
+  // Fix2: write back meta.num_sequences to pre-expansion so any kernel path
+  // that reads it directly sees consistent value.
+  validate_input.input_params.meta.num_sequences = num_sequences;
+
   // [spike:suffix-hybrid] Mirror MTP validate contract
   // (mtp_worker_impl.cpp:2086,2101-2107): mark spec-verify path AND populate
   // num_accepted_tokens so hybrid gated delta net + linear_state_restore
