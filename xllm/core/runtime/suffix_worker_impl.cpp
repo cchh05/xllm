@@ -289,17 +289,17 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   // re-embeds on the expanded batch (MTP does this in the spec_verify guard).
   validate_input.input_params.embedding.input_embedding = torch::Tensor();
 
-  // Build q_cu_seq_lens from q_seq_lens (memory 08-12 line 76 warned this
-  // assumption; hybrid causal_conv1d + gated delta net read it in the
-  // spec_verify branch).
-  if (!validate_input.input_params.attention.host.q_seq_lens.empty()) {
+  // Build q_cu_seq_lens from pre-expansion q_seq_lens on `input` (NOT
+  // validate_input which post-expansion has num_val_tokens rows per orig
+  // seq). Each orig seq's q_len is num_val_tokens after batch expansion,
+  // so build cu_seq_lens as [0, num_val_tokens, 2*num_val_tokens, ...,
+  // num_sequences*num_val_tokens]. Kernel expects size = num_sequences+1.
+  {
     std::vector<int32_t> q_cu_seq_lens_vec;
-    q_cu_seq_lens_vec.reserve(validate_input.input_params.meta.num_sequences +
-                              1);
+    q_cu_seq_lens_vec.reserve(num_sequences + 1);
     q_cu_seq_lens_vec.emplace_back(0);
-    for (int32_t q_len :
-         validate_input.input_params.attention.host.q_seq_lens) {
-      q_cu_seq_lens_vec.emplace_back(q_cu_seq_lens_vec.back() + q_len);
+    for (int32_t s = 0; s < num_sequences; ++s) {
+      q_cu_seq_lens_vec.emplace_back(q_cu_seq_lens_vec.back() + num_val_tokens);
     }
     validate_input.input_params.attention.host.q_cu_seq_lens =
         std::move(q_cu_seq_lens_vec);
@@ -314,9 +314,10 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   // num_accepted_tokens: mirror MTP default=1 per seq. Represents the initial
   // input token accepted from prefill. Kernel size CHECK only; MTP-tested
   // value.
-  const int32_t num_sequences_spec =
-      validate_input.input_params.meta.num_sequences;
-  std::vector<int32_t> accepted_prefix_lengths(num_sequences_spec,
+  // Use pre-expansion num_sequences (line 177) — post-expansion validate_input
+  // meta has num_sequences * num_val_tokens which sizes accepted_prefix_lengths
+  // wrong. Kernel expects size = original num_sequences.
+  std::vector<int32_t> accepted_prefix_lengths(num_sequences,
                                                num_speculative_tokens - 1);
   const auto token_options = validate_input.token_ids.options();
   validate_input.input_params.num_accepted_tokens_host.assign(
