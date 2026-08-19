@@ -75,6 +75,20 @@ SuffixWorkerImpl::SuffixWorkerImpl(const ParallelArgs& parallel_args,
       options_.speculative_suffix_max_cached_requests());
 }
 
+// [spike:suffix-hybrid P1] Allocate embedding_cache_ mirror MTP
+// (mtp_worker_impl.cpp:735-747). Suffix has no draft model, so we do NOT
+// set_placeholder (Phase 2 will decide if any Suffix-specific placeholder
+// needed). Chain base to keep KV cache alloc happening.
+bool SuffixWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
+  if (!SpeculativeWorkerImpl::allocate_kv_cache(kv_cache_shape)) {
+    return false;
+  }
+  const int64_t num_blocks = kv_cache_shape.key_cache_shape()[0];
+  embedding_cache_ =
+      std::make_shared<EmbeddingCache>(static_cast<int32_t>(num_blocks));
+  return true;
+}
+
 std::optional<ForwardOutput> SuffixWorkerImpl::step_empty(
     const ForwardInput& input) {
   if (!input.input_params.meta.batch_forward_type.is_decode()) {
