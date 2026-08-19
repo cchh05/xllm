@@ -16,6 +16,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <optional>
+#include <sstream>
 #include <tuple>
 
 #include "xllm/core/kernels/npu/npu_ops_api.h"
@@ -737,6 +738,62 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       }
     } else {
       if (use_spec_verify) {
+        // [spike:suffix-diag] Non-invasive dump kernel params before crash.
+        // Only shape/dtype/numel/size - no .item()/.sum().item().
+        {
+          std::ostringstream oss;
+          oss << "conv_input dtype=" << conv_input.scalar_type()
+              << " sizes=" << conv_input.sizes()
+              << " numel=" << conv_input.numel();
+          LOG(ERROR) << "[suffix-diag] " << oss.str();
+        }
+        {
+          std::ostringstream oss;
+          oss << "conv_weight dtype=" << conv_weight.scalar_type()
+              << " sizes=" << conv_weight.sizes();
+          LOG(ERROR) << "[suffix-diag] " << oss.str();
+        }
+        {
+          std::ostringstream oss;
+          oss << "conv_cache dtype=" << conv_cache.scalar_type()
+              << " sizes=" << conv_cache.sizes();
+          LOG(ERROR) << "[suffix-diag] " << oss.str();
+        }
+        {
+          const auto& qsl = input_params.parallel.query_start_loc;
+          std::ostringstream oss;
+          oss << "query_start_loc size=" << qsl.size() << " [";
+          for (size_t i = 0; i < std::min<size_t>(8, qsl.size()); ++i) {
+            oss << qsl[i] << ",";
+          }
+          oss << "]";
+          LOG(ERROR) << "[suffix-diag] " << oss.str();
+        }
+        {
+          std::ostringstream oss;
+          oss << "linear_state_indices_host size="
+              << linear_state_indices_host.size() << " [";
+          for (size_t i = 0;
+               i < std::min<size_t>(8, linear_state_indices_host.size());
+               ++i) {
+            oss << linear_state_indices_host[i] << ",";
+          }
+          oss << "]";
+          LOG(ERROR) << "[suffix-diag] " << oss.str();
+        }
+        {
+          std::ostringstream oss;
+          oss << "num_accepted size=" << num_accepted.size() << " [";
+          for (size_t i = 0; i < std::min<size_t>(8, num_accepted.size());
+               ++i) {
+            oss << num_accepted[i] << ",";
+          }
+          oss << "]";
+          LOG(ERROR) << "[suffix-diag] " << oss.str();
+        }
+        LOG(ERROR) << "[suffix-diag] num_sequences="
+                   << input_params.meta.num_sequences
+                   << " is_spec_verify=" << input_params.is_spec_verify;
         torch::Tensor output = torch::empty_like(conv_input);
         xllm::kernel::causal_conv1d_out(
             output,
