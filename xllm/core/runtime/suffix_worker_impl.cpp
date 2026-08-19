@@ -284,6 +284,27 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
 
+  // [spike:suffix-hybrid] Mirror MTP Stage 2 fields
+  // (mtp_worker_impl.cpp:2085-2094). Clear input_embedding so the validate
+  // re-embeds on the expanded batch (MTP does this in the spec_verify guard).
+  validate_input.input_params.embedding.input_embedding = torch::Tensor();
+
+  // Build q_cu_seq_lens from q_seq_lens (memory 08-12 line 76 warned this
+  // assumption; hybrid causal_conv1d + gated delta net read it in the
+  // spec_verify branch).
+  if (!validate_input.input_params.attention.host.q_seq_lens.empty()) {
+    std::vector<int32_t> q_cu_seq_lens_vec;
+    q_cu_seq_lens_vec.reserve(validate_input.input_params.meta.num_sequences +
+                              1);
+    q_cu_seq_lens_vec.emplace_back(0);
+    for (int32_t q_len :
+         validate_input.input_params.attention.host.q_seq_lens) {
+      q_cu_seq_lens_vec.emplace_back(q_cu_seq_lens_vec.back() + q_len);
+    }
+    validate_input.input_params.attention.host.q_cu_seq_lens =
+        std::move(q_cu_seq_lens_vec);
+  }
+
   // [spike:suffix-hybrid] Mirror MTP validate contract
   // (mtp_worker_impl.cpp:2086,2101-2107): mark spec-verify path AND populate
   // num_accepted_tokens so hybrid gated delta net + linear_state_restore
