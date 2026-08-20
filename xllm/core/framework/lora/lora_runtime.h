@@ -32,6 +32,10 @@ limitations under the License.
 #include "lora_config.h"
 #include "lora_registry.h"
 
+#if defined(USE_NPU)
+#include <acl/acl.h>
+#endif
+
 namespace xllm {
 
 // LoRARuntime is the process-global singleton that ties the LoRA modules
@@ -323,6 +327,27 @@ class LoRARuntime {
  private:
   LoRARuntime() = default;
 
+#if defined(USE_NPU)
+ public:
+  // [h2d-overlap P2.3 A3] Set the dedicated LoRA load stream from
+  // WorkerImpl. Non-owning ptr; WorkerImpl owns the Stream lifetime.
+  // Called once per worker at model init before any adapter is loaded.
+  // nullptr means dual-stream disabled (fall back to Phase 1 same-stream).
+  void set_lora_load_stream(::aclrtStream stream) {
+    lora_load_stream_ = stream;
+  }
+  ::aclrtStream lora_load_stream() const { return lora_load_stream_; }
+
+  // Get or record an H2D-complete event for the given adapter int_id.
+  // Called during install_static_adapter_on_device[_per_proj] after
+  // aclrtMemcpyAsync H2D queue on lora_load_stream_. The event is
+  // then waited on before the delta is consumed by forward.
+  ::aclrtEvent get_or_create_h2d_event(uint64_t int_id);
+  ::aclrtEvent lookup_h2d_event(uint64_t int_id) const;
+
+ private:
+#endif
+
   // [h2d-overlap P1.4 Option B] Pinned host storage for adapter A/B
   // tensors, populated by install_static_adapter_on_device when it
   // issues aclrtMemcpyAsync H2D. Kept alive process-wide (never freed
@@ -331,6 +356,21 @@ class LoRARuntime {
   // LoRARegistry teardown-time; the leak is bounded by
   // max_loras static preload count (typical <10 adapters, ~50MB each).
   std::vector<void*> pinned_adapter_storage_;
+
+#if defined(USE_NPU)
+  // [h2d-overlap P2.3 A3] Dedicated LoRA H2D stream (non-owning),
+  // set by WorkerImpl. nullptr => dual-stream off, fall back to
+  // same-stream install (Phase 1 behavior).
+  ::aclrtStream lora_load_stream_ = nullptr;
+
+  // Per-adapter H2D-complete events. Recorded on lora_load_stream_
+  // after the install-loop queues its aclrtMemcpyAsync H2Ds.
+  // Consumed by forward path via aclrtStreamWaitEvent on
+  // compute stream before touching the adapter tensors.
+  // Events are owned; destructor releases them.
+  std::unordered_map<uint64_t, ::aclrtEvent> h2d_events_;
+  mutable std::mutex h2d_events_mu_;
+#endif
 
   // Called with materialise_mu_ held. Picks a plausible A/B pair from the
   // adapter's canonicalised tensor set. Result is CPU-side, dtype-cast to

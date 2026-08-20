@@ -35,6 +35,30 @@ LoRARuntime& LoRARuntime::instance() {
   return g;
 }
 
+#if defined(USE_NPU)
+::aclrtEvent LoRARuntime::get_or_create_h2d_event(uint64_t int_id) {
+  std::lock_guard<std::mutex> g(h2d_events_mu_);
+  auto it = h2d_events_.find(int_id);
+  if (it != h2d_events_.end()) return it->second;
+  ::aclrtEvent evt = nullptr;
+  const uint32_t flags = ACL_EVENT_SYNC;
+  aclError ret = aclrtCreateEventWithFlag(&evt, flags);
+  if (ret != ACL_SUCCESS) {
+    LOG(ERROR) << "[h2d-overlap] aclrtCreateEventWithFlag failed ret=" << ret
+               << " for int_id=" << int_id;
+    return nullptr;
+  }
+  h2d_events_[int_id] = evt;
+  return evt;
+}
+
+::aclrtEvent LoRARuntime::lookup_h2d_event(uint64_t int_id) const {
+  std::lock_guard<std::mutex> g(h2d_events_mu_);
+  auto it = h2d_events_.find(int_id);
+  return it == h2d_events_.end() ? nullptr : it->second;
+}
+#endif
+
 void LoRARuntime::init(const LoRAConfig& config) {
   {
     std::lock_guard g(materialise_mu_);
