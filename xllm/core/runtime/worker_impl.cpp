@@ -368,6 +368,13 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
     lora_load_stream_ = device_.get_stream_from_pool();
     LOG(INFO) << "[h2d-overlap P2] Allocated lora_load_stream for dual-stream "
                  "adapter H2D";
+    // [h2d-overlap P2.3e A3] Hand the stream to LoRARuntime so future
+    // adapter installs (static preload + hot-swap) issue aclrtMemcpyAsync
+    // on this stream and record per-adapter completion events.
+    if (lora_load_stream_ != nullptr) {
+      LoRARuntime::instance().set_lora_load_stream(
+          lora_load_stream_->get_stream()->stream());
+    }
   }
   worker_rendezvous_ =
       std::make_unique<WorkerRendezvous>(kv_cache_transfer_, weight_transfer_);
