@@ -504,7 +504,11 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device(
     // device. Subsequent kernel launches on the same stream serialize
     // behind this copy (stream ordering).
     const auto t_issue_begin = std::chrono::steady_clock::now();
-    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    // [h2d-overlap P2.3c A3] Prefer dedicated lora_load_stream_.
+    aclrtStream stream = lora_load_stream_;
+    if (stream == nullptr) {
+      stream = c10_npu::getCurrentNPUStream().stream();
+    }
     aclError memcpy_a = aclrtMemcpyAsync(A_dev.data_ptr(),
                                          A_bytes,
                                          A_pinned,
@@ -585,6 +589,22 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device(
     // load_and_activate() calls behave normally.
     pending_.reset();
   }
+  // [h2d-overlap P2.3c A3] whole-block install: record event after 2 H2Ds.
+  if (lora_load_stream_ != nullptr) {
+    ::aclrtEvent evt = get_or_create_h2d_event(*id_opt);
+    if (evt != nullptr) {
+      aclError rec = aclrtRecordEvent(evt, lora_load_stream_);
+      if (rec != ACL_SUCCESS) {
+        LOG(ERROR) << "[h2d-overlap P2.3c wb] aclrtRecordEvent failed ret="
+                   << rec << " for int_id=" << *id_opt;
+      } else {
+        LOG(INFO) << "[h2d-overlap P2.3c wb] recorded h2d_event for '"
+                  << lora_name << "' id=" << *id_opt
+                  << " on lora_load_stream (dual-stream active)";
+      }
+    }
+  }
+
   LOG(INFO) << "[LoRARuntime] installed static adapter '" << lora_name
             << "' id=" << *id_opt << " A_device=" << A_dev.device()
             << " A.shape=" << A_dev.sizes() << " B.shape=" << B_dev.sizes()
@@ -878,8 +898,12 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
       A_dev = torch::empty(A_cpu_owned.sizes(), dev_opts).contiguous();
       B_dev = torch::empty(B_cpu_owned.sizes(), dev_opts).contiguous();
 
-      // (3) Non-blocking H2D on current NPU stream.
-      aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+      // (3) [h2d-overlap P2.3c A3] Non-blocking H2D on lora_load_stream_
+      //     (falls back to current stream when not wired).
+      aclrtStream stream = lora_load_stream_;
+      if (stream == nullptr) {
+        stream = c10_npu::getCurrentNPUStream().stream();
+      }
       aclError memcpy_a = aclrtMemcpyAsync(A_dev.data_ptr(),
                                            A_bytes,
                                            A_pinned,
@@ -943,6 +967,24 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
     std::lock_guard g(materialise_mu_);
     per_proj_device_pool_[int_id] = std::move(per_proj);
   }
+  // [h2d-overlap P2.3c A3] Record ONE H2D-complete event on lora_load_stream_
+  // after all per-(layer,proj) aclrtMemcpyAsync H2Ds queued. Forward path
+  // waits this event before touching delta tensors.
+  if (lora_load_stream_ != nullptr && installed > 0) {
+    ::aclrtEvent evt = get_or_create_h2d_event(int_id);
+    if (evt != nullptr) {
+      aclError rec = aclrtRecordEvent(evt, lora_load_stream_);
+      if (rec != ACL_SUCCESS) {
+        LOG(ERROR) << "[h2d-overlap P2.3c] aclrtRecordEvent failed ret=" << rec
+                   << " for int_id=" << int_id;
+      } else {
+        LOG(INFO) << "[h2d-overlap P2.3c] recorded h2d_event for '" << lora_name
+                  << "' id=" << int_id
+                  << " on lora_load_stream (dual-stream active)";
+      }
+    }
+  }
+
   LOG(INFO) << "[LoRARuntime] installed per-proj adapter '" << lora_name
             << "' id=" << int_id << " slots=" << installed
             << " skipped=" << skipped << " r=" << adapter_opt->r
