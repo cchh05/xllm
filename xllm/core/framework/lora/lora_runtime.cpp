@@ -812,8 +812,88 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
     // ATB backend doesn't run per-proj anyway.
     (void)tp;
 
-    // .to(device, dtype)
+    // [h2d-overlap P1.4b Option B] Per-proj pinned host + aclrtMemcpyAsync
+    // on getCurrentNPUStream(). Same pattern as line 398 whole-block variant.
+    // Same-stream implies correctness safe but no TTFT overlap in Phase 1;
+    // Phase 2 dual-stream + event will unlock real overlap.
     torch::Tensor A_dev, B_dev;
+#if defined(USE_NPU)
+    try {
+      // (1) CPU-side dtype cast into fresh heap (safetensors mmap not
+      // directly aclrtMemcpyAsync-compatible).
+      auto cpu_target_opts =
+          torch::TensorOptions().dtype(dtype).device(torch::kCPU);
+      torch::Tensor A_cpu_owned =
+          A_cpu.to(cpu_target_opts, /*non_blocking=*/false, /*copy=*/true)
+              .contiguous();
+      torch::Tensor B_cpu_owned =
+          B_cpu.to(cpu_target_opts, /*non_blocking=*/false, /*copy=*/true)
+              .contiguous();
+
+      const size_t A_bytes = A_cpu_owned.nbytes();
+      const size_t B_bytes = B_cpu_owned.nbytes();
+      void* A_pinned = nullptr;
+      void* B_pinned = nullptr;
+      aclError alloc_a = aclrtMallocHost(&A_pinned, A_bytes);
+      aclError alloc_b = aclrtMallocHost(&B_pinned, B_bytes);
+      if (alloc_a != ACL_SUCCESS || alloc_b != ACL_SUCCESS) {
+        if (A_pinned) aclrtFreeHost(A_pinned);
+        if (B_pinned) aclrtFreeHost(B_pinned);
+        LOG(ERROR) << "[h2d-overlap-perproj] aclrtMallocHost failed '"
+                   << lora_name << "' key=layers." << pk.layer_index << "."
+                   << pk.proj_name << " A_ret=" << alloc_a
+                   << " B_ret=" << alloc_b;
+        ++skipped;
+        continue;
+      }
+      std::memcpy(A_pinned, A_cpu_owned.data_ptr(), A_bytes);
+      std::memcpy(B_pinned, B_cpu_owned.data_ptr(), B_bytes);
+
+      // (2) Device torch::empty for autograd-compatible destination.
+      auto dev_opts = torch::TensorOptions().dtype(dtype).device(device);
+      A_dev = torch::empty(A_cpu_owned.sizes(), dev_opts).contiguous();
+      B_dev = torch::empty(B_cpu_owned.sizes(), dev_opts).contiguous();
+
+      // (3) Non-blocking H2D on current NPU stream.
+      aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+      aclError memcpy_a = aclrtMemcpyAsync(A_dev.data_ptr(),
+                                           A_bytes,
+                                           A_pinned,
+                                           A_bytes,
+                                           ACL_MEMCPY_HOST_TO_DEVICE,
+                                           stream);
+      aclError memcpy_b = aclrtMemcpyAsync(B_dev.data_ptr(),
+                                           B_bytes,
+                                           B_pinned,
+                                           B_bytes,
+                                           ACL_MEMCPY_HOST_TO_DEVICE,
+                                           stream);
+      if (memcpy_a != ACL_SUCCESS || memcpy_b != ACL_SUCCESS) {
+        aclrtFreeHost(A_pinned);
+        aclrtFreeHost(B_pinned);
+        LOG(ERROR) << "[h2d-overlap-perproj] aclrtMemcpyAsync failed '"
+                   << lora_name << "' key=layers." << pk.layer_index << "."
+                   << pk.proj_name << " A_ret=" << memcpy_a
+                   << " B_ret=" << memcpy_b;
+        ++skipped;
+        continue;
+      }
+      pinned_adapter_storage_.push_back(A_pinned);
+      pinned_adapter_storage_.push_back(B_pinned);
+
+      LOG_EVERY_N(INFO, 50)
+          << "[h2d-overlap-perproj] '" << lora_name
+          << "' layer=" << pk.layer_index << " proj=" << pk.proj_name
+          << " A_bytes=" << A_bytes << " B_bytes=" << B_bytes;
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "[h2d-overlap-perproj] pinned+async failed for '"
+                 << lora_name << "' key=layers." << pk.layer_index << "."
+                 << pk.proj_name << ": " << e.what();
+      ++skipped;
+      continue;
+    }
+#else
+    // Non-NPU legacy path unchanged.
     try {
       A_dev = A_cpu.to(device, dtype).contiguous();
       B_dev = B_cpu.to(device, dtype).contiguous();
@@ -824,6 +904,7 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
       ++skipped;
       continue;
     }
+#endif
 
     ProjDelta pd;
     pd.A = A_dev;
