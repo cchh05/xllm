@@ -377,6 +377,13 @@ class WorkerImpl {
   std::unique_ptr<MooncakeWeightTransfer> weight_transfer_;
   std::unique_ptr<Stream> load_stream_;
 
+  // [h2d-overlap P2.3 Option A3] Dedicated LoRA H2D stream, only
+  // created when --enable_lora=true. Non-owning ptr shared with
+  // LoRARuntime via set_load_stream(). Enables adapter install H2D
+  // to run on this stream while forward runs on compute_stream_,
+  // with per-adapter aclrtEvent coordinating cross-stream sync.
+  std::unique_ptr<Stream> lora_load_stream_;
+
   // Lazily-built cache backing npu_cp_plan_runtime_config().
   mutable bool npu_cp_runtime_config_computed_ = false;
   mutable CpPlanRuntimeConfig npu_cp_runtime_config_;

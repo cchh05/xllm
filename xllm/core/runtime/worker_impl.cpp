@@ -361,6 +361,14 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
   if (::xllm::LoadConfig::get_instance().enable_rolling_load()) {
     load_stream_ = device_.get_stream_from_pool();
   }
+  // [h2d-overlap P2.3 Option A3] Allocate a dedicated LoRA H2D stream
+  // when LoRA is enabled. Kept nullptr otherwise so non-LoRA
+  // deployments incur zero overhead.
+  if (FLAGS_enable_lora) {
+    lora_load_stream_ = device_.get_stream_from_pool();
+    LOG(INFO) << "[h2d-overlap P2] Allocated lora_load_stream for dual-stream "
+                 "adapter H2D";
+  }
   worker_rendezvous_ =
       std::make_unique<WorkerRendezvous>(kv_cache_transfer_, weight_transfer_);
 #else
