@@ -323,6 +323,15 @@ class LoRARuntime {
  private:
   LoRARuntime() = default;
 
+  // [h2d-overlap P1.4 Option B] Pinned host storage for adapter A/B
+  // tensors, populated by install_static_adapter_on_device when it
+  // issues aclrtMemcpyAsync H2D. Kept alive process-wide (never freed
+  // during runtime) because there is no per-adapter completion event
+  // in this Phase 1 minimal wire. Freed only at process exit via
+  // LoRARegistry teardown-time; the leak is bounded by
+  // max_loras static preload count (typical <10 adapters, ~50MB each).
+  std::vector<void*> pinned_adapter_storage_;
+
   // Called with materialise_mu_ held. Picks a plausible A/B pair from the
   // adapter's canonicalised tensor set. Result is CPU-side, dtype-cast to
   // the model dtype but kept off-device.

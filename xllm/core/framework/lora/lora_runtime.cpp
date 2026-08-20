@@ -23,7 +23,10 @@ limitations under the License.
 
 #if defined(USE_NPU)
 #include <acl/acl.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
 #endif
+
+#include <chrono>
 
 namespace xllm {
 
@@ -392,27 +395,154 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device(
   // Strategy: build a fresh CPU tensor via torch::empty (same allocator as
   // V60 randn) and copy_ from mmap tensor - this materializes into normal
   // heap. Then .to(device) proceeds.
+  // [h2d-overlap P1.4 Option B] Replace blocking `.to(device, dtype)` with
+  // pinned host + aclrtMemcpyAsync on getCurrentNPUStream(). Mirrors base
+  // weight loader pattern (xllm/core/layers/npu/loader/base_loader.cpp:487
+  // aclrtMallocHost, :519 copy_weights_to_device_async). Rationale in
+  // reference_lora_h2d_overlap_direction_2026_08_20.
+  //
+  // Flow:
+  //   1. Cast A_cpu/B_cpu to target dtype on CPU (torch handles bf16 cast)
+  //   2. Allocate pinned host storage via aclrtMallocHost, memcpy into it
+  //   3. Allocate destination device torch::Tensor via torch::empty(...)
+  //   4. aclrtMemcpyAsync H2D on current NPU stream (non-blocking issue)
+  //   5. Track pinned host in pinned_adapter_storage_ for later aclrtFreeHost
+  //
+  // Overlap: aclrtMemcpyAsync issues on the same stream as subsequent
+  // forward ops. On NPU, kernel launches queued after this H2D wait
+  // automatically until it completes (stream ordering), while the caller
+  // thread returns immediately from install_static_adapter_on_device.
+  // Any request that arrives while H2D is in-flight has its target-model
+  // kernel dispatch overlap with the H2D on the same stream.
   torch::Tensor A_dev, B_dev;
+#if defined(USE_NPU)
   try {
-    LOG(INFO) << "[LoRARuntime] materializing A_cpu via torch::empty+copy_";
+    LOG(INFO) << "[h2d-overlap] adapter='" << lora_name
+              << "' begin: A.sizes=" << A_cpu.sizes()
+              << " B.sizes=" << B_cpu.sizes() << " target_dtype=" << dtype;
+
+    // (1) CPU-side cast to target dtype. .to() on CPU is not the H2D copy;
+    // it is a dtype conversion into a normal heap buffer (safetensors mmap
+    // storage cannot be aclrtMemcpyAsync'd directly, see 07-06 finding).
+    const auto t_cast_begin = std::chrono::steady_clock::now();
+    auto cpu_target_opts =
+        torch::TensorOptions().dtype(dtype).device(torch::kCPU);
+    torch::Tensor A_cpu_owned =
+        A_cpu.to(cpu_target_opts, /*non_blocking=*/false, /*copy=*/true)
+            .contiguous();
+    torch::Tensor B_cpu_owned =
+        B_cpu.to(cpu_target_opts, /*non_blocking=*/false, /*copy=*/true)
+            .contiguous();
+    const auto t_cast_end = std::chrono::steady_clock::now();
+    const auto cast_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             t_cast_end - t_cast_begin)
+                             .count();
+
+    // (2) Allocate pinned host + memcpy. Bytes are contiguous per-tensor.
+    const size_t A_bytes = A_cpu_owned.nbytes();
+    const size_t B_bytes = B_cpu_owned.nbytes();
+    void* A_pinned = nullptr;
+    void* B_pinned = nullptr;
+    const auto t_alloc_begin = std::chrono::steady_clock::now();
+    aclError alloc_ret_a = aclrtMallocHost(&A_pinned, A_bytes);
+    aclError alloc_ret_b = aclrtMallocHost(&B_pinned, B_bytes);
+    const auto t_alloc_end = std::chrono::steady_clock::now();
+    const auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              t_alloc_end - t_alloc_begin)
+                              .count();
+    if (alloc_ret_a != ACL_SUCCESS || alloc_ret_b != ACL_SUCCESS) {
+      if (A_pinned) aclrtFreeHost(A_pinned);
+      if (B_pinned) aclrtFreeHost(B_pinned);
+      LOG(ERROR) << "[h2d-overlap] aclrtMallocHost failed A_ret=" << alloc_ret_a
+                 << " B_ret=" << alloc_ret_b << " A_bytes=" << A_bytes
+                 << " B_bytes=" << B_bytes;
+      return std::nullopt;
+    }
+
+    const auto t_memcpy_begin = std::chrono::steady_clock::now();
+    std::memcpy(A_pinned, A_cpu_owned.data_ptr(), A_bytes);
+    std::memcpy(B_pinned, B_cpu_owned.data_ptr(), B_bytes);
+    const auto t_memcpy_end = std::chrono::steady_clock::now();
+    const auto memcpy_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(t_memcpy_end -
+                                                              t_memcpy_begin)
+            .count();
+
+    // (3) Allocate destination device tensors via torch. torch_npu will
+    // give us aclrtMallocAlign32-backed storage attached to the caching
+    // allocator, correctly registered with autograd/device metadata.
+    auto dev_opts = torch::TensorOptions().dtype(dtype).device(device);
+    A_dev = torch::empty(A_cpu_owned.sizes(), dev_opts);
+    B_dev = torch::empty(B_cpu_owned.sizes(), dev_opts);
+
+    // (4) Issue aclrtMemcpyAsync on the caller (ctor) thread's current NPU
+    // stream. Non-blocking issue; caller returns before H2D completes on
+    // device. Subsequent kernel launches on the same stream serialize
+    // behind this copy (stream ordering).
+    const auto t_issue_begin = std::chrono::steady_clock::now();
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    aclError memcpy_a = aclrtMemcpyAsync(A_dev.data_ptr(),
+                                         A_bytes,
+                                         A_pinned,
+                                         A_bytes,
+                                         ACL_MEMCPY_HOST_TO_DEVICE,
+                                         stream);
+    aclError memcpy_b = aclrtMemcpyAsync(B_dev.data_ptr(),
+                                         B_bytes,
+                                         B_pinned,
+                                         B_bytes,
+                                         ACL_MEMCPY_HOST_TO_DEVICE,
+                                         stream);
+    const auto t_issue_end = std::chrono::steady_clock::now();
+    const auto issue_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                              t_issue_end - t_issue_begin)
+                              .count();
+    if (memcpy_a != ACL_SUCCESS || memcpy_b != ACL_SUCCESS) {
+      aclrtFreeHost(A_pinned);
+      aclrtFreeHost(B_pinned);
+      LOG(ERROR) << "[h2d-overlap] aclrtMemcpyAsync failed A_ret=" << memcpy_a
+                 << " B_ret=" << memcpy_b;
+      return std::nullopt;
+    }
+
+    // (5) Track pinned host storage. It cannot be freed until H2D completes
+    // on device (would corrupt in-flight copy). Store here and free in
+    // destructor after full stream sync at shutdown. For hot-swap this
+    // leaks per-load, acceptable for Phase 1 static preload path (single
+    // load per lifetime). Phase 2 will free after event-based completion
+    // signal.
+    pinned_adapter_storage_.push_back(A_pinned);
+    pinned_adapter_storage_.push_back(B_pinned);
+
+    LOG(INFO) << "[h2d-overlap] adapter='" << lora_name
+              << "' cast_us=" << cast_us << " alloc_us=" << alloc_us
+              << " memcpy_us=" << memcpy_us << " h2d_issue_us=" << issue_us
+              << " A_bytes=" << A_bytes << " B_bytes=" << B_bytes
+              << " A_dev.device=" << A_dev.device()
+              << " B_dev.device=" << B_dev.device();
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "[h2d-overlap] pinned+async H2D failed for '" << lora_name
+               << "': " << e.what();
+    return std::nullopt;
+  }
+#else
+  // Non-NPU build falls back to blocking torch .to(device) (unchanged
+  // legacy path).
+  try {
     auto cpu_opts =
         torch::TensorOptions().dtype(A_cpu.dtype()).device(torch::kCPU);
     torch::Tensor A_cpu_owned = torch::empty(A_cpu.sizes(), cpu_opts);
     A_cpu_owned.copy_(A_cpu);
     torch::Tensor B_cpu_owned = torch::empty(B_cpu.sizes(), cpu_opts);
     B_cpu_owned.copy_(B_cpu);
-    LOG(INFO) << "[LoRARuntime] materialized; casting + moving to " << device;
     A_dev = A_cpu_owned.to(device, dtype);
-    LOG(INFO) << "[LoRARuntime] A_dev on " << A_dev.device()
-              << " dtype=" << A_dev.dtype() << " sizes=" << A_dev.sizes();
     B_dev = B_cpu_owned.to(device, dtype);
-    LOG(INFO) << "[LoRARuntime] B_dev on " << B_dev.device()
-              << " dtype=" << B_dev.dtype() << " sizes=" << B_dev.sizes();
   } catch (const std::exception& e) {
     LOG(ERROR) << "[LoRARuntime] .to(device) failed for static adapter '"
                << lora_name << "': " << e.what();
     return std::nullopt;
   }
+#endif
 
   const auto id_opt = registry_.register_adapter(req);
   if (!id_opt) return std::nullopt;
