@@ -345,6 +345,13 @@ class LoRARuntime {
   ::aclrtEvent get_or_create_h2d_event(uint64_t int_id);
   ::aclrtEvent lookup_h2d_event(uint64_t int_id) const;
 
+  // [h2d-overlap P2.3d A3] Called from forward path before touching
+  // adapter tensors. On the caller's current compute stream, waits
+  // for the H2D-complete event recorded in P2.3c install. Cheap
+  // no-op if event already signaled. Skip when dual-stream off
+  // (event never recorded).
+  void wait_h2d_ready_for(uint64_t int_id);
+
  private:
 #endif
 

@@ -57,6 +57,23 @@ LoRARuntime& LoRARuntime::instance() {
   auto it = h2d_events_.find(int_id);
   return it == h2d_events_.end() ? nullptr : it->second;
 }
+
+void LoRARuntime::wait_h2d_ready_for(uint64_t int_id) {
+  // Dual-stream off: no event was recorded, forward path already
+  // serialized behind H2D on same stream (Phase 1 P1.4/P1.4b behavior).
+  if (lora_load_stream_ == nullptr) return;
+  ::aclrtEvent evt = lookup_h2d_event(int_id);
+  if (evt == nullptr) return;  // no install seen yet for this int_id
+
+  // Wait event on current compute NPU stream. Subsequent kernel launches
+  // on this stream execute after H2D completes on device.
+  aclrtStream compute = c10_npu::getCurrentNPUStream().stream();
+  aclError ret = aclrtStreamWaitEvent(compute, evt);
+  if (ret != ACL_SUCCESS) {
+    LOG(ERROR) << "[h2d-overlap P2.3d] aclrtStreamWaitEvent failed ret=" << ret
+               << " for int_id=" << int_id;
+  }
+}
 #endif
 
 void LoRARuntime::init(const LoRAConfig& config) {

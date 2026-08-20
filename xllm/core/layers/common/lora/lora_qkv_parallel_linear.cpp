@@ -142,6 +142,12 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
     }
     if (single_adapter && sole_aid != 0) {
       auto& runtime = LoRARuntime::instance();
+#if defined(USE_NPU)
+      // [h2d-overlap P2.3d A3] Wait H2D-complete event on compute stream
+      // before reading adapter tensors. No-op when dual-stream off (event
+      // never recorded) or when event already signaled.
+      runtime.wait_h2d_ready_for(sole_aid);
+#endif
       const auto* q_pd =
           runtime.get_per_proj_delta(sole_aid, ctx->layer_index, "q_proj");
       const auto* k_pd =
@@ -198,6 +204,11 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
     const int32_t seq_len = q_seq_lens[seq_idx];
     if (seq_len <= 0) continue;
     const uint64_t aid = adapter_ids[seq_idx];
+#if defined(USE_NPU)
+    // [h2d-overlap P2.3d A3] Wait H2D-complete for this adapter before
+    // reading its tensors. Repeat calls with same event are cheap.
+    if (aid != 0) runtime.wait_h2d_ready_for(aid);
+#endif
     if (aid == 0) {
       tok_off += seq_len;
       continue;
