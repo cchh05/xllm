@@ -24,6 +24,7 @@ cc_library(
     lora_context.h
     lora_metrics.h
     lora_block_pool.h
+    lora_kv_dependency_tree.h
   SRCS
     lora_config.cpp
     lora_registry.cpp
@@ -32,6 +33,7 @@ cc_library(
     lora_context.cpp
     lora_metrics.cpp
     lora_block_pool.cpp
+    lora_kv_dependency_tree.cpp
   DEPS
     :state_dict
     glog::glog
