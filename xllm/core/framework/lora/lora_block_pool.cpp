@@ -108,18 +108,28 @@ torch::Tensor LoRABlockPool::tensor_view(int32_t block_id,
   CHECK_GE(block_id, 0) << "LoRABlockPool::tensor_view: block_id < 0";
   CHECK_LT(block_id, static_cast<int32_t>(num_total_blocks_))
       << "LoRABlockPool::tensor_view: block_id out of range";
-  // Byte-offset into the flat bf16 slab.
-  const int64_t start_elem = static_cast<int64_t>(block_id) *
-                             static_cast<int64_t>(block_bytes_) /
-                             static_cast<int64_t>(sizeof(uint16_t));
-  const int64_t num_elems_block = static_cast<int64_t>(block_bytes_) /
-                                  static_cast<int64_t>(sizeof(uint16_t));
-  // Narrow (flat) then view to caller shape.
-  torch::Tensor block_view = slab_.narrow(0, start_elem, num_elems_block);
-  if (dtype != torch::kBFloat16) {
-    block_view = block_view.view(dtype);
+  // Compute caller element count and required bytes.
+  int64_t caller_elems = 1;
+  for (int64_t d : sizes) {
+    caller_elems *= d;
   }
-  return block_view.view(sizes);
+  const int64_t elem_size_bytes = torch::elementSize(dtype);
+  const int64_t caller_bytes = caller_elems * elem_size_bytes;
+  CHECK_LE(caller_bytes, static_cast<int64_t>(block_bytes_))
+      << "LoRABlockPool::tensor_view: caller shape " << sizes << " needs "
+      << caller_bytes << " bytes, exceeds block_bytes " << block_bytes_;
+  const int64_t start_elem_bf16 = static_cast<int64_t>(block_id) *
+                                  static_cast<int64_t>(block_bytes_) /
+                                  static_cast<int64_t>(sizeof(uint16_t));
+  const int64_t caller_elems_bf16 =
+      (caller_bytes + static_cast<int64_t>(sizeof(uint16_t)) - 1) /
+      static_cast<int64_t>(sizeof(uint16_t));
+  torch::Tensor slice_bf16 =
+      slab_.narrow(0, start_elem_bf16, caller_elems_bf16);
+  if (dtype == torch::kBFloat16) {
+    return slice_bf16.view(sizes);
+  }
+  return slice_bf16.view(dtype).view(sizes);
 }
 
 uint32_t LoRABlockPool::num_free_blocks() const {
