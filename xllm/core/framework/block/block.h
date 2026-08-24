@@ -52,6 +52,11 @@ enum class BlockType : int8_t {
                   // from LinearStateBlockManager; exported via
   // get_linear_block_id() (linear_state_ids). Also the cache group
   // for the conv/ssm recurrent-state KV tensors.
+  LORA_A = 6,  // [FASTLIBRA Phase 0] LoRA adapter A matrix block,
+               // slab-allocated by LoRABlockPool. Not sequence-scoped; keyed by
+               // (adapter_int_id, layer, proj). Phase 1 dependency
+               // tree links these to KV subtrees.
+  LORA_B = 7,  // [FASTLIBRA Phase 0] LoRA adapter B matrix block, same scheme.
 };
 
 // Fixed column order of worker multi_block_tables. The exported tables must

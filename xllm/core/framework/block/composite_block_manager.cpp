@@ -65,6 +65,8 @@ bool leaf_participates_in_prefix_cache(BlockType type,
     case BlockType::SWA:
     case BlockType::LINEAR:
     case BlockType::EMBEDDING:
+    case BlockType::LORA_A:
+    case BlockType::LORA_B:
       return false;
   }
   // Fail loudly on unhandled BlockType. Falling back to false would silently
