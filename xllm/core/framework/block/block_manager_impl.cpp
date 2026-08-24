@@ -18,7 +18,12 @@ limitations under the License.
 
 #include <unordered_set>
 
+#include "framework/lora/lora_kv_dependency_tree.h"
+#include "framework/lora/lora_registry.h"
+#include "framework/lora/lora_request.h"
+#include "framework/lora/lora_runtime.h"
 #include "framework/prefix_cache/prefix_cache_factory.h"
+#include "framework/request/sequence.h"
 namespace xllm {
 namespace {
 
@@ -260,6 +265,29 @@ std::optional<std::vector<Block>> BlockManagerImpl::allocate_for_sequence(
   std::vector<Block> blocks = allocate(num_additional);
   if (blocks.size() != num_additional) {
     return std::nullopt;
+  }
+  // [FASTLIBRA Phase 1.D] Register newly-allocated KV blocks in the
+  // LoRA/KV dependency tree, keyed by the sequence's adapter. Only
+  // flat-KV managers participate (SWA/C4/C128/EMBEDDING/LINEAR skipped).
+  // Base sequences (adapter_id == 0) skip -- their KV lives outside
+  // the tree, per P1.A design.
+  if (block_type() == BlockType::KV && seq->adapter_id() != 0 &&
+      !blocks.empty()) {
+    auto adapter_req =
+        LoRARuntime::instance().registry().lookup(seq->adapter_id());
+    if (adapter_req.has_value()) {
+      const size_t bytes_est = static_cast<size_t>(block_size_);
+      for (const Block& b : blocks) {
+        const uint64_t key = (static_cast<uint64_t>(seq->seq_id()) << 20) |
+                             static_cast<uint64_t>(b.id());
+        LoRAKVDependencyTree::instance().register_kv(
+            adapter_req->lora_name,
+            key,
+            static_cast<int64_t>(b.id()),
+            /*layer=*/-1,
+            bytes_est);
+      }
+    }
   }
   return blocks;
 }
