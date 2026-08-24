@@ -29,6 +29,7 @@ limitations under the License.
 #include <unordered_map>
 
 #include "adapter_loader.h"
+#include "lora_block_pool.h"
 #include "lora_config.h"
 #include "lora_registry.h"
 
@@ -341,6 +342,15 @@ class LoRARuntime {
     uint64_t int_id;
   };
   std::optional<PendingDelta> pending_;
+
+  // [FASTLIBRA Phase 0.3c] Lazy-init LoRA block pool. Created on
+  // first per-proj install to size block_bytes to fit the largest
+  // adapter tensor observed. Phase 1 replaces this with a
+  // pool shared with KV BlockManager via dependency tree.
+  std::unique_ptr<LoRABlockPool> lora_block_pool_;
+  // Track allocated block ids per (int_id, proj_key) so unload
+  // returns them. Phase 0 keeps a flat list per int_id.
+  std::unordered_map<uint64_t, std::vector<int32_t>> per_int_id_pool_blocks_;
 
   mutable std::mutex materialise_mu_;
   LoRAConfig config_;

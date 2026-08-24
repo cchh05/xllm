@@ -682,13 +682,63 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
     // ATB backend doesn't run per-proj anyway.
     (void)tp;
 
-    // .to(device, dtype)
+    // [FASTLIBRA Phase 0.3c] Allocate 2 slab blocks (one for A, one for B)
+    // from LoRABlockPool (lazy init on first call) instead of ad-hoc
+    // torch::empty. This is a functional no-op for correctness (bit-exact
+    // same tensor content), but routes the device storage through a
+    // block-shaped pool so Phase 1 can layer a dependency tree on top
+    // without touching this install path again.
     torch::Tensor A_dev, B_dev;
     try {
-      A_dev = A_cpu.to(device, dtype).contiguous();
-      B_dev = B_cpu.to(device, dtype).contiguous();
+      // Materialize adapter A/B on device via regular torch .to() first,
+      // to get sizes + bf16 content in a normal device tensor.
+      auto A_dev_tmp = A_cpu.to(device, dtype).contiguous();
+      auto B_dev_tmp = B_cpu.to(device, dtype).contiguous();
+
+      // Lazy-init pool. Block size = 1 MiB (fits rank <=128 × hidden <=6144
+      // bf16). num_blocks = 2048 (up to ~5 typical adapters worth).
+      // Sizes chosen conservative for Phase 0; Phase 1 will make them
+      // config-driven / auto-sized from model args.
+      if (lora_block_pool_ == nullptr) {
+        LoRABlockPool::Options pool_opts;
+        pool_opts.num_blocks = 2048;
+        pool_opts.block_bytes = 1024 * 1024;  // 1 MiB
+        pool_opts.device = device;
+        lora_block_pool_ = std::make_unique<LoRABlockPool>(pool_opts);
+      }
+
+      const size_t A_bytes = A_dev_tmp.nbytes();
+      const size_t B_bytes = B_dev_tmp.nbytes();
+      if (A_bytes > lora_block_pool_->block_bytes() ||
+          B_bytes > lora_block_pool_->block_bytes()) {
+        LOG(ERROR) << "[FASTLIBRA] adapter tensor larger than block_bytes; "
+                   << "A_bytes=" << A_bytes << " B_bytes=" << B_bytes
+                   << " block_bytes=" << lora_block_pool_->block_bytes();
+        ++skipped;
+        continue;
+      }
+      auto ids = lora_block_pool_->allocate(2);
+      if (ids.size() != 2) {
+        LOG(ERROR) << "[FASTLIBRA] LoRABlockPool OOM claiming 2 blocks for '"
+                   << lora_name << "' layer=" << pk.layer_index
+                   << " proj=" << pk.proj_name;
+        ++skipped;
+        continue;
+      }
+      const int32_t block_a = ids[0];
+      const int32_t block_b = ids[1];
+
+      // Create views over the block slots reshaped to the tensor's shape,
+      // then copy content in. .copy_() runs on device and preserves stream
+      // ordering with subsequent forward ops on same stream.
+      A_dev = lora_block_pool_->tensor_view(block_a, A_dev_tmp.sizes(), dtype);
+      B_dev = lora_block_pool_->tensor_view(block_b, B_dev_tmp.sizes(), dtype);
+      A_dev.copy_(A_dev_tmp);
+      B_dev.copy_(B_dev_tmp);
+      per_int_id_pool_blocks_[int_id].push_back(block_a);
+      per_int_id_pool_blocks_[int_id].push_back(block_b);
     } catch (const std::exception& e) {
-      LOG(ERROR) << "[LoRARuntime] per-proj .to(device) failed for '"
+      LOG(ERROR) << "[FASTLIBRA] per-proj block-pool install failed for '"
                  << lora_name << "' key=layers." << pk.layer_index << "."
                  << pk.proj_name << ": " << e.what();
       ++skipped;
