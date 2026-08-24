@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <mutex>
 
+#include "lora_kv_dependency_tree.h"
 #include "lora_metrics.h"
 
 #if defined(USE_NPU)
@@ -484,6 +485,10 @@ bool LoRARuntime::unload(const std::string& lora_name) {
       LOG(INFO) << "[LoRARuntime] deactivated pending '" << lora_name << "'";
     }
   }
+  // [FASTLIBRA Phase 1.C] Drop the adapter's subtree from the LoRA/KV
+  // dependency tree. This also drops any KV children attached under
+  // this adapter (P1.D will start populating those).
+  LoRAKVDependencyTree::instance().unregister_lora(lora_name);
   return ok;
 }
 
@@ -765,6 +770,16 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
   // P1-D: adapter is now active on device.
   LoRAMetrics::instance().set_state(int_id, 1);
   LoRAMetrics::instance().set_device_slots(int_id, installed);
+  // [FASTLIBRA Phase 1.C] Register the newly-installed adapter as a
+  // subtree root under the LoRA/KV dependency tree. Phase 2 will
+  // consult the tree to make swap decisions.
+  {
+    const uint64_t total_bytes =
+        static_cast<uint64_t>(installed) * 2ULL *
+        (lora_block_pool_ ? lora_block_pool_->block_bytes() : 0ULL);
+    LoRAKVDependencyTree::instance().register_lora(
+        lora_name, static_cast<int64_t>(int_id), total_bytes);
+  }
   return int_id;
 }
 
