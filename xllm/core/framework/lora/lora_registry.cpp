@@ -153,6 +153,15 @@ bool LoRARegistry::contains(uint64_t int_id) const {
   return id_to_entry_.find(int_id) != id_to_entry_.end();
 }
 
+bool LoRARegistry::is_unloading(const std::string& lora_name) const {
+  std::shared_lock lock(mu_);
+  auto it = name_to_id_.find(lora_name);
+  if (it == name_to_id_.end()) return false;
+  auto entry_it = id_to_entry_.find(it->second);
+  if (entry_it == id_to_entry_.end()) return false;
+  return entry_it->second.unloading;
+}
+
 std::vector<LoRARequest> LoRARegistry::list() const {
   std::shared_lock lock(mu_);
   std::vector<LoRARequest> out;
