@@ -29,7 +29,11 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "framework/batch/batch_factory.h"
 #include "framework/lora/lora_config.h"
+#include "framework/lora/lora_kv_dependency_tree.h"
 #include "framework/lora/lora_metrics.h"
+#include "framework/lora/lora_registry.h"
+#include "framework/lora/lora_request.h"
+#include "framework/lora/lora_runtime.h"
 #include "framework/request/priority_comparator.h"
 #include "util/timer.h"
 #include "util/utils.h"
@@ -150,6 +154,20 @@ std::vector<std::shared_ptr<Request>> SchedulerPolicy::collect_finished(
     if (request->finished() || request->cancelled()) {
       clear_mtp_bootstrap(request.get(), state);
       state.kv_cache_manager->deallocate(request.get());
+      // [FASTLIBRA Phase 1.C+] Decrement ref count on LoRA subtree.
+      // Matches the inc_ref at admit site above.
+      {
+        const uint64_t fin_aid =
+            !request->sequences().empty() && request->sequences()[0]
+                ? request->sequences()[0]->adapter_id()
+                : 0;
+        if (fin_aid != 0) {
+          auto adapter_req = LoRARuntime::instance().registry().lookup(fin_aid);
+          if (adapter_req.has_value()) {
+            LoRAKVDependencyTree::instance().dec_ref(adapter_req->lora_name);
+          }
+        }
+      }
       finished_requests.emplace_back(request);
       *it = nullptr;
     }
@@ -667,6 +685,22 @@ void SchedulerPolicy::schedule_decode_from_queue(RequestPriorityQueue* queue,
                 ? request->sequences()[0]->adapter_id()
                 : 0;
         gate.record_admit(aid);
+      }
+      // [FASTLIBRA Phase 1.C+] Increment ref count on LoRA subtree.
+      // Balanced by dec_ref at request-finish site (see
+      // handle_running_requests).
+      {
+        const uint64_t admit_aid =
+            !request->sequences().empty() && request->sequences()[0]
+                ? request->sequences()[0]->adapter_id()
+                : 0;
+        if (admit_aid != 0) {
+          auto adapter_req =
+              LoRARuntime::instance().registry().lookup(admit_aid);
+          if (adapter_req.has_value()) {
+            LoRAKVDependencyTree::instance().inc_ref(adapter_req->lora_name);
+          }
+        }
       }
       state.running_sequences.insert(state.running_sequences.end(),
                                      candidate_sequences.begin(),
