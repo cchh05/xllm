@@ -59,6 +59,20 @@ void LoRARuntime::init(const LoRAConfig& config) {
         LOG(INFO) << "[LoRARuntime] freed per_proj device pool for id="
                   << int_id << " slots=" << slot_count;
       }
+      // [FASTLIBRA Phase 0.3c fix] Return the LoRABlockPool blocks that
+      // were claimed during per-proj install. Without this the slab
+      // free_list is never replenished and pool OOMs after ~5 unloads.
+      // Discovered via E.3 multi-adapter stress 08-25.
+      auto pb = per_int_id_pool_blocks_.find(int_id);
+      if (pb != per_int_id_pool_blocks_.end()) {
+        const size_t n_blocks = pb->second.size();
+        if (lora_block_pool_) {
+          lora_block_pool_->free(pb->second);
+        }
+        per_int_id_pool_blocks_.erase(pb);
+        LOG(INFO) << "[LoRARuntime] freed LoRABlockPool blocks for id="
+                  << int_id << " n_blocks=" << n_blocks;
+      }
       // Also drop legacy P0-A dummy pool entry if the same int_id sits there.
       auto dp = device_pool_.find(int_id);
       if (dp != device_pool_.end()) {
