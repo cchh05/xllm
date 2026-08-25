@@ -315,15 +315,82 @@ void LoRASwapManager::do_swap_decisions(int64_t now_us) {
 }
 
 void LoRASwapManager::reclaim_completed_swaps() {
-  // Phase 2.C+ fills this. For P2.B skeleton, no-op.
+  // P2.C+ uses synchronous torch copy so there is no aclrtEvent to
+  // poll. A future optim commit that wires aclrtMemcpyAsync + a
+  // dedicated swap stream will populate this to transition EVICTING
+  // -> MAIN_MEM and LOADING -> HBM asynchronously.
 }
 
-void LoRASwapManager::swap_out_async(uint64_t /*int_id*/, AdapterEntry& /*e*/) {
-  // Phase 2.C+ fills this.
+void LoRASwapManager::swap_out_async(uint64_t int_id, AdapterEntry& e) {
+  // Caller holds mu_.
+  if (e.residency != Residency::HBM) return;
+  if (e.slab_bytes == 0 || e.hbm_blocks.empty()) return;
+  // Enforce host mirror budget.
+  if (!e.main_mem_mirror.defined()) {
+    if (total_host_mirror_bytes_ + e.slab_bytes > opts_.max_host_mirror_bytes) {
+      LOG(WARNING) << "[LoRASwapManager] swap_out_async id=" << int_id
+                   << " would exceed host mirror cap ("
+                   << opts_.max_host_mirror_bytes << " bytes), skipping";
+      return;
+    }
+  }
+  e.residency = Residency::EVICTING;
+  const uint32_t bpc = static_cast<uint32_t>(pool_ ? pool_->block_bytes() : 0);
+  if (bpc == 0) {
+    LOG(ERROR) << "[LoRASwapManager] swap_out_async: pool block_bytes=0";
+    e.residency = Residency::HBM;
+    return;
+  }
+  // Lazy-allocate host pinned mirror. Sized to slab_bytes.
+  if (!e.main_mem_mirror.defined()) {
+    const int64_t n_bytes = static_cast<int64_t>(e.slab_bytes);
+    const int64_t n_bf16 = n_bytes / 2;  // slab is bfloat16
+    auto opts_t = torch::TensorOptions()
+                      .dtype(torch::kBFloat16)
+                      .device(torch::kCPU)
+                      .pinned_memory(true);
+    e.main_mem_mirror = torch::empty({n_bf16}, opts_t);
+    total_host_mirror_bytes_ += e.slab_bytes;
+  }
+  // Copy each block from slab to the corresponding chunk of the
+  // mirror. Uses torch's current NPU stream implicitly.
+  const int64_t bf16_per_block = bpc / 2;
+  for (size_t i = 0; i < e.hbm_blocks.size(); ++i) {
+    const int32_t block_id = e.hbm_blocks[i];
+    torch::Tensor src =
+        pool_->tensor_view(block_id, {bf16_per_block}, torch::kBFloat16);
+    torch::Tensor dst = e.main_mem_mirror.narrow(
+        0, static_cast<int64_t>(i) * bf16_per_block, bf16_per_block);
+    dst.copy_(src, /*non_blocking=*/true);
+  }
+  e.residency = Residency::MAIN_MEM;
+  e.last_swap_us = now_micros();
+  stats_.n_swap_out_count++;
+  LOG(INFO) << "[LoRASwapManager] swap_out id=" << int_id << " name='"
+            << e.lora_name << "' bytes=" << e.slab_bytes;
 }
 
-void LoRASwapManager::swap_in_async(uint64_t /*int_id*/, AdapterEntry& /*e*/) {
-  // Phase 2.C+ fills this.
+void LoRASwapManager::swap_in_async(uint64_t int_id, AdapterEntry& e) {
+  // Caller holds mu_.
+  if (e.residency != Residency::MAIN_MEM) return;
+  if (!e.main_mem_mirror.defined() || e.hbm_blocks.empty()) return;
+  const uint32_t bpc = static_cast<uint32_t>(pool_ ? pool_->block_bytes() : 0);
+  if (bpc == 0) return;
+  e.residency = Residency::LOADING;
+  const int64_t bf16_per_block = bpc / 2;
+  for (size_t i = 0; i < e.hbm_blocks.size(); ++i) {
+    const int32_t block_id = e.hbm_blocks[i];
+    torch::Tensor src = e.main_mem_mirror.narrow(
+        0, static_cast<int64_t>(i) * bf16_per_block, bf16_per_block);
+    torch::Tensor dst =
+        pool_->tensor_view(block_id, {bf16_per_block}, torch::kBFloat16);
+    dst.copy_(src, /*non_blocking=*/true);
+  }
+  e.residency = Residency::HBM;
+  e.last_swap_us = now_micros();
+  stats_.n_swap_in_count++;
+  LOG(INFO) << "[LoRASwapManager] swap_in id=" << int_id << " name='"
+            << e.lora_name << "' bytes=" << e.slab_bytes;
 }
 
 // ---------- Cost model (paper Eq.3-6) ----------
