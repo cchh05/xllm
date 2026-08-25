@@ -27,6 +27,8 @@ limitations under the License.
 #include <vector>
 
 #include "api_service/call.h"
+#include "framework/lora/lora_registry.h"
+#include "framework/lora/lora_runtime.h"
 #include "sequence.h"
 #include "util/timer.h"
 
@@ -45,6 +47,15 @@ Request::Request(const std::string& request_id,
                   source_xservice_addr),
       state_(std::move(state)) {
   create_sequences_group();
+}
+
+Request::~Request() {
+  // RAII pin release. Only unpin if this request actually carried a
+  // LoRA adapter (state_.adapter_id != 0). LoRARuntime and its registry
+  // are process-wide singletons, so no-op safely if LoRA is disabled.
+  if (state_.adapter_id != 0 && LoRARuntime::instance().enabled()) {
+    LoRARuntime::instance().registry().unpin(state_.adapter_id);
+  }
 }
 
 void Request::create_sequences_group() {

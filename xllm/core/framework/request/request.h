@@ -44,6 +44,14 @@ class Request : public RequestBase {
           const std::string& service_request_id = "",
           const std::string& source_xservice_addr = "");
 
+  // RAII destructor: unpins the LoRA adapter pin that was acquired
+  // by chat_service (lookup_and_pin) when this request was routed to a
+  // named LoRA adapter. Balances the +1 pin from lookup_and_pin so
+  // LoRARegistry can complete drain-on-unload and downstream reloads
+  // don't get stuck at HTTP 503 (see memory
+  // project_xllm_lora_registry_cross_rank_int_id_race_2026_08_25).
+  ~Request();
+
   bool finished() const;
 
   std::vector<std::unique_ptr<Sequence>>& sequences() {
