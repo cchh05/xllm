@@ -847,6 +847,20 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
       LoRASwapManager::Options swap_opts;
       lora_swap_manager_ = std::make_unique<LoRASwapManager>(
           lora_block_pool_.get(), &LoRAKVDependencyTree::instance(), swap_opts);
+      // [Fix A] Wire swap-out callback to invalidate stale per-adapter
+      // tensor views. Without this, forward path reads the now-freed
+      // blocks after another adapter reallocates them -- silent
+      // corruption verified by reviewer via logprob API (evicted
+      // adapter logprob drifts 100x from clean baseline).
+      lora_swap_manager_->set_on_swapped_out([this](uint64_t int_id) {
+        std::lock_guard g(materialise_mu_);
+        auto it = per_proj_device_pool_.find(int_id);
+        if (it != per_proj_device_pool_.end()) {
+          per_proj_device_pool_.erase(it);
+          LOG(INFO) << "[LoRARuntime] Fix A: erased per_proj_device_pool_"
+                    << " for evicted id=" << int_id;
+        }
+      });
       if (std::getenv("LORA_SWAP_ENABLE"))
         lora_swap_manager_->start_tick_thread();
     }

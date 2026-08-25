@@ -421,6 +421,12 @@ void LoRASwapManager::swap_out_async(uint64_t int_id, AdapterEntry& e) {
   e.residency = Residency::MAIN_MEM;
   e.last_swap_us = now_micros();
   stats_.n_swap_out_count++;
+  // [Fix A] Notify LoRARuntime to invalidate any per_proj_device_pool_
+  // tensor views that referenced the just-freed blocks. Called with
+  // mu_ held; handler acquires materialise_mu_ (disjoint lock order).
+  if (on_swapped_out_) {
+    on_swapped_out_(int_id);
+  }
   LOG(INFO) << "[LoRASwapManager] swap_out id=" << int_id << " name='"
             << e.lora_name << "' bytes=" << e.slab_bytes
             << " blocks_freed=" << freed;

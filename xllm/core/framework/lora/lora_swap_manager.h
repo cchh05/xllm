@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -135,6 +136,20 @@ class LoRASwapManager {
   // Not stable output for parsing.
   std::string dump_state() const;
 
+  // [Fix A] Callback fired after swap_out finishes freeing blocks.
+  // Handler should erase per-adapter tensor views that referenced
+  // the just-freed blocks. Called synchronously from tick thread or
+  // install-time evict path.
+  using OnSwappedOutFn = std::function<void(uint64_t int_id)>;
+  void set_on_swapped_out(OnSwappedOutFn fn) {
+    on_swapped_out_ = std::move(fn);
+  }
+
+  // Reserved for Fix B: rebuild per-adapter tensor views after
+  // swap_in reallocates blocks. Fix A does not wire this.
+  using OnSwappedInFn = std::function<void(uint64_t int_id)>;
+  void set_on_swapped_in(OnSwappedInFn fn) { on_swapped_in_ = std::move(fn); }
+
  private:
   // Per-adapter bookkeeping. Held under mu_.
   struct AdapterEntry {
@@ -195,6 +210,12 @@ class LoRASwapManager {
   std::atomic<bool> stop_{false};
   std::atomic<bool> tick_started_{false};
   std::thread tick_thread_;
+
+  // [Fix A] Callbacks invoked around residency transitions so upstream
+  // (LoRARuntime) can keep its per-adapter tensor-view maps in sync
+  // with pool block ownership. Null until set_on_swapped_* is called.
+  OnSwappedOutFn on_swapped_out_;
+  OnSwappedInFn on_swapped_in_;
 
   // Cumulative stats (public via get_stats()).
   Stats stats_;
