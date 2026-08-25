@@ -128,6 +128,10 @@ class LoRAKVDependencyTree {
   void inc_ref(const std::string& adapter_id);
   void dec_ref(const std::string& adapter_id);
 
+  // Read ref_count for the given adapter. Returns -1 if unknown.
+  // Used by LoRASwapManager to skip evicting active adapters.
+  int get_ref_count(const std::string& adapter_id) const;
+
   // ------------------- Traversal (Phase 2 will consume) -------------------
   // Eviction candidates: KV leaves currently in HBM.
   std::vector<LoRAKVNode*> find_leaves_in_hbm();

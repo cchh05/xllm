@@ -240,6 +240,13 @@ void LoRAKVDependencyTree::dec_ref(const std::string& adapter_id) {
   it->second->ref_count -= 1;
 }
 
+int LoRAKVDependencyTree::get_ref_count(const std::string& adapter_id) const {
+  std::lock_guard<std::mutex> g(mu_);
+  auto it = lora_index_.find(adapter_id);
+  if (it == lora_index_.end()) return -1;
+  return it->second->ref_count;
+}
+
 // ----------------------------- Traversal -----------------------------
 
 std::vector<LoRAKVNode*> LoRAKVDependencyTree::find_leaves_in_hbm() {

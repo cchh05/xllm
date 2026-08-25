@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <cstdlib>
 #include <mutex>
 
 #include "lora_kv_dependency_tree.h"
@@ -758,11 +759,33 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
       }
       auto ids = lora_block_pool_->allocate(2);
       if (ids.size() != 2) {
-        LOG(ERROR) << "[FASTLIBRA] LoRABlockPool OOM claiming 2 blocks for '"
-                   << lora_name << "' layer=" << pk.layer_index
-                   << " proj=" << pk.proj_name;
-        ++skipped;
-        continue;
+        // [FASTLIBRA Phase 2 Option A] Pool OOM. Ask swap manager to
+        // evict enough cold adapters to reclaim ~2 blocks, then retry.
+        // If swap manager missing or evict yields nothing, degrade to
+        // the original skip-and-warn behavior.
+        if (!ids.empty()) lora_block_pool_->free(ids);
+        size_t freed = 0;
+        if (lora_swap_manager_) {
+          // Ask for 2 blocks minimum. If eviction pool is bigger,
+          // swap manager may free more; the surplus stays in the pool
+          // free-list ready for the next OOM.
+          freed = lora_swap_manager_->try_evict_for_install(2);
+        }
+        if (freed > 0) {
+          ids = lora_block_pool_->allocate(2);
+        }
+        if (ids.size() != 2) {
+          LOG(ERROR) << "[FASTLIBRA] LoRABlockPool OOM claiming 2 blocks for '"
+                     << lora_name << "' layer=" << pk.layer_index
+                     << " proj=" << pk.proj_name
+                     << " (post-evict freed=" << freed << ")";
+          if (!ids.empty()) lora_block_pool_->free(ids);
+          ++skipped;
+          continue;
+        }
+        LOG(INFO) << "[FASTLIBRA] LoRABlockPool retry OK after evict for '"
+                  << lora_name << "' layer=" << pk.layer_index
+                  << " proj=" << pk.proj_name << " freed=" << freed;
       }
       const int32_t block_a = ids[0];
       const int32_t block_b = ids[1];
@@ -824,7 +847,8 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
       LoRASwapManager::Options swap_opts;
       lora_swap_manager_ = std::make_unique<LoRASwapManager>(
           lora_block_pool_.get(), &LoRAKVDependencyTree::instance(), swap_opts);
-      lora_swap_manager_->start_tick_thread();
+      if (std::getenv("LORA_SWAP_ENABLE"))
+        lora_swap_manager_->start_tick_thread();
     }
     auto blocks_snapshot = per_int_id_pool_blocks_[int_id];
     const uint64_t total_bytes =

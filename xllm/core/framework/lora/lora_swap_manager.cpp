@@ -151,6 +151,57 @@ std::vector<int32_t> LoRASwapManager::unregister_adapter(uint64_t int_id) {
   return out;
 }
 
+size_t LoRASwapManager::try_evict_for_install(uint32_t n_blocks_needed) {
+  // Called synchronously from LoRARuntime install path when the pool
+  // returns OOM. We must evict adapters worth at least n_blocks_needed
+  // blocks total. Ref_count > 0 adapters are skipped (they are serving
+  // active requests).
+  //
+  // Score-based eviction: reuses Eq.5 retain_eval to pick the
+  // least-valuable HBM adapters first. Returns total blocks freed.
+  std::vector<uint64_t> victims;
+  size_t freed_total = 0;
+  const int64_t nu = now_micros();
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    std::vector<std::pair<double, uint64_t>> hbm_scores;
+    hbm_scores.reserve(adapters_.size());
+    for (const auto& [id, e] : adapters_) {
+      if (e.residency != Residency::HBM) continue;
+      if (e.hbm_blocks.empty()) continue;
+      const int rc = tree_ ? tree_->get_ref_count(e.lora_name) : 0;
+      if (rc > 0) continue;
+      const double score = compute_retain_eval(e, nu);
+      hbm_scores.emplace_back(score, id);
+    }
+    std::sort(hbm_scores.begin(), hbm_scores.end());  // asc: worst first
+    size_t projected = 0;
+    for (auto& [score, id] : hbm_scores) {
+      if (projected >= n_blocks_needed) break;
+      const auto& e = adapters_[id];
+      projected += e.hbm_blocks.size();
+      victims.push_back(id);
+    }
+  }
+  // Fire evictions outside the score-selection scope (each helper
+  // reacquires mu_ internally).
+  for (uint64_t id : victims) {
+    std::lock_guard<std::mutex> g(mu_);
+    auto it = adapters_.find(id);
+    if (it == adapters_.end()) continue;
+    if (it->second.residency != Residency::HBM) continue;
+    const size_t before = it->second.hbm_blocks.size();
+    swap_out_async(id, it->second);
+    if (it->second.residency == Residency::MAIN_MEM) {
+      freed_total += before;
+    }
+  }
+  LOG(INFO) << "[LoRASwapManager] try_evict_for_install requested="
+            << n_blocks_needed << " freed=" << freed_total
+            << " victims=" << victims.size();
+  return freed_total;
+}
+
 // ---------- Tick lifecycle ----------
 
 void LoRASwapManager::start_tick_thread() {
@@ -263,18 +314,14 @@ void LoRASwapManager::do_swap_decisions(int64_t now_us) {
       return a.first > b.first;
     });
     if (over_high) {
-      // Evict up to swap_batch adapters. Skip adapters that the tree
-      // says are still referenced by admitted requests (ref_count > 0).
+      // Evict up to swap_batch adapters. Skip adapters with ref_count > 0
+      // (still serving admitted requests) -- Option A ref_count guard.
       uint32_t picked = 0;
       for (auto& [score, id] : hbm_scores) {
         if (picked >= opts_.swap_batch) break;
         const auto& e = adapters_[id];
-        // Consult tree ref_count to avoid evicting an active adapter.
-        // Phase 2 uses a coarse lookup; Phase 3 refines w/ per-request
-        // arrival prob.
-        // (tree_->lookup would go here; kept out of P2.C to avoid
-        // header cycles. Ref_count guard lands in P2.C+ w/ full API.)
-        (void)e;
+        const int rc = tree_ ? tree_->get_ref_count(e.lora_name) : 0;
+        if (rc > 0) continue;
         evict_ids.push_back(id);
         ++picked;
       }
@@ -363,19 +410,40 @@ void LoRASwapManager::swap_out_async(uint64_t int_id, AdapterEntry& e) {
         0, static_cast<int64_t>(i) * bf16_per_block, bf16_per_block);
     dst.copy_(src, /*non_blocking=*/true);
   }
+  // Option A: return the freed blocks back to LoRABlockPool so subsequent
+  // install for new adapters can succeed. hbm_blocks list stays empty
+  // until swap-in reallocates fresh block ids.
+  const size_t freed = e.hbm_blocks.size();
+  if (pool_ && freed > 0) {
+    pool_->free(e.hbm_blocks);
+  }
+  e.hbm_blocks.clear();
   e.residency = Residency::MAIN_MEM;
   e.last_swap_us = now_micros();
   stats_.n_swap_out_count++;
   LOG(INFO) << "[LoRASwapManager] swap_out id=" << int_id << " name='"
-            << e.lora_name << "' bytes=" << e.slab_bytes;
+            << e.lora_name << "' bytes=" << e.slab_bytes
+            << " blocks_freed=" << freed;
 }
 
 void LoRASwapManager::swap_in_async(uint64_t int_id, AdapterEntry& e) {
   // Caller holds mu_.
   if (e.residency != Residency::MAIN_MEM) return;
-  if (!e.main_mem_mirror.defined() || e.hbm_blocks.empty()) return;
+  if (!e.main_mem_mirror.defined()) return;
   const uint32_t bpc = static_cast<uint32_t>(pool_ ? pool_->block_bytes() : 0);
   if (bpc == 0) return;
+  // Option A: allocate fresh blocks from pool. If pool cannot satisfy,
+  // skip swap-in (adapter stays on host mirror; later tick can retry).
+  const uint32_t n_blocks = static_cast<uint32_t>(e.slab_bytes / bpc);
+  std::vector<int32_t> new_blocks = pool_->allocate(n_blocks);
+  if (new_blocks.size() != n_blocks) {
+    LOG(WARNING) << "[LoRASwapManager] swap_in id=" << int_id << " name='"
+                 << e.lora_name << "' cannot allocate " << n_blocks
+                 << " blocks (got " << new_blocks.size() << "), skip swap-in";
+    if (!new_blocks.empty()) pool_->free(new_blocks);
+    return;
+  }
+  e.hbm_blocks = std::move(new_blocks);
   e.residency = Residency::LOADING;
   const int64_t bf16_per_block = bpc / 2;
   for (size_t i = 0; i < e.hbm_blocks.size(); ++i) {
@@ -390,7 +458,8 @@ void LoRASwapManager::swap_in_async(uint64_t int_id, AdapterEntry& e) {
   e.last_swap_us = now_micros();
   stats_.n_swap_in_count++;
   LOG(INFO) << "[LoRASwapManager] swap_in id=" << int_id << " name='"
-            << e.lora_name << "' bytes=" << e.slab_bytes;
+            << e.lora_name << "' bytes=" << e.slab_bytes
+            << " blocks_realloced=" << e.hbm_blocks.size();
 }
 
 // ---------- Cost model (paper Eq.3-6) ----------

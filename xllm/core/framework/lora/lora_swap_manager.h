@@ -116,6 +116,13 @@ class LoRASwapManager {
   // ids so the caller can free them.
   std::vector<int32_t> unregister_adapter(uint64_t int_id);
 
+  // Option A install-time OOM handler: evict up to n_blocks_needed
+  // worth of adapter blocks (swap them out to host mirror + free
+  // blocks back to pool). Called synchronously from LoRARuntime
+  // install path when pool.allocate fails. Skips adapters with
+  // ref_count > 0 (active requests). Returns number of blocks freed.
+  size_t try_evict_for_install(uint32_t n_blocks_needed);
+
   // ---------- Tick control ----------
   // Start the 100ms decision thread. Idempotent — subsequent calls no-op.
   void start_tick_thread();
