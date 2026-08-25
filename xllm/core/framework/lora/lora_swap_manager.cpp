@@ -17,10 +17,12 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #include "lora_block_pool.h"
 #include "lora_kv_dependency_tree.h"
@@ -176,11 +178,16 @@ void LoRASwapManager::stop_tick_thread() {
 
 void LoRASwapManager::tick_loop() {
   const auto period = std::chrono::milliseconds(opts_.tick_ms);
+#if defined(USE_NPU)
+  // aclrtGetMemInfo requires a device context on the calling thread.
+  // Bind this tick thread to device 0 (rank 0 uses device 0 in TP
+  // layout; per-rank setDevice would be needed for worker rank ticks).
+  aclrtSetDevice(0);
+#endif
   while (!stop_.load()) {
     const int64_t start_us = now_micros();
-    // Phase 2 skeleton: reclaim finished swaps, but do NOT yet issue new
-    // swap decisions. P2.C wires do_swap_decisions.
     reclaim_completed_swaps();
+    // Update stats snapshot under mu_ before making decisions.
     {
       std::lock_guard<std::mutex> g(mu_);
       stats_.last_tick_us = start_us;
@@ -201,12 +208,110 @@ void LoRASwapManager::tick_loop() {
       }
       stats_.hbm_util_pct = read_hbm_util_pct();
     }
+    // Every-tick trace for Phase 3 bench diag. Off by default; enable
+    // with --v=1 at the xllm CLI.
+    VLOG(1) << "[LoRASwapManager] tick hbm_util=" << stats_.hbm_util_pct
+            << "% n_hbm=" << stats_.n_hbm_adapters
+            << " n_main=" << stats_.n_main_mem_adapters
+            << " hbm_bytes=" << stats_.n_hbm_bytes
+            << " main_bytes=" << stats_.n_main_mem_bytes
+            << " swap_in_total=" << stats_.n_swap_in_count
+            << " swap_out_total=" << stats_.n_swap_out_count;
+    do_swap_decisions(start_us);
     std::this_thread::sleep_for(period);
   }
 }
 
-void LoRASwapManager::do_swap_decisions(int64_t /*now_us*/) {
-  // Phase 2.C fills this. For P2.B skeleton, no-op.
+void LoRASwapManager::do_swap_decisions(int64_t now_us) {
+  // Snapshot state under mu_, choose swap-in/out targets, then release
+  // mu_ before invoking the async kernels (P2.C+ real, P2.C stub).
+  std::vector<uint64_t> evict_ids;
+  std::vector<uint64_t> load_ids;
+  bool decisions_logged = false;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    if (adapters_.empty()) return;
+    const double hbm_util = stats_.hbm_util_pct;
+    const bool over_high = hbm_util > opts_.hbm_high_threshold_pct;
+    const bool under_low = hbm_util < opts_.hbm_low_threshold_pct;
+    if (!over_high && !under_low) return;
+    // Estimate batch size from tree: use n_hbm_adapters as a proxy in
+    // Phase 2 (Phase 3 wires the real scheduler bs). Bounded [1, 32].
+    const double bs = std::max<double>(
+        1.0,
+        std::min<double>(32.0, static_cast<double>(stats_.n_hbm_adapters)));
+    const double low_lora = compute_low_lora(bs);
+    const size_t n_hbm = stats_.n_hbm_adapters;
+    const double lora_eval = compute_lora_eval(n_hbm, low_lora);
+    // Score every adapter; separate HBM (eviction candidates) from
+    // MAIN_MEM (swap-in candidates). EVICTING/LOADING are already
+    // in-flight and are skipped.
+    std::vector<std::pair<double, uint64_t>> hbm_scores;
+    std::vector<std::pair<double, uint64_t>> main_scores;
+    for (const auto& [id, e] : adapters_) {
+      const double score = compute_swap_score(e, lora_eval, now_us);
+      if (e.residency == Residency::HBM) {
+        hbm_scores.emplace_back(score, id);
+      } else if (e.residency == Residency::MAIN_MEM) {
+        main_scores.emplace_back(score, id);
+      }
+    }
+    // Ascending for eviction (lowest score = worst = evict first).
+    std::sort(hbm_scores.begin(), hbm_scores.end());
+    // Descending for swap-in (highest score = best = load first).
+    std::sort(main_scores.begin(), main_scores.end(), [](auto& a, auto& b) {
+      return a.first > b.first;
+    });
+    if (over_high) {
+      // Evict up to swap_batch adapters. Skip adapters that the tree
+      // says are still referenced by admitted requests (ref_count > 0).
+      uint32_t picked = 0;
+      for (auto& [score, id] : hbm_scores) {
+        if (picked >= opts_.swap_batch) break;
+        const auto& e = adapters_[id];
+        // Consult tree ref_count to avoid evicting an active adapter.
+        // Phase 2 uses a coarse lookup; Phase 3 refines w/ per-request
+        // arrival prob.
+        // (tree_->lookup would go here; kept out of P2.C to avoid
+        // header cycles. Ref_count guard lands in P2.C+ w/ full API.)
+        (void)e;
+        evict_ids.push_back(id);
+        ++picked;
+      }
+    } else if (under_low) {
+      uint32_t picked = 0;
+      for (auto& [score, id] : main_scores) {
+        if (picked >= opts_.swap_batch) break;
+        load_ids.push_back(id);
+        ++picked;
+      }
+    }
+    if (!evict_ids.empty() || !load_ids.empty()) {
+      LOG(INFO) << "[LoRASwapManager] tick decision hbm_util=" << hbm_util
+                << "% n_hbm=" << n_hbm
+                << " n_main=" << stats_.n_main_mem_adapters
+                << " evict=" << evict_ids.size() << " load=" << load_ids.size();
+      decisions_logged = true;
+    }
+  }
+  // Fire async kernels outside mu_. Each helper reacquires mu_ briefly
+  // to transition residency HBM->EVICTING or MAIN_MEM->LOADING and to
+  // record the aclrtEvent (P2.C+).
+  for (uint64_t id : evict_ids) {
+    std::lock_guard<std::mutex> g(mu_);
+    auto it = adapters_.find(id);
+    if (it != adapters_.end() && it->second.residency == Residency::HBM) {
+      swap_out_async(id, it->second);
+    }
+  }
+  for (uint64_t id : load_ids) {
+    std::lock_guard<std::mutex> g(mu_);
+    auto it = adapters_.find(id);
+    if (it != adapters_.end() && it->second.residency == Residency::MAIN_MEM) {
+      swap_in_async(id, it->second);
+    }
+  }
+  (void)decisions_logged;
 }
 
 void LoRASwapManager::reclaim_completed_swaps() {
@@ -221,41 +326,84 @@ void LoRASwapManager::swap_in_async(uint64_t /*int_id*/, AdapterEntry& /*e*/) {
   // Phase 2.C+ fills this.
 }
 
-// ---------- Cost model (P2.C fills the real math) ----------
+// ---------- Cost model (paper Eq.3-6) ----------
 
-double LoRASwapManager::compute_low_lora(double /*bs*/) const {
-  return 0.0;  // P2.C impl
+// Eq.3: expected active LoRAs given per-adapter arrival prob and BS.
+// Low_lora = Sum_i (1 - (1 - prob_i)^BS). Requires mu_ held by caller.
+double LoRASwapManager::compute_low_lora(double bs) const {
+  double sum = 0.0;
+  for (const auto& [id, e] : adapters_) {
+    const double p = std::max(0.0, std::min(1.0, e.prob_estimate));
+    sum += (1.0 - std::pow(1.0 - p, bs));
+  }
+  return sum;
 }
 
-double LoRASwapManager::compute_lora_eval(size_t /*n_hbm*/,
-                                          double /*low_lora*/) const {
-  return 0.0;  // P2.C impl
+// Eq.4: LoRA_Eval = max(1, low_lora / n_hbm_adapters).
+double LoRASwapManager::compute_lora_eval(size_t n_hbm, double low_lora) const {
+  if (n_hbm == 0) return 1.0;
+  const double e = low_lora / static_cast<double>(n_hbm);
+  return std::max(1.0, e);
 }
 
-double LoRASwapManager::compute_retain_eval(const AdapterEntry& /*e*/,
-                                            int64_t /*now_us*/) const {
-  return 0.0;  // P2.C impl
+// Eq.5: Retain_Eval = cost * prob * (1 - sigmoid(t_since_use_us)).
+// cost is a byte-normalized swap cost proxy; sigmoid uses paper §3.2
+// scaled t argument. Higher retain_eval = more valuable to keep in HBM.
+// Requires mu_ held by caller.
+double LoRASwapManager::compute_retain_eval(const AdapterEntry& e,
+                                            int64_t now_us) const {
+  const double dt_sec = static_cast<double>(now_us - e.last_swap_us) / 1e6;
+  // Paper §3.2: sigmoid(dt / tau) with tau on the order of seconds.
+  // Use tau=5s so dt=5s -> sigmoid(1) ~= 0.73, tail beyond 30s ~= 1.
+  const double tau = 5.0;
+  const double x = dt_sec / tau;
+  const double sigmoid = 1.0 / (1.0 + std::exp(-x));
+  // cost proxy: normalized slab bytes. Larger adapter = higher swap
+  // cost = higher retain incentive.
+  const double cost =
+      static_cast<double>(e.slab_bytes) / (256.0 * 1024.0 * 1024.0);
+  const double p = std::max(0.0, std::min(1.0, e.prob_estimate));
+  return cost * p * (1.0 - sigmoid);
 }
 
-double LoRASwapManager::compute_swap_score(const AdapterEntry& /*e*/,
-                                           double /*lora_eval*/,
-                                           int64_t /*now_us*/) const {
-  return 0.0;  // P2.C impl
+// Eq.6: Eval_i = LoRA_Eval * Retain_Eval. Higher = keep in HBM.
+double LoRASwapManager::compute_swap_score(const AdapterEntry& e,
+                                           double lora_eval,
+                                           int64_t now_us) const {
+  return lora_eval * compute_retain_eval(e, now_us);
 }
 
 // ---------- HBM monitor ----------
 
 double LoRASwapManager::read_hbm_util_pct() const {
+  // Try device HBM first via aclrtGetMemInfo. If that fails (missing
+  // device context on this thread, or driver returns 0), fall back
+  // to a LoRA-slab-bytes proxy so the swap decision path can still
+  // exercise under pressure. Caller must hold mu_ if reading stats_.
 #if defined(USE_NPU)
   size_t free_memory = 0;
   size_t total_memory = 0;
   const auto ret = aclrtGetMemInfo(ACL_HBM_MEM, &free_memory, &total_memory);
-  if (ret != ACL_SUCCESS || total_memory == 0) return 0.0;
-  const size_t used = total_memory - free_memory;
-  return 100.0 * static_cast<double>(used) / static_cast<double>(total_memory);
-#else
-  return 0.0;
+  if (ret == ACL_SUCCESS && total_memory > 0) {
+    const size_t used = total_memory - free_memory;
+    return 100.0 * static_cast<double>(used) /
+           static_cast<double>(total_memory);
+  }
 #endif
+  // Fallback proxy: LoRA slab used / (pool total slab bytes).
+  if (pool_ == nullptr) return 0.0;
+  const uint64_t block_bytes = pool_->block_bytes();
+  const uint64_t total_blocks = pool_->num_total_blocks();
+  const uint64_t slab_total = block_bytes * total_blocks;
+  if (slab_total == 0) return 0.0;
+  size_t used_bytes = 0;
+  for (const auto& [id, e] : adapters_) {
+    if (e.residency == Residency::HBM || e.residency == Residency::LOADING) {
+      used_bytes += e.slab_bytes;
+    }
+  }
+  return 100.0 * static_cast<double>(used_bytes) /
+         static_cast<double>(slab_total);
 }
 
 // ---------- Diagnostics ----------
