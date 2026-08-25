@@ -126,6 +126,15 @@ class LoRARegistry {
   // in-flight request finished and the entry was erased.
   bool contains(uint64_t int_id) const;
 
+  // Drain-barrier probe: returns true if the name has an entry that is
+  // currently marked for unload (unloading=true) but not yet erased.
+  // Used by /v1/load_lora_adapter to reject reload during the drain
+  // window so cross-rank int_id divergence does not happen (rank 0 would
+  // revive existing id while ranks 1/2/3 would fresh-register a new id
+  // because their entries already erased -- see memory
+  // project_xllm_lora_registry_cross_rank_int_id_race_2026_08_25).
+  bool is_unloading(const std::string& lora_name) const;
+
  private:
   struct Entry {
     LoRARequest req;

@@ -1784,6 +1784,23 @@ void APIService::LoadLoraAdapterHttp(
         {{"error", "no master registered"}, {"lora_name", lora_name}});
     return;
   }
+  // Drain-barrier: if master-side registry has this adapter marked
+  // unloading (a prior unload is still draining because some request
+  // holds a pin), refuse the reload. Broadcasting now would diverge
+  // int_id across ranks: master shares registry with worker rank 0 and
+  // would take the revive branch (keep old id), while ranks 1/2/3 have
+  // already erased and would fresh-register a new id. See memory
+  // project_xllm_lora_registry_cross_rank_int_id_race_2026_08_25.
+  if (runtime.registry().is_unloading(lora_name)) {
+    LOG(WARNING) << "[LoadLoraAdapterHttp] refuse reload during drain '"
+                 << lora_name << "'; client should retry after drain";
+    write_json_response(ctrl,
+                        503,
+                        {{"error", "adapter drain in progress, retry"},
+                         {"lora_name", lora_name},
+                         {"retry_after_seconds", 30}});
+    return;
+  }
   const bool broadcast_ok =
       master->load_lora_broadcast(lora_name, lora_path, base_model_name);
   if (!broadcast_ok) {
