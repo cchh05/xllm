@@ -79,6 +79,9 @@ struct TPInfo {
   int32_t tp_rank = 0;
 };
 
+class LoRABlockPool;
+class LoRASwapManager;
+
 class LoRARuntime {
  public:
   static LoRARuntime& instance();
@@ -351,6 +354,9 @@ class LoRARuntime {
   // Track allocated block ids per (int_id, proj_key) so unload
   // returns them. Phase 0 keeps a flat list per int_id.
   std::unordered_map<uint64_t, std::vector<int32_t>> per_int_id_pool_blocks_;
+  // [FASTLIBRA Phase 2] Swap manager. Lazy-init on first per-proj install,
+  // owns the swap tick thread and per-adapter residency state.
+  std::unique_ptr<LoRASwapManager> lora_swap_manager_;
 
   mutable std::mutex materialise_mu_;
   LoRAConfig config_;

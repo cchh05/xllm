@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "lora_kv_dependency_tree.h"
 #include "lora_metrics.h"
+#include "lora_swap_manager.h"
 
 #if defined(USE_NPU)
 #include <acl/acl.h>
@@ -59,19 +60,27 @@ void LoRARuntime::init(const LoRAConfig& config) {
         LOG(INFO) << "[LoRARuntime] freed per_proj device pool for id="
                   << int_id << " slots=" << slot_count;
       }
-      // [FASTLIBRA Phase 0.3c fix] Return the LoRABlockPool blocks that
-      // were claimed during per-proj install. Without this the slab
-      // free_list is never replenished and pool OOMs after ~5 unloads.
-      // Discovered via E.3 multi-adapter stress 08-25.
+      // [FASTLIBRA Phase 0.3c fix + Phase 2] Return LoRABlockPool blocks.
+      // If Phase 2 swap manager owns this adapter, route through its
+      // unregister_adapter which sync-waits any in-flight swap event
+      // before handing blocks back for freeing.
+      std::vector<int32_t> blocks_to_free;
+      if (lora_swap_manager_) {
+        blocks_to_free = lora_swap_manager_->unregister_adapter(int_id);
+      } else {
+        auto pb = per_int_id_pool_blocks_.find(int_id);
+        if (pb != per_int_id_pool_blocks_.end()) {
+          blocks_to_free = pb->second;
+        }
+      }
       auto pb = per_int_id_pool_blocks_.find(int_id);
       if (pb != per_int_id_pool_blocks_.end()) {
-        const size_t n_blocks = pb->second.size();
-        if (lora_block_pool_) {
-          lora_block_pool_->free(pb->second);
-        }
         per_int_id_pool_blocks_.erase(pb);
+      }
+      if (!blocks_to_free.empty() && lora_block_pool_) {
+        lora_block_pool_->free(blocks_to_free);
         LOG(INFO) << "[LoRARuntime] freed LoRABlockPool blocks for id="
-                  << int_id << " n_blocks=" << n_blocks;
+                  << int_id << " n_blocks=" << blocks_to_free.size();
       }
       // Also drop legacy P0-A dummy pool entry if the same int_id sits there.
       auto dp = device_pool_.find(int_id);
@@ -804,6 +813,25 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
         (lora_block_pool_ ? lora_block_pool_->block_bytes() : 0ULL);
     LoRAKVDependencyTree::instance().register_lora(
         lora_name, static_cast<int64_t>(int_id), total_bytes);
+  }
+  // [FASTLIBRA Phase 2] Hand the newly-installed adapter's blocks over
+  // to the swap manager for residency tracking + eviction candidacy.
+  // Lazy-init the swap manager on the first per-proj install so the
+  // block pool is already sized.
+  {
+    std::lock_guard g(materialise_mu_);
+    if (!lora_swap_manager_) {
+      LoRASwapManager::Options swap_opts;
+      lora_swap_manager_ = std::make_unique<LoRASwapManager>(
+          lora_block_pool_.get(), &LoRAKVDependencyTree::instance(), swap_opts);
+      lora_swap_manager_->start_tick_thread();
+    }
+    auto blocks_snapshot = per_int_id_pool_blocks_[int_id];
+    const uint64_t total_bytes =
+        static_cast<uint64_t>(installed) * 2ULL *
+        (lora_block_pool_ ? lora_block_pool_->block_bytes() : 0ULL);
+    lora_swap_manager_->register_adapter(
+        int_id, lora_name, std::move(blocks_snapshot), total_bytes);
   }
   return int_id;
 }
