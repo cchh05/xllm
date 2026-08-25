@@ -567,6 +567,17 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
     if (per_proj_device_pool_.count(int_id) > 0) {
       LOG(INFO) << "[LoRARuntime] per-proj install: idempotent skip '"
                 << lora_name << "' id=" << int_id << " (already installed)";
+      // [FASTLIBRA Phase 1.C-fix] Idempotent path also syncs the LoRA/KV
+      // dependency tree so the tree state matches runtime state after a
+      // load-unload-reload cycle. register_lora is idempotent (warns and
+      // ignores duplicates), so this is safe even when tree already has
+      // the node.
+      const size_t slot_count = per_proj_device_pool_[int_id].size();
+      const uint64_t total_bytes =
+          static_cast<uint64_t>(slot_count) * 2ULL *
+          (lora_block_pool_ ? lora_block_pool_->block_bytes() : 0ULL);
+      LoRAKVDependencyTree::instance().register_lora(
+          lora_name, static_cast<int64_t>(int_id), total_bytes);
       return int_id;
     }
   }
