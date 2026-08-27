@@ -22,7 +22,23 @@ limitations under the License.
 #include "lora_metrics.h"
 
 #if defined(USE_NPU)
+#include "ascendc/ascendc_lora_storage.h"
+#endif
+
+#if defined(USE_NPU)
 #include <acl/acl.h>
+#endif
+
+#if defined(USE_NPU)
+// Linker anchor: force xllm_lora_ascendc_binding.o to survive
+// --gc-sections. That TU registers TORCH_LIBRARY(_C_xllm_lora, ...) ops via
+// static ctors, but without any link-time reference the whole object is
+// dead-stripped and torch._C._jit_get_operation returns (None, None).
+// A volatile pointer to an empty extern "C" symbol defined in binding.cpp
+// gives the linker a symbol dependency it cannot fold away.
+extern "C" void _xllm_c_xllm_lora_anchor();
+[[maybe_unused]] static void (*volatile _xllm_c_xllm_lora_anchor_ref)() =
+    &_xllm_c_xllm_lora_anchor;
 #endif
 
 namespace xllm {
@@ -58,6 +74,17 @@ void LoRARuntime::init(const LoRAConfig& config) {
         LOG(INFO) << "[LoRARuntime] freed per_proj device pool for id="
                   << int_id << " slots=" << slot_count;
       }
+#if defined(USE_NPU)
+      // AscendC LoRA storage: zero-out this int_id's slot in every
+      // (layer,proj) stacked slab and release the slot for reuse. Called
+      // under materialise_mu_ + inside set_on_final_removal (which fires
+      // exactly at ref_count==0 per RAII unpin discipline
+      // xllm-lora-registry-cross-rank-int-id-race-2026-08-25), so no
+      // forward can hold a reference to the stale weights.
+      if (std::getenv("USE_ASCENDC_LORA") != nullptr) {
+        AscendCLoRAStorage::instance().unregister_adapter(int_id);
+      }
+#endif
       // Also drop legacy P0-A dummy pool entry if the same int_id sits there.
       auto dp = device_pool_.find(int_id);
       if (dp != device_pool_.end()) {
@@ -708,6 +735,26 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
     std::lock_guard g(materialise_mu_);
     per_proj_device_pool_[int_id] = std::move(per_proj);
   }
+#if defined(USE_NPU)
+  // AscendC LoRA storage: replicate per-proj (A, B, scaling) into the
+  // pre-stacked slab so slow_path can dispatch bgmv/sgmv kernels without
+  // per-forward torch::stack overhead. Called after per_proj_device_pool_
+  // is set so a concurrent get_per_proj_delta reader always sees consistent
+  // state. Failure to register (all N slots full) is non-fatal — slow_path
+  // will just fall through to per-seq loop.
+  if (std::getenv("USE_ASCENDC_LORA") != nullptr) {
+    std::lock_guard g(materialise_mu_);
+    auto it = per_proj_device_pool_.find(int_id);
+    if (it != per_proj_device_pool_.end()) {
+      for (const auto& kv : it->second) {
+        const auto& key = kv.first;
+        const auto& pd = kv.second;
+        AscendCLoRAStorage::instance().register_adapter(
+            int_id, key.layer_index, key.proj_name, pd.A, pd.B, pd.scaling);
+      }
+    }
+  }
+#endif
   LOG(INFO) << "[LoRARuntime] installed per-proj adapter '" << lora_name
             << "' id=" << int_id << " slots=" << installed
             << " skipped=" << skipped << " r=" << adapter_opt->r
