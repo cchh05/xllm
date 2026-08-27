@@ -21,6 +21,13 @@ limitations under the License.
 #include "framework/lora/lora_context.h"
 #include "framework/lora/lora_runtime.h"
 
+#if defined(USE_NPU)
+#include <cstdlib>
+
+#include "framework/lora/ascendc/ascendc_lora_storage.h"
+#include "framework/lora/ascendc/xllm_lora_ascendc_binding.h"
+#endif
+
 namespace xllm {
 namespace layer {
 
@@ -192,6 +199,155 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
   // Fallback per-seq apply: slice y along dim=0 by q_seq_lens, look up
   // (int_id, layer, {q_proj,k_proj,v_proj}), stack Q/K/V deltas into
   // one [seq_tokens, q_size + 2*kv_size] slab, add to that slice.
+
+#if defined(USE_NPU)
+  // Commit B — AscendC LoRA slow_path (mixed adapter batch).
+  //
+  // Replaces the per-seq for loop below with 3 batched bgmv_shrink +
+  // 3 batched bgmv_expand calls when:
+  //   USE_ASCENDC_LORA env is set
+  //   adapter_ids.size() > 1 (fast_path above handles == 1)
+  //   input.device().is_privateuseone() (NPU only)
+  //   Storage has an entry for (layer, q_proj) AND (layer, k_proj) AND
+  //     (layer, v_proj)
+  //   R <= 64 (kernel constraint, per vllm-ascend punica_npu.py)
+  //   All seqs have a registered aid (base-only seq mixed → per-seq)
+  //
+  // The three per-proj B slabs are TP-sharded per this rank via a view
+  // slice: fast_path uses the same "B.size(0) / out_local → shard_idx"
+  // formula (see line ~178 above) for a 2D pd->B [H_out_full, R]; here
+  // AscendCLoRAStorage::StackedView::B_stacked is 3D
+  // [num_adapters, H_out_full, R] so the slice is along dim=1 instead of 0.
+  //
+  // Known-optimization-followup: `torch::zeros` per forward for buf_{q,k,v}
+  // fp32 accumulators. HBM alloc churn may dominate at high decode QPS.
+  // If Step 4 bench misses KPI, move buf allocation into
+  // AscendCLoRAStorage (per-layer pre-alloc + zero_() reuse).
+  do {
+    // Diag: first-attempt log fires exactly once per process so absence of
+    // this line in the server log means the slow_path AscendC branch was
+    // never even considered (e.g. the whole #ifdef USE_NPU wasn't compiled
+    // in, or the flow never reached this point).
+    {
+      static bool first_attempt = true;
+      if (first_attempt) {
+        first_attempt = false;
+        LOG(INFO) << "[AscendC LoRA slow_path] first attempt (env checked)";
+      }
+    }
+    if (std::getenv("USE_ASCENDC_LORA") == nullptr) break;
+    if (adapter_ids.size() <= 1) break;
+    if (!input.device().is_privateuseone()) break;
+
+    auto& storage = AscendCLoRAStorage::instance();
+    auto qv = storage.get_stacked(ctx->layer_index, "q_proj");
+    auto kv = storage.get_stacked(ctx->layer_index, "k_proj");
+    auto vv = storage.get_stacked(ctx->layer_index, "v_proj");
+    if (!qv.valid || !kv.valid || !vv.valid) break;
+
+    const int64_t R = qv.A_stacked.size(1);
+    if (R > 64) break;
+
+    // Shape guards — early exit is better than device crash if storage
+    // ever produced malformed slabs. register_adapter should refuse
+    // zero-sized inputs so this is truly defense-in-depth.
+    if (qv.A_stacked.dim() != 3 || kv.A_stacked.dim() != 3 ||
+        vv.A_stacked.dim() != 3) {
+      break;
+    }
+    if (qv.A_stacked.size(1) != R || kv.A_stacked.size(1) != R ||
+        vv.A_stacked.size(1) != R) {
+      break;  // Q/K/V rank mismatch
+    }
+    if (qv.A_stacked.size(2) != input.size(1)) {
+      break;  // hidden_in mismatch
+    }
+
+    LOG_EVERY_N(INFO, 100) << "[AscendC LoRA slow_path] enter, aids="
+                           << adapter_ids.size()
+                           << " layer=" << ctx->layer_index << " R=" << R;
+
+    // Per-token adapter slot indices.
+    // Fix W (2026-08-28): device-side index build. Legacy host-side path
+    // (build_indices_cpu + from_blob().to(device)) triggered aclrtMemcpy
+    // 107030 inside --enable_graph=true capture, causing 3-fallback
+    // regression (see 08-28 bench root cause). New path uses:
+    //   1. Host-only scan for the aid==0 fallback guard (no device op).
+    //   2. storage.slot_lookup_dev().index_select(0, adapter_ids_per_token)
+    //      — pure device op, graph-safe. adapter_ids_per_token is prepared
+    //      by ModelInputParams::to(device) at batch build time (Phase A W2
+    //      v2, see 07-06 memory).
+    const int64_t total_tokens = input.size(0);
+    bool all_registered = true;
+    for (size_t s = 0; s < adapter_ids.size(); ++s) {
+      if (adapter_ids[s] == 0) {
+        all_registered = false;
+        break;
+      }
+    }
+    if (!all_registered) break;
+
+    if (ctx->adapter_ids_per_token == nullptr ||
+        !ctx->adapter_ids_per_token->defined() ||
+        !storage.slot_lookup_dev().defined()) {
+      break;  // device pipeline not ready → fallback per-seq
+    }
+    // Shape sanity: adapter_ids_per_token is [total_tokens] on device.
+    if (ctx->adapter_ids_per_token->numel() != total_tokens) {
+      break;  // shape mismatch → fallback (should not happen post-Phase A)
+    }
+    auto indices =
+        storage.slot_lookup_dev().index_select(0, *ctx->adapter_ids_per_token);
+
+    // TP shard B_stacked along dim=1 (H_out_full → out_local). Formula
+    // mirrors the fast_path slice (line ~172 above) with the extra
+    // leading N dim shifted (0 → 1). num_shards >= 1 for a valid shard
+    // by construction (register_adapter refuses zero-sized B).
+    auto shard_B = [&](const torch::Tensor& B_full, int64_t out_local) {
+      if (tp_world_size_ <= 1 || B_full.size(1) <= out_local) return B_full;
+      const int64_t num_shards = B_full.size(1) / out_local;
+      if (num_shards <= 0) return B_full;
+      const int64_t shard_idx = tp_rank_ * num_shards / tp_world_size_;
+      const int64_t start = shard_idx * out_local;
+      return B_full.slice(1, start, start + out_local);
+    };
+    auto qB = shard_B(qv.B_stacked, q_size_local_);
+    auto kB = shard_B(kv.B_stacked, kv_size_local_);
+    auto vB = shard_B(vv.B_stacked, kv_size_local_);
+
+    // 3 bgmv_shrink (Q/K/V have independent A). Buf is fp32 per kernel
+    // spec — shrink writes accumulator in fp32; expand reads it back.
+    // Fix Y (2026-08-27): shared per-rank buf pool pre-allocated at first
+    // install. slice + zero_() is a mutex-free device view op (no HBM alloc
+    // churn per forward). See ascendc_lora_storage.h buf_q()/k()/v() docs.
+    if (!storage.buf_q().defined() || !storage.buf_k().defined() ||
+        !storage.buf_v().defined() || storage.buf_max_t() < total_tokens) {
+      break;  // buf pool not ready (shouldnt happen post-install)
+    }
+    auto buf_q =
+        storage.buf_q().slice(0, 0, total_tokens).slice(1, 0, R).zero_();
+    auto buf_k =
+        storage.buf_k().slice(0, 0, total_tokens).slice(1, 0, R).zero_();
+    auto buf_v =
+        storage.buf_v().slice(0, 0, total_tokens).slice(1, 0, R).zero_();
+    xllm::bgmv_shrink(
+        input, qv.A_stacked, indices, buf_q, static_cast<double>(qv.scaling));
+    xllm::bgmv_shrink(
+        input, kv.A_stacked, indices, buf_k, static_cast<double>(kv.scaling));
+    xllm::bgmv_shrink(
+        input, vv.A_stacked, indices, buf_v, static_cast<double>(vv.scaling));
+
+    // 3 bgmv_expand writing into y at Q/K/V segment offsets. The kernel
+    // accumulates in-place, so any base output already sitting in y is
+    // preserved (y = base_forward result at line 76).
+    xllm::bgmv_expand(buf_q, qB, indices, y, /*offset=*/0, q_size_local_);
+    xllm::bgmv_expand(buf_k, kB, indices, y, q_size_local_, kv_size_local_);
+    xllm::bgmv_expand(
+        buf_v, vB, indices, y, q_size_local_ + kv_size_local_, kv_size_local_);
+    return y;
+  } while (false);
+#endif  // USE_NPU
+
   auto& runtime = LoRARuntime::instance();
   int64_t tok_off = 0;
   for (size_t seq_idx = 0; seq_idx < adapter_ids.size(); ++seq_idx) {

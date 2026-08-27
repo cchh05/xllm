@@ -24,6 +24,7 @@ cc_library(
     lora_context.h
     lora_metrics.h
     $<$<BOOL:${USE_NPU}>:ascendc/ascendc_lora_storage.h>
+    $<$<BOOL:${USE_NPU}>:ascendc/xllm_lora_ascendc_binding.h>
   SRCS
     lora_config.cpp
     lora_registry.cpp
