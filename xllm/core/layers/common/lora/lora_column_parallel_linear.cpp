@@ -9,6 +9,10 @@ Licensed under the Apache License, Version 2.0.
 
 #include "framework/lora/lora_context.h"
 #include "framework/lora/lora_runtime.h"
+#if defined(USE_NPU)
+#include "framework/lora/ascendc/ascendc_lora_storage.h"
+#include "framework/lora/ascendc/xllm_lora_ascendc_binding.h"
+#endif
 
 namespace xllm {
 namespace layer {
@@ -130,6 +134,95 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
       }
     }
   }
+
+#if defined(USE_NPU)
+  // Commit C (2026-08-28) - AscendC LoRA slow_path for fused gate_up column
+  // parallel (MoE). Replaces per-seq for-loop with 2 batched bgmv (gate+up
+  // independent kernel pair, concat via offset). Reuses storage buf_gate /
+  // buf_up (independent from QKV bufs) + slot_lookup_dev (Fix W device
+  // indices, graph-capture safe).
+  do {
+    static bool first_attempt_col = true;
+    if (first_attempt_col) {
+      first_attempt_col = false;
+      LOG(INFO) << "[AscendC Column slow_path] first attempt (env checked)";
+    }
+    if (std::getenv("USE_ASCENDC_LORA") == nullptr) break;
+    if (adapter_ids.size() <= 1) break;
+    if (!input.device().is_privateuseone()) break;
+    if (!is_fused_gate_up_) break;
+
+    auto& storage = AscendCLoRAStorage::instance();
+    auto gate_view = storage.get_stacked(ctx->layer_index, "gate_proj");
+    auto up_view = storage.get_stacked(ctx->layer_index, "up_proj");
+    if (!gate_view.valid || !up_view.valid) break;
+
+    const int64_t R = gate_view.A_stacked.size(1);
+    if (R > 64) break;
+    if (gate_view.A_stacked.dim() != 3 || up_view.A_stacked.dim() != 3) break;
+    if (gate_view.A_stacked.size(1) != R || up_view.A_stacked.size(1) != R)
+      break;
+    if (gate_view.A_stacked.size(2) != input.size(1)) break;
+
+    bool all_registered = true;
+    for (size_t s = 0; s < adapter_ids.size(); ++s) {
+      if (adapter_ids[s] == 0) {
+        all_registered = false;
+        break;
+      }
+    }
+    if (!all_registered) break;
+
+    if (ctx->adapter_ids_per_token == nullptr ||
+        !ctx->adapter_ids_per_token->defined() ||
+        !storage.slot_lookup_dev().defined())
+      break;
+
+    const int64_t total_tokens = input.size(0);
+    if (ctx->adapter_ids_per_token->numel() != total_tokens) break;
+    if (!storage.buf_gate().defined() || !storage.buf_up().defined()) break;
+    if (storage.buf_max_t() < total_tokens) break;
+
+    LOG_EVERY_N(INFO, 100) << "[AscendC Column slow_path] enter, aids="
+                           << adapter_ids.size()
+                           << " layer=" << ctx->layer_index << " R=" << R;
+
+    auto indices =
+        storage.slot_lookup_dev().index_select(0, *ctx->adapter_ids_per_token);
+
+    auto shard_B_col = [&](const torch::Tensor& B_full) {
+      if (tp_world_size_ <= 1 || B_full.size(1) <= inter_size_local_)
+        return B_full;
+      const int64_t num_shards = B_full.size(1) / inter_size_local_;
+      if (num_shards <= 0) return B_full;
+      const int64_t shard_idx = tp_rank_ * num_shards / tp_world_size_;
+      const int64_t start = shard_idx * inter_size_local_;
+      return B_full.slice(1, start, start + inter_size_local_);
+    };
+    auto gateB = shard_B_col(gate_view.B_stacked);
+    auto upB = shard_B_col(up_view.B_stacked);
+
+    auto buf_g =
+        storage.buf_gate().slice(0, 0, total_tokens).slice(1, 0, R).zero_();
+    auto buf_u =
+        storage.buf_up().slice(0, 0, total_tokens).slice(1, 0, R).zero_();
+    xllm::bgmv_shrink(input,
+                      gate_view.A_stacked,
+                      indices,
+                      buf_g,
+                      static_cast<double>(gate_view.scaling));
+    xllm::bgmv_shrink(input,
+                      up_view.A_stacked,
+                      indices,
+                      buf_u,
+                      static_cast<double>(up_view.scaling));
+
+    xllm::bgmv_expand(buf_g, gateB, indices, y, 0, inter_size_local_);
+    xllm::bgmv_expand(
+        buf_u, upB, indices, y, inter_size_local_, inter_size_local_);
+    return y;
+  } while (false);
+#endif  // USE_NPU
 
   auto& runtime = LoRARuntime::instance();
   int64_t tok_off = 0;

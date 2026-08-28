@@ -118,6 +118,11 @@ class AscendCLoRAStorage {
   const torch::Tensor& buf_q() const { return buf_q_shared_; }
   const torch::Tensor& buf_k() const { return buf_k_shared_; }
   const torch::Tensor& buf_v() const { return buf_v_shared_; }
+  // Commit C: MoE column (gate/up) + row (down/o) independent bufs to avoid
+  // race with QKV bufs under xllm layer_synchronizer multi-stream forward.
+  const torch::Tensor& buf_gate() const { return buf_gate_shared_; }
+  const torch::Tensor& buf_up() const { return buf_up_shared_; }
+  const torch::Tensor& buf_down() const { return buf_down_shared_; }
   int64_t buf_max_t() const { return buf_max_t_; }
 
   // Fix W: device-side slot lookup table. Shape [kMaxIntId] int64, populated
@@ -168,6 +173,10 @@ class AscendCLoRAStorage {
   torch::Tensor buf_q_shared_;
   torch::Tensor buf_k_shared_;
   torch::Tensor buf_v_shared_;
+  // Commit C: MoE bufs
+  torch::Tensor buf_gate_shared_;
+  torch::Tensor buf_up_shared_;
+  torch::Tensor buf_down_shared_;
   int64_t buf_max_t_ = 0;
 
   // Fix W: device-side slot lookup table [kMaxIntId] int64, init -1.

@@ -10,6 +10,10 @@ Licensed under the Apache License, Version 2.0.
 #include "framework/lora/lora_config.h"
 #include "framework/lora/lora_context.h"
 #include "framework/lora/lora_runtime.h"
+#if defined(USE_NPU)
+#include "framework/lora/ascendc/ascendc_lora_storage.h"
+#include "framework/lora/ascendc/xllm_lora_ascendc_binding.h"
+#endif
 #include "framework/parallel_state/parallel_state.h"
 
 namespace xllm {
@@ -193,6 +197,93 @@ torch::Tensor LoRARowParallelLinearImpl::forward(torch::Tensor input) {
   // here — legacy issues N collectives per proj per layer for an N-seq
   // batch; fused issues 1. Interleaved base + adapter seqs are still the
   // main cost driver; adapter-affinity batching at the gateway helps.
+#if defined(USE_NPU)
+  // Commit C (2026-08-28) - AscendC LoRA slow_path for row parallel (down/o).
+  // Replaces per-seq for-loop with 1 batched bgmv (single proj_name_). Reuses
+  // storage buf_down (independent from QKV bufs) + slot_lookup_dev.
+  // Note: Row parallel shards A along dim=2 (input hidden) via tp_rank.
+  do {
+    static bool first_attempt_row = true;
+    if (first_attempt_row) {
+      first_attempt_row = false;
+      LOG(INFO) << "[AscendC Row slow_path] first attempt (env checked) proj="
+                << proj_name_;
+    }
+    if (std::getenv("USE_ASCENDC_LORA") == nullptr) break;
+    if (adapter_ids.size() <= 1) break;
+    if (!input.device().is_privateuseone()) break;
+
+    auto& storage = AscendCLoRAStorage::instance();
+    auto view = storage.get_stacked(ctx->layer_index, proj_name_);
+    if (!view.valid) break;
+
+    const int64_t R = view.A_stacked.size(1);
+    if (R > 64) break;
+    if (view.A_stacked.dim() != 3) break;
+    if (view.A_stacked.size(1) != R) break;
+    // Row A shape: [N, R, H_in_full]. TP shards A along dim=2 by tp_rank.
+    // A_local width should match input.size(1) (already TP-sharded input).
+    const int64_t A_hin = view.A_stacked.size(2);
+    const int64_t in_local = static_cast<int64_t>(in_features_local_);
+    if (tp_world_size_ > 1 && A_hin > in_local) {
+      // A pre-shard: caller will slice per-rank below
+    } else if (A_hin != input.size(1)) {
+      break;
+    }
+
+    bool all_registered = true;
+    for (size_t s = 0; s < adapter_ids.size(); ++s) {
+      if (adapter_ids[s] == 0) {
+        all_registered = false;
+        break;
+      }
+    }
+    if (!all_registered) break;
+
+    if (ctx->adapter_ids_per_token == nullptr ||
+        !ctx->adapter_ids_per_token->defined() ||
+        !storage.slot_lookup_dev().defined())
+      break;
+
+    const int64_t total_tokens = input.size(0);
+    if (ctx->adapter_ids_per_token->numel() != total_tokens) break;
+    if (!storage.buf_down().defined()) break;
+    if (storage.buf_max_t() < total_tokens) break;
+
+    LOG_EVERY_N(INFO, 100) << "[AscendC Row slow_path] enter, aids="
+                           << adapter_ids.size()
+                           << " layer=" << ctx->layer_index
+                           << " proj=" << proj_name_ << " R=" << R;
+
+    auto indices =
+        storage.slot_lookup_dev().index_select(0, *ctx->adapter_ids_per_token);
+
+    // TP shard A along dim=2 (H_in_full -> in_features_local)
+    torch::Tensor A_stacked_local = view.A_stacked;
+    if (tp_world_size_ > 1 && A_hin > in_local) {
+      const int64_t num_shards = A_hin / in_local;
+      if (num_shards <= 0) break;
+      const int64_t shard_idx = static_cast<int64_t>(tp_rank_) * num_shards /
+                                static_cast<int64_t>(tp_world_size_);
+      const int64_t start = shard_idx * in_local;
+      A_stacked_local = view.A_stacked.slice(2, start, start + in_local);
+    }
+
+    // B: [N, H_out, R]. Row parallel: B is full output (no TP shard on B).
+    const int64_t out_size = view.B_stacked.size(1);
+
+    auto buf_d =
+        storage.buf_down().slice(0, 0, total_tokens).slice(1, 0, R).zero_();
+    xllm::bgmv_shrink(input,
+                      A_stacked_local,
+                      indices,
+                      buf_d,
+                      static_cast<double>(view.scaling));
+    xllm::bgmv_expand(buf_d, view.B_stacked, indices, y, 0, out_size);
+    return y;
+  } while (false);
+#endif  // USE_NPU
+
   auto& runtime = LoRARuntime::instance();
   int64_t tok_off = 0;
   for (size_t seq_idx = 0; seq_idx < adapter_ids.size(); ++seq_idx) {

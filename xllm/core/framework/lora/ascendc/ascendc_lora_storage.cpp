@@ -26,8 +26,13 @@ void AscendCLoRAStorage::ensure_bufs_ready_locked(torch::Device device,
   buf_q_shared_ = torch::zeros({buf_max_t_, kBufMaxR}, opts);
   buf_k_shared_ = torch::zeros({buf_max_t_, kBufMaxR}, opts);
   buf_v_shared_ = torch::zeros({buf_max_t_, kBufMaxR}, opts);
+  // Commit C: MoE gate/up/down bufs, independent to avoid concurrent op race
+  buf_gate_shared_ = torch::zeros({buf_max_t_, kBufMaxR}, opts);
+  buf_up_shared_ = torch::zeros({buf_max_t_, kBufMaxR}, opts);
+  buf_down_shared_ = torch::zeros({buf_max_t_, kBufMaxR}, opts);
   LOG(INFO) << "[AscendCLoRAStorage] buf pool alloc max_t=" << buf_max_t_
-            << " R_max=" << kBufMaxR << " (Q/K/V fp32, per-rank shared)";
+            << " R_max=" << kBufMaxR
+            << " (Q/K/V + gate/up/down fp32, per-rank shared, Commit C)";
 }
 
 void AscendCLoRAStorage::update_slot_lookup_locked(uint64_t int_id,
