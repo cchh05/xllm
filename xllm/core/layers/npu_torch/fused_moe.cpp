@@ -36,6 +36,7 @@ limitations under the License.
 #include "framework/config/eplb_config.h"
 #include "framework/config/kernel_config.h"
 #include "framework/config/scheduler_config.h"
+#include "framework/lora/lora_context.h"
 #include "framework/parallel_state/mega_moe_comm_resource.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
@@ -1264,7 +1265,28 @@ torch::Tensor FusedMoEImpl::forward(const torch::Tensor& hidden_states,
   }
 
   std::optional<torch::Tensor> shared_output = std::nullopt;
+  LOG_FIRST_N(ERROR, 5) << "[FusedMoE_diag] n_shared_experts="
+                        << n_shared_experts_ << " shared_experts_valid="
+                        << (shared_experts_ ? "yes" : "no");
   if (n_shared_experts_ > 0) {
+    {
+      const auto* _sedmoe_ctx = xllm::current_lora_context();
+      LOG_FIRST_N(ERROR, 20)
+          << "[SharedExpert aids_pt_diag call_site1]"
+          << " ctx=" << (_sedmoe_ctx ? "ok" : "null") << " aids_pt_ptr="
+          << (_sedmoe_ctx && _sedmoe_ctx->adapter_ids_per_token ? "ok" : "null")
+          << " aids_pt_def="
+          << (_sedmoe_ctx && _sedmoe_ctx->adapter_ids_per_token &&
+                      _sedmoe_ctx->adapter_ids_per_token->defined()
+                  ? "def"
+                  : "undef")
+          << " aids_pt_numel="
+          << (_sedmoe_ctx && _sedmoe_ctx->adapter_ids_per_token &&
+                      _sedmoe_ctx->adapter_ids_per_token->defined()
+                  ? _sedmoe_ctx->adapter_ids_per_token->numel()
+                  : -1)
+          << " input_tokens=" << input.size(0);
+    }
     shared_output = shared_experts_(input);
     if (should_apply_shared_expert_gate(shared_expert_gate_,
                                         is_deepseek_v4_,
@@ -1783,7 +1805,28 @@ torch::Tensor FusedMoEImpl::forward_with_selected_experts(
       std::make_pair(weights_2d.to(input.dtype()), ids_2d.to(torch::kInt32));
 
   std::optional<torch::Tensor> shared_output = std::nullopt;
+  LOG_FIRST_N(ERROR, 5) << "[FusedMoE_diag] n_shared_experts="
+                        << n_shared_experts_ << " shared_experts_valid="
+                        << (shared_experts_ ? "yes" : "no");
   if (n_shared_experts_ > 0) {
+    {
+      const auto* _sedmoe_ctx = xllm::current_lora_context();
+      LOG_FIRST_N(ERROR, 20)
+          << "[SharedExpert aids_pt_diag call_site1]"
+          << " ctx=" << (_sedmoe_ctx ? "ok" : "null") << " aids_pt_ptr="
+          << (_sedmoe_ctx && _sedmoe_ctx->adapter_ids_per_token ? "ok" : "null")
+          << " aids_pt_def="
+          << (_sedmoe_ctx && _sedmoe_ctx->adapter_ids_per_token &&
+                      _sedmoe_ctx->adapter_ids_per_token->defined()
+                  ? "def"
+                  : "undef")
+          << " aids_pt_numel="
+          << (_sedmoe_ctx && _sedmoe_ctx->adapter_ids_per_token &&
+                      _sedmoe_ctx->adapter_ids_per_token->defined()
+                  ? _sedmoe_ctx->adapter_ids_per_token->numel()
+                  : -1)
+          << " input_tokens=" << input.size(0);
+    }
     shared_output = shared_experts_(input);
     if (should_apply_shared_expert_gate(shared_expert_gate_,
                                         is_deepseek_v4_,

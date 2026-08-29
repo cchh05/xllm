@@ -100,6 +100,9 @@ DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
 }
 
 torch::Tensor DenseMLPImpl::forward(const torch::Tensor& hidden_states) {
+  LOG_FIRST_N(ERROR, 5) << "[DenseMLP_diag] forward called intermediate="
+                        << intermediate_size_
+                        << " is_smoothquant=" << is_smoothquant_;
   const FlashComm1Context* fc1_ctx = get_current_flash_comm1_context();
   const bool use_fc1_sequence_parallel =
       apply_fc1_sequence_parallel_ && fc1_ctx && is_sequence_sharded(*fc1_ctx);

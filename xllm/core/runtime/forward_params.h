@@ -216,7 +216,12 @@ inline bool has_contiguous_input_buffer_exclusions(
     const ModelInputParams& params) {
   return params.multimodal.mm_data.valid() || params.has_onerec_params() ||
          params.has_llmrec_params() || params.dit_forward_input.valid() ||
-         !params.multimodal.deep_stacks.empty();
+         !params.multimodal.deep_stacks.empty() ||
+         (!params.adapter_ids.empty() &&
+          params.adapter_ids.size() >
+              1);  // FIX_C1-refined: LoRA mixed batch (aids>1) force slow_path;
+                   // single-adapter batch stays on fast_path to avoid B_single
+                   // regress
 }
 
 inline void clear_contiguous_input_buffer_tensor_targets(

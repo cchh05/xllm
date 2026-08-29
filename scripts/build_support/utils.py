@@ -238,7 +238,7 @@ def _run_git_command(repo_root: str, args: list[str]) -> tuple[bool, str]:
     return True, output
 
 def _collect_submodule_init_issues(repo_root: str) -> dict[str, str]:
-    ok, output = _run_git_command(repo_root, ["submodule", "status", "--recursive"])
+    ok, output = _run_git_command(repo_root, ["submodule", "status"])
     if not ok:
         logger.error("❌ Failed to inspect submodule status.")
         _print_manual_check_commands([

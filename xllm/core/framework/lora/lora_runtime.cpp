@@ -81,7 +81,8 @@ void LoRARuntime::init(const LoRAConfig& config) {
       // exactly at ref_count==0 per RAII unpin discipline
       // xllm-lora-registry-cross-rank-int-id-race-2026-08-25), so no
       // forward can hold a reference to the stale weights.
-      if (std::getenv("USE_ASCENDC_LORA") != nullptr) {
+      if (std::getenv("USE_ASCENDC_LORA") != nullptr &&
+          std::getenv("DISABLE_ASCENDC_SPRINT_GAMMA") == nullptr) {
         AscendCLoRAStorage::instance().unregister_adapter(int_id);
       }
 #endif
@@ -742,7 +743,8 @@ std::optional<uint64_t> LoRARuntime::install_static_adapter_on_device_per_proj(
   // is set so a concurrent get_per_proj_delta reader always sees consistent
   // state. Failure to register (all N slots full) is non-fatal — slow_path
   // will just fall through to per-seq loop.
-  if (std::getenv("USE_ASCENDC_LORA") != nullptr) {
+  if (std::getenv("USE_ASCENDC_LORA") != nullptr &&
+      std::getenv("DISABLE_ASCENDC_SPRINT_GAMMA") == nullptr) {
     std::lock_guard g(materialise_mu_);
     auto it = per_proj_device_pool_.find(int_id);
     if (it != per_proj_device_pool_.end()) {

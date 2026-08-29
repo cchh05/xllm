@@ -109,6 +109,55 @@ class Qwen3HybridModelImplBase : public Qwen3HybridModelModule {
     // LoRAContext so wrapper (QKV / MLP) sees adapter_ids for this batch.
     // Without this, wrapper falls into fast-return and delta is never applied.
     ModelInputParams modified_input_params = input_params;
+
+    // FIX_C1.5: force build adapter_ids_per_token if not defined (mirror
+    // ModelInputParams::to logic). Bypass upstream fast_path skip issue where
+    // to_contiguous_input_buffer path never populated the device tensor.
+    if (!modified_input_params.adapter_ids.empty() &&
+        modified_input_params.adapter_ids.size() >
+            1 &&  // FIX_C1.5.b: skip populate for single-adapter batch (kernel
+                  // wrapper breaks on aids <= 1 anyway)
+        !modified_input_params.adapter_ids_per_token.defined()) {
+      std::vector<int64_t> host_aids;
+      const auto& q_lens = modified_input_params.attention.host.q_seq_lens;
+      host_aids.reserve(1024);
+      for (size_t si = 0; si < modified_input_params.adapter_ids.size(); ++si) {
+        const int64_t seq_len =
+            (si < q_lens.size()) ? static_cast<int64_t>(q_lens[si]) : 0;
+        for (int64_t t = 0; t < seq_len; ++t) {
+          host_aids.push_back(
+              static_cast<int64_t>(modified_input_params.adapter_ids[si]));
+        }
+      }
+      if (!host_aids.empty()) {
+        auto host_t = torch::tensor(host_aids, torch::kInt64);
+        modified_input_params.adapter_ids_per_token =
+            host_t.to(tokens.device(), /*non_blocking=*/true);
+      }
+      LOG_FIRST_N(ERROR, 20)
+          << "[FIX_C1.5 populate]"
+          << " aids_size=" << modified_input_params.adapter_ids.size()
+          << " q_lens_size=" << q_lens.size()
+          << " host_size=" << host_aids.size() << " aids_pt_def_after="
+          << modified_input_params.adapter_ids_per_token.defined();
+    }
+    LOG_FIRST_N(ERROR, 20)
+        << "[Hybrid top-level aids_pt_diag]"
+        << " input_params_aids_size=" << input_params.adapter_ids.size()
+        << " input_params_aids_pt_def="
+        << (input_params.adapter_ids_per_token.defined() ? "def" : "undef")
+        << " input_params_aids_pt_numel="
+        << (input_params.adapter_ids_per_token.defined()
+                ? input_params.adapter_ids_per_token.numel()
+                : -1)
+        << " modified_aids_pt_def="
+        << (modified_input_params.adapter_ids_per_token.defined() ? "def"
+                                                                  : "undef")
+        << " modified_aids_pt_numel="
+        << (modified_input_params.adapter_ids_per_token.defined()
+                ? modified_input_params.adapter_ids_per_token.numel()
+                : -1)
+        << " tokens_size=" << tokens.size(0);
     LoRAContextFrame lora_frame;
     lora_frame.adapter_ids = &modified_input_params.adapter_ids;
     lora_frame.q_seq_lens_vec =

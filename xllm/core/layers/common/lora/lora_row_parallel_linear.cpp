@@ -7,6 +7,8 @@ Licensed under the Apache License, Version 2.0.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <atomic>
+
 #include "framework/lora/lora_config.h"
 #include "framework/lora/lora_context.h"
 #include "framework/lora/lora_runtime.h"
@@ -203,21 +205,62 @@ torch::Tensor LoRARowParallelLinearImpl::forward(torch::Tensor input) {
   // storage buf_down (independent from QKV bufs) + slot_lookup_dev.
   // Note: Row parallel shards A along dim=2 (input hidden) via tp_rank.
   do {
+    if (std::getenv("DISABLE_ASCENDC_SPRINT_GAMMA") != nullptr)
+      break;  // FIX_F5B: comprehensive sprint gamma disable
     static bool first_attempt_row = true;
     if (first_attempt_row) {
       first_attempt_row = false;
       LOG(INFO) << "[AscendC Row slow_path] first attempt (env checked) proj="
                 << proj_name_;
     }
+    static std::atomic<int64_t> row_enter_reached{0};
+    static std::atomic<int64_t> row_aids_size_le_1{0};
+    static std::atomic<int64_t> row_defined_break{0};
+    static std::atomic<int64_t> row_numel_break{0};
+    static std::atomic<int64_t> row_buf_break{0};
+    static std::atomic<int64_t> row_kernel_launch{0};
+    row_enter_reached.fetch_add(1);
+    LOG_EVERY_N(ERROR, 500) << "[Row_STAT] enter=" << row_enter_reached.load()
+                            << " aids_le_1=" << row_aids_size_le_1.load()
+                            << " defined_break=" << row_defined_break.load()
+                            << " numel_break=" << row_numel_break.load()
+                            << " buf_break=" << row_buf_break.load()
+                            << " kernel_launch=" << row_kernel_launch.load();
+    LOG_FIRST_N(ERROR, 20)
+        << "[AscendC Row guard_diag P1]"
+        << " env=" << (std::getenv("USE_ASCENDC_LORA") ? "set" : "unset")
+        << " aids_size=" << adapter_ids.size()
+        << " device_npu=" << input.device().is_privateuseone()
+        << " proj=" << proj_name_ << " layer=" << ctx->layer_index
+        << " input_hidden=" << input.size(1)
+        << " total_tokens=" << input.size(0);
     if (std::getenv("USE_ASCENDC_LORA") == nullptr) break;
-    if (adapter_ids.size() <= 1) break;
+    if (adapter_ids.size() <= 1) {
+      row_aids_size_le_1.fetch_add(1);
+      break;
+    }
     if (!input.device().is_privateuseone()) break;
 
     auto& storage = AscendCLoRAStorage::instance();
     auto view = storage.get_stacked(ctx->layer_index, proj_name_);
+    LOG_FIRST_N(ERROR, 20) << "[AscendC Row guard_diag P2]"
+                           << " layer=" << ctx->layer_index
+                           << " proj=" << proj_name_
+                           << " view_valid=" << view.valid;
     if (!view.valid) break;
 
     const int64_t R = view.A_stacked.size(1);
+    const int64_t A_hin_early = view.A_stacked.size(2);
+    const int64_t in_local_early = static_cast<int64_t>(in_features_local_);
+    LOG_FIRST_N(ERROR, 20) << "[AscendC Row guard_diag P3]"
+                           << " layer=" << ctx->layer_index
+                           << " proj=" << proj_name_ << " R=" << R
+                           << " view_dim=" << view.A_stacked.dim()
+                           << " view_R=" << view.A_stacked.size(1)
+                           << " A_hin=" << A_hin_early
+                           << " in_local=" << in_local_early
+                           << " tp_world_size=" << tp_world_size_
+                           << " input_hidden=" << input.size(1);
     if (R > 64) break;
     if (view.A_stacked.dim() != 3) break;
     if (view.A_stacked.size(1) != R) break;
@@ -238,23 +281,53 @@ torch::Tensor LoRARowParallelLinearImpl::forward(torch::Tensor input) {
         break;
       }
     }
+    LOG_FIRST_N(ERROR, 20)
+        << "[AscendC Row guard_diag P4]"
+        << " layer=" << ctx->layer_index << " proj=" << proj_name_
+        << " all_reg=" << all_registered
+        << " aids_pt_ptr=" << (ctx->adapter_ids_per_token ? "ok" : "null")
+        << " aids_pt_def="
+        << (ctx->adapter_ids_per_token && ctx->adapter_ids_per_token->defined()
+                ? "def"
+                : "undef")
+        << " slot_lookup_def="
+        << (storage.slot_lookup_dev().defined() ? "def" : "undef")
+        << " aids_pt_numel="
+        << (ctx->adapter_ids_per_token && ctx->adapter_ids_per_token->defined()
+                ? ctx->adapter_ids_per_token->numel()
+                : -1)
+        << " total_tokens=" << input.size(0)
+        << " buf_down=" << (storage.buf_down().defined() ? "def" : "undef")
+        << " buf_max_t=" << storage.buf_max_t();
     if (!all_registered) break;
 
     if (ctx->adapter_ids_per_token == nullptr ||
         !ctx->adapter_ids_per_token->defined() ||
-        !storage.slot_lookup_dev().defined())
+        !storage.slot_lookup_dev().defined()) {
+      row_defined_break.fetch_add(1);
       break;
+    }
 
     const int64_t total_tokens = input.size(0);
-    if (ctx->adapter_ids_per_token->numel() != total_tokens) break;
-    if (!storage.buf_down().defined()) break;
-    if (storage.buf_max_t() < total_tokens) break;
+    if (ctx->adapter_ids_per_token->numel() != total_tokens) {
+      row_numel_break.fetch_add(1);
+      break;
+    }
+    if (!storage.buf_down().defined()) {
+      row_buf_break.fetch_add(1);
+      break;
+    }
+    if (storage.buf_max_t() < total_tokens) {
+      row_buf_break.fetch_add(1);
+      break;
+    }
 
     LOG_EVERY_N(INFO, 100) << "[AscendC Row slow_path] enter, aids="
                            << adapter_ids.size()
                            << " layer=" << ctx->layer_index
                            << " proj=" << proj_name_ << " R=" << R;
 
+    row_kernel_launch.fetch_add(1);
     auto indices =
         storage.slot_lookup_dev().index_select(0, *ctx->adapter_ids_per_token);
 

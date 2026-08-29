@@ -224,6 +224,8 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
   // If Step 4 bench misses KPI, move buf allocation into
   // AscendCLoRAStorage (per-layer pre-alloc + zero_() reuse).
   do {
+    if (std::getenv("DISABLE_ASCENDC_SPRINT_GAMMA") != nullptr)
+      break;  // FIX_F5B: comprehensive sprint gamma disable
     // Diag: first-attempt log fires exactly once per process so absence of
     // this line in the server log means the slow_path AscendC branch was
     // never even considered (e.g. the whole #ifdef USE_NPU wasn't compiled
@@ -267,37 +269,35 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
                            << adapter_ids.size()
                            << " layer=" << ctx->layer_index << " R=" << R;
 
-    // Per-token adapter slot indices.
-    // Fix W (2026-08-28): device-side index build. Legacy host-side path
-    // (build_indices_cpu + from_blob().to(device)) triggered aclrtMemcpy
-    // 107030 inside --enable_graph=true capture, causing 3-fallback
-    // regression (see 08-28 bench root cause). New path uses:
-    //   1. Host-only scan for the aid==0 fallback guard (no device op).
-    //   2. storage.slot_lookup_dev().index_select(0, adapter_ids_per_token)
-    //      — pure device op, graph-safe. adapter_ids_per_token is prepared
-    //      by ModelInputParams::to(device) at batch build time (Phase A W2
-    //      v2, see 07-06 memory).
+    // Per-token adapter slot indices. int_id 0 (base) or unregistered id
+    // → we fall back to per-seq (skeleton simplicity; a base-only seq
+    // interleaved with adapter seqs is uncommon in mixed batches).
     const int64_t total_tokens = input.size(0);
+    std::vector<int64_t> idx_host(total_tokens, -1);
+    int64_t off = 0;
     bool all_registered = true;
     for (size_t s = 0; s < adapter_ids.size(); ++s) {
-      if (adapter_ids[s] == 0) {
+      const int32_t slen = q_seq_lens[s];
+      if (slen <= 0) continue;
+      const uint64_t aid = adapter_ids[s];
+      if (aid == 0) {
         all_registered = false;
         break;
       }
+      auto slot_cpu = storage.build_indices_cpu({aid});
+      const int64_t slot = slot_cpu.data_ptr<int64_t>()[0];
+      if (slot < 0) {
+        all_registered = false;
+        break;
+      }
+      for (int32_t t = 0; t < slen; ++t) idx_host[off + t] = slot;
+      off += slen;
     }
     if (!all_registered) break;
-
-    if (ctx->adapter_ids_per_token == nullptr ||
-        !ctx->adapter_ids_per_token->defined() ||
-        !storage.slot_lookup_dev().defined()) {
-      break;  // device pipeline not ready → fallback per-seq
-    }
-    // Shape sanity: adapter_ids_per_token is [total_tokens] on device.
-    if (ctx->adapter_ids_per_token->numel() != total_tokens) {
-      break;  // shape mismatch → fallback (should not happen post-Phase A)
-    }
     auto indices =
-        storage.slot_lookup_dev().index_select(0, *ctx->adapter_ids_per_token);
+        torch::from_blob(idx_host.data(), {total_tokens}, torch::kInt64)
+            .clone()
+            .to(input.device());
 
     // TP shard B_stacked along dim=1 (H_out_full → out_local). Formula
     // mirrors the fast_path slice (line ~172 above) with the extra
@@ -317,19 +317,11 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
 
     // 3 bgmv_shrink (Q/K/V have independent A). Buf is fp32 per kernel
     // spec — shrink writes accumulator in fp32; expand reads it back.
-    // Fix Y (2026-08-27): shared per-rank buf pool pre-allocated at first
-    // install. slice + zero_() is a mutex-free device view op (no HBM alloc
-    // churn per forward). See ascendc_lora_storage.h buf_q()/k()/v() docs.
-    if (!storage.buf_q().defined() || !storage.buf_k().defined() ||
-        !storage.buf_v().defined() || storage.buf_max_t() < total_tokens) {
-      break;  // buf pool not ready (shouldnt happen post-install)
-    }
-    auto buf_q =
-        storage.buf_q().slice(0, 0, total_tokens).slice(1, 0, R).zero_();
-    auto buf_k =
-        storage.buf_k().slice(0, 0, total_tokens).slice(1, 0, R).zero_();
-    auto buf_v =
-        storage.buf_v().slice(0, 0, total_tokens).slice(1, 0, R).zero_();
+    const auto buf_options =
+        torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
+    auto buf_q = torch::zeros({total_tokens, R}, buf_options);
+    auto buf_k = torch::zeros({total_tokens, R}, buf_options);
+    auto buf_v = torch::zeros({total_tokens, R}, buf_options);
     xllm::bgmv_shrink(
         input, qv.A_stacked, indices, buf_q, static_cast<double>(qv.scaling));
     xllm::bgmv_shrink(
