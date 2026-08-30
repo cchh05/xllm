@@ -186,7 +186,7 @@ torch::Tensor LoRARowParallelLinearImpl::forward(torch::Tensor input) {
         delta = torch::matmul(tmp, pd->B.transpose(0, 1));
       }
       delta = (delta * pd->scaling).to(y.dtype());
-      y.add_(delta);
+      y = y + delta;  // NPU add_ silent no-op fix
       if (wrapper_owns_reduction_ && pg != nullptr) {
         y = xllm::parallel_state::reduce(y, pg);
       }

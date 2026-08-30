@@ -120,7 +120,7 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
         auto gate_delta = shrink_expand(gate_pd);
         auto up_delta = shrink_expand(up_pd);
         auto fused_delta = torch::cat({gate_delta, up_delta}, /*dim=*/-1);
-        y.add_(fused_delta);
+        y = y + fused_delta;  // NPU add_ silent no-op fix
         return y;
       } else {
         // Single-proj branch (reserved). Not exercised in Qwen family
@@ -136,7 +136,7 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
         }
         auto delta = torch::matmul(tmp, B_local.transpose(0, 1));
         delta = (delta * pd->scaling).to(y.dtype());
-        y.add_(delta);
+        y = y + delta;  // NPU add_ silent no-op fix
         return y;
       }
     }

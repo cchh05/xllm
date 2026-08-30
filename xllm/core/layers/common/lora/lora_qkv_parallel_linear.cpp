@@ -147,6 +147,10 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
         break;
       }
     }
+    LOG_EVERY_N(ERROR, 200)
+        << "[LORA_SINGLE_FAST] single_adapter=" << single_adapter
+        << " sole_aid=" << sole_aid << " layer_idx=" << ctx->layer_index
+        << " aids_size=" << adapter_ids.size();
     if (single_adapter && sole_aid != 0) {
       auto& runtime = LoRARuntime::instance();
       const auto* q_pd =
@@ -155,6 +159,11 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
           runtime.get_per_proj_delta(sole_aid, ctx->layer_index, "k_proj");
       const auto* v_pd =
           runtime.get_per_proj_delta(sole_aid, ctx->layer_index, "v_proj");
+      LOG_EVERY_N(ERROR, 200)
+          << "[LORA_SINGLE_PD] q_pd=" << (q_pd ? "ok" : "null")
+          << " k_pd=" << (k_pd ? "ok" : "null")
+          << " v_pd=" << (v_pd ? "ok" : "null")
+          << " layer_idx=" << ctx->layer_index << " sole_aid=" << sole_aid;
       if (q_pd == nullptr && k_pd == nullptr && v_pd == nullptr) {
         return y;
       }
@@ -191,7 +200,28 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
       auto k_delta = shrink_expand(k_pd, kv_size_local_);
       auto v_delta = shrink_expand(v_pd, kv_size_local_);
       auto qkv_delta = torch::cat({q_delta, k_delta, v_delta}, /*dim=*/-1);
-      y.add_(qkv_delta);
+      LOG_EVERY_N(ERROR, 200)
+          << "[LORA_DELTA_NORM] q_norm=" << q_delta.norm().item<float>()
+          << " k_norm=" << k_delta.norm().item<float>()
+          << " v_norm=" << v_delta.norm().item<float>()
+          << " qkv_norm=" << qkv_delta.norm().item<float>()
+          << " y_norm_before=" << y.norm().item<float>() << " y_shape=["
+          << y.size(0) << "," << (y.dim() > 1 ? y.size(1) : -1) << "]"
+          << " y_dtype=" << y.dtype() << " qkv_shape=[" << qkv_delta.size(0)
+          << "," << (qkv_delta.dim() > 1 ? qkv_delta.size(1) : -1) << "]"
+          << " qkv_dtype=" << qkv_delta.dtype()
+          << " q_size_local=" << q_size_local_
+          << " kv_size_local=" << kv_size_local_
+          << " input_norm=" << input.norm().item<float>()
+          << " layer_idx=" << ctx->layer_index;
+      // Fix: use out-of-place y = y + qkv_delta (in-place add_ silently no-ops)
+      auto y_pre_hash = y.data_ptr();
+      y = y + qkv_delta;
+      auto y_post_hash = y.data_ptr();
+      LOG_EVERY_N(ERROR, 200)
+          << "[LORA_DELTA_APPLIED_FIX] y_norm_after=" << y.norm().item<float>()
+          << " y_ptr_same=" << (y_pre_hash == y_post_hash ? 1 : 0)
+          << " layer_idx=" << ctx->layer_index;
       return y;
     }
   }
