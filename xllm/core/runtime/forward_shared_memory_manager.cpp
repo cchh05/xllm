@@ -2481,6 +2481,36 @@ inline void deserialize_forward_input_payload(
   forward_input.input_host_buffer_has_layout = true;
   if (materialize_device_buffer &&
       forward_input.device_input_buffer.defined()) {
+    // FIX_C1.5.c Option F: populate adapter_ids_per_token in the shared-memory
+    // deserialize path. Otherwise device_tensors_ready=true below causes
+    // ForwardInput::to() to short-circuit and adapter_ids_per_token stays
+    // undefined, forcing Fix C1.5 hybrid populate to fire inside captured
+    // stream (107027 crash).
+    auto& input_params = forward_input.input_params;
+    if (!input_params.adapter_ids.empty() &&
+        input_params.adapter_ids.size() > 1 &&
+        !input_params.adapter_ids_per_token.defined()) {
+      std::vector<int64_t> host_aids;
+      const auto& q_lens = input_params.attention.host.q_seq_lens;
+      host_aids.reserve(1024);
+      for (size_t si = 0; si < input_params.adapter_ids.size(); ++si) {
+        const int64_t seq_len =
+            (si < q_lens.size()) ? static_cast<int64_t>(q_lens[si]) : 0;
+        for (int64_t t = 0; t < seq_len; ++t) {
+          host_aids.push_back(
+              static_cast<int64_t>(input_params.adapter_ids[si]));
+        }
+      }
+      LOG_FIRST_N(ERROR, 20)
+          << "[FIX_C1.5.c_OptF] aids_size=" << input_params.adapter_ids.size()
+          << " q_lens_size=" << q_lens.size()
+          << " host_size=" << host_aids.size();
+      if (!host_aids.empty()) {
+        auto host_t = torch::tensor(host_aids, torch::kInt64);
+        input_params.adapter_ids_per_token =
+            host_t.to(device, /*non_blocking=*/true);
+      }
+    }
     forward_input.device_tensors_ready = true;
   }
   buffer = payload_base + buffer_size;

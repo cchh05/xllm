@@ -439,7 +439,16 @@ struct ForwardInput {
       return *this;
     }
 
-    if (input_host_buffer_has_layout) {
+    // FIX_C1.5.c: LoRA mixed batch (aids > 1) skips fast_path #1
+    // (unpack_from_input_host_buffer) so it falls through to slow_path
+    // input_params.to(device) at line ~474, which populates
+    // adapter_ids_per_token on prepare_stream (pre-capture). This enables
+    // graph=true production posture with AscendC kernel real launch —
+    // otherwise fast_path #1 wins and adapter_ids_per_token stays undefined
+    // until Hybrid forward top-level (intra-capture → 107027 crash).
+    const bool _fix_c15c_skip_fast_path_1 = !input_params.adapter_ids.empty() &&
+                                            input_params.adapter_ids.size() > 1;
+    if (input_host_buffer_has_layout && !_fix_c15c_skip_fast_path_1) {
       ForwardInput buffer_inputs;
       const bool materialize_device_buffer =
           ::xllm::ExecutionConfig::get_instance()

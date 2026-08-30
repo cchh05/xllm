@@ -990,6 +990,10 @@ struct GraphInput {
 struct ModelInputParams {
   ModelInputParams to(const torch::Device& device) const {
     ModelInputParams params;
+    LOG_FIRST_N(ERROR, 20) << "[TODEV_ENTRY] adapter_ids_size="
+                           << adapter_ids.size() << " q_lens_size="
+                           << attention.host.q_seq_lens.size()
+                           << " device=" << device;
     params.meta = meta;
     params.attention = attention.to(device);
     params.embedding = embedding.to(device);
@@ -1043,9 +1047,19 @@ struct ModelInputParams {
           host.push_back(static_cast<int64_t>(adapter_ids[si]));
         }
       }
+      LOG_FIRST_N(ERROR, 20)
+          << "[TODEV_HOST] aids_size=" << adapter_ids.size()
+          << " q_lens_size=" << q_lens.size() << " host_size=" << host.size();
       if (!host.empty()) {
         auto host_t = torch::tensor(host, torch::kInt64);
         params.adapter_ids_per_token = safe_to(host_t, device, true);
+        LOG_FIRST_N(ERROR, 20)
+            << "[TODEV_POPULATE] host_size=" << host.size()
+            << " device_tensor_def=" << params.adapter_ids_per_token.defined()
+            << " device_tensor_numel="
+            << (params.adapter_ids_per_token.defined()
+                    ? params.adapter_ids_per_token.numel()
+                    : -1);
       }
     }
 

@@ -245,23 +245,39 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
     auto qv = storage.get_stacked(ctx->layer_index, "q_proj");
     auto kv = storage.get_stacked(ctx->layer_index, "k_proj");
     auto vv = storage.get_stacked(ctx->layer_index, "v_proj");
-    if (!qv.valid || !kv.valid || !vv.valid) break;
+    // Patch B (memory xllm-ascendc-layer1-qkv-h1-precise-2026-08-28 Option
+    // A1-fix): Allow partial-QKV adapter invocation (per-proj optional).
+    // Adapter that only targets q_proj (e.g. p3a/qwen35-122b-se-* has Q but no
+    // K/V) can still fire kernel for valid projs. Skip whole path only if ALL 3
+    // invalid.
+    if (!qv.valid && !kv.valid && !vv.valid) break;
 
-    const int64_t R = qv.A_stacked.size(1);
+    // Patch B: derive R from whichever proj is valid (partial invocation OK)
+    const int64_t R = qv.valid   ? qv.A_stacked.size(1)
+                      : kv.valid ? kv.A_stacked.size(1)
+                                 : vv.A_stacked.size(1);
     if (R > 64) break;
 
     // Shape guards — early exit is better than device crash if storage
     // ever produced malformed slabs. register_adapter should refuse
     // zero-sized inputs so this is truly defense-in-depth.
-    if (qv.A_stacked.dim() != 3 || kv.A_stacked.dim() != 3 ||
-        vv.A_stacked.dim() != 3) {
+    // Patch B: per-proj shape check (skip check for invalid proj)
+    if ((qv.valid && qv.A_stacked.dim() != 3) ||
+        (kv.valid && kv.A_stacked.dim() != 3) ||
+        (vv.valid && vv.A_stacked.dim() != 3)) {
       break;
     }
-    if (qv.A_stacked.size(1) != R || kv.A_stacked.size(1) != R ||
-        vv.A_stacked.size(1) != R) {
-      break;  // Q/K/V rank mismatch
+    if ((qv.valid && qv.A_stacked.size(1) != R) ||
+        (kv.valid && kv.A_stacked.size(1) != R) ||
+        (vv.valid && vv.A_stacked.size(1) != R)) {
+      break;  // rank mismatch among valid projs
     }
-    if (qv.A_stacked.size(2) != input.size(1)) {
+    // hidden_in check: use first valid proj (all valid projs must have same
+    // hidden_in)
+    const int64_t hidden_in = qv.valid   ? qv.A_stacked.size(2)
+                              : kv.valid ? kv.A_stacked.size(2)
+                                         : vv.A_stacked.size(2);
+    if (hidden_in != input.size(1)) {
       break;  // hidden_in mismatch
     }
 
@@ -311,31 +327,35 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
       const int64_t start = shard_idx * out_local;
       return B_full.slice(1, start, start + out_local);
     };
-    auto qB = shard_B(qv.B_stacked, q_size_local_);
-    auto kB = shard_B(kv.B_stacked, kv_size_local_);
-    auto vB = shard_B(vv.B_stacked, kv_size_local_);
-
-    // 3 bgmv_shrink (Q/K/V have independent A). Buf is fp32 per kernel
-    // spec — shrink writes accumulator in fp32; expand reads it back.
+    // Patch B: per-proj kernel launch (skip invalid proj). Buf fp32 per spec.
     const auto buf_options =
         torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
-    auto buf_q = torch::zeros({total_tokens, R}, buf_options);
-    auto buf_k = torch::zeros({total_tokens, R}, buf_options);
-    auto buf_v = torch::zeros({total_tokens, R}, buf_options);
-    xllm::bgmv_shrink(
-        input, qv.A_stacked, indices, buf_q, static_cast<double>(qv.scaling));
-    xllm::bgmv_shrink(
-        input, kv.A_stacked, indices, buf_k, static_cast<double>(kv.scaling));
-    xllm::bgmv_shrink(
-        input, vv.A_stacked, indices, buf_v, static_cast<double>(vv.scaling));
-
-    // 3 bgmv_expand writing into y at Q/K/V segment offsets. The kernel
-    // accumulates in-place, so any base output already sitting in y is
-    // preserved (y = base_forward result at line 76).
-    xllm::bgmv_expand(buf_q, qB, indices, y, /*offset=*/0, q_size_local_);
-    xllm::bgmv_expand(buf_k, kB, indices, y, q_size_local_, kv_size_local_);
-    xllm::bgmv_expand(
-        buf_v, vB, indices, y, q_size_local_ + kv_size_local_, kv_size_local_);
+    if (qv.valid) {
+      auto qB = shard_B(qv.B_stacked, q_size_local_);
+      auto buf_q = torch::zeros({total_tokens, R}, buf_options);
+      xllm::bgmv_shrink(
+          input, qv.A_stacked, indices, buf_q, static_cast<double>(qv.scaling));
+      xllm::bgmv_expand(buf_q, qB, indices, y, /*offset=*/0, q_size_local_);
+    }
+    if (kv.valid) {
+      auto kB = shard_B(kv.B_stacked, kv_size_local_);
+      auto buf_k = torch::zeros({total_tokens, R}, buf_options);
+      xllm::bgmv_shrink(
+          input, kv.A_stacked, indices, buf_k, static_cast<double>(kv.scaling));
+      xllm::bgmv_expand(buf_k, kB, indices, y, q_size_local_, kv_size_local_);
+    }
+    if (vv.valid) {
+      auto vB = shard_B(vv.B_stacked, kv_size_local_);
+      auto buf_v = torch::zeros({total_tokens, R}, buf_options);
+      xllm::bgmv_shrink(
+          input, vv.A_stacked, indices, buf_v, static_cast<double>(vv.scaling));
+      xllm::bgmv_expand(buf_v,
+                        vB,
+                        indices,
+                        y,
+                        q_size_local_ + kv_size_local_,
+                        kv_size_local_);
+    }
     return y;
   } while (false);
 #endif  // USE_NPU
