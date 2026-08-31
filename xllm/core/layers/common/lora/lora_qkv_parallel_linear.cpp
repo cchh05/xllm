@@ -254,17 +254,12 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
   // If Step 4 bench misses KPI, move buf allocation into
   // AscendCLoRAStorage (per-layer pre-alloc + zero_() reuse).
   do {
-    if (std::getenv("DISABLE_ASCENDC_SPRINT_GAMMA") != nullptr)
-      break;  // FIX_F5B: comprehensive sprint gamma disable
-    // Diag: first-attempt log fires exactly once per process so absence of
-    // this line in the server log means the slow_path AscendC branch was
-    // never even considered (e.g. the whole #ifdef USE_NPU wasn't compiled
-    // in, or the flow never reached this point).
+    if (std::getenv("DISABLE_ASCENDC_SPRINT_GAMMA") != nullptr) break;
     {
       static bool first_attempt = true;
       if (first_attempt) {
         first_attempt = false;
-        LOG(INFO) << "[AscendC LoRA slow_path] first attempt (env checked)";
+        LOG(INFO) << "[AscendC LoRA slow_path multishape] first attempt";
       }
     }
     if (std::getenv("USE_ASCENDC_LORA") == nullptr) break;
@@ -272,83 +267,45 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
     if (!input.device().is_privateuseone()) break;
 
     auto& storage = AscendCLoRAStorage::instance();
-    auto qv = storage.get_stacked(ctx->layer_index, "q_proj");
-    auto kv = storage.get_stacked(ctx->layer_index, "k_proj");
-    auto vv = storage.get_stacked(ctx->layer_index, "v_proj");
-    // Patch B (memory xllm-ascendc-layer1-qkv-h1-precise-2026-08-28 Option
-    // A1-fix): Allow partial-QKV adapter invocation (per-proj optional).
-    // Adapter that only targets q_proj (e.g. p3a/qwen35-122b-se-* has Q but no
-    // K/V) can still fire kernel for valid projs. Skip whole path only if ALL 3
-    // invalid.
-    if (!qv.valid && !kv.valid && !vv.valid) break;
-
-    // Patch B: derive R from whichever proj is valid (partial invocation OK)
-    const int64_t R = qv.valid   ? qv.A_stacked.size(1)
-                      : kv.valid ? kv.A_stacked.size(1)
-                                 : vv.A_stacked.size(1);
-    if (R > 64) break;
-
-    // Shape guards — early exit is better than device crash if storage
-    // ever produced malformed slabs. register_adapter should refuse
-    // zero-sized inputs so this is truly defense-in-depth.
-    // Patch B: per-proj shape check (skip check for invalid proj)
-    if ((qv.valid && qv.A_stacked.dim() != 3) ||
-        (kv.valid && kv.A_stacked.dim() != 3) ||
-        (vv.valid && vv.A_stacked.dim() != 3)) {
+    auto qb = storage.get_bucketed(ctx->layer_index, "q_proj");
+    auto kb = storage.get_bucketed(ctx->layer_index, "k_proj");
+    auto vb = storage.get_bucketed(ctx->layer_index, "v_proj");
+    // Sprint γ+1: at least one proj has any bucket populated to proceed.
+    if (qb.num_buckets() == 0 && kb.num_buckets() == 0 &&
+        vb.num_buckets() == 0) {
       break;
     }
-    if ((qv.valid && qv.A_stacked.size(1) != R) ||
-        (kv.valid && kv.A_stacked.size(1) != R) ||
-        (vv.valid && vv.A_stacked.size(1) != R)) {
-      break;  // rank mismatch among valid projs
+    if (!storage.slot_lookup_dev().defined() ||
+        !storage.bucket_lookup_dev().defined()) {
+      break;
     }
-    // hidden_in check: use first valid proj (all valid projs must have same
-    // hidden_in)
-    const int64_t hidden_in = qv.valid   ? qv.A_stacked.size(2)
-                              : kv.valid ? kv.A_stacked.size(2)
-                                         : vv.A_stacked.size(2);
-    if (hidden_in != input.size(1)) {
-      break;  // hidden_in mismatch
+    if (ctx->adapter_ids_per_token == nullptr ||
+        !ctx->adapter_ids_per_token->defined()) {
+      break;
     }
 
-    LOG_EVERY_N(INFO, 100) << "[AscendC LoRA slow_path] enter, aids="
-                           << adapter_ids.size()
-                           << " layer=" << ctx->layer_index << " R=" << R;
-
-    // Per-token adapter slot indices. int_id 0 (base) or unregistered id
-    // → we fall back to per-seq (skeleton simplicity; a base-only seq
-    // interleaved with adapter seqs is uncommon in mixed batches).
     const int64_t total_tokens = input.size(0);
-    std::vector<int64_t> idx_host(total_tokens, -1);
-    int64_t off = 0;
-    bool all_registered = true;
-    for (size_t s = 0; s < adapter_ids.size(); ++s) {
-      const int32_t slen = q_seq_lens[s];
-      if (slen <= 0) continue;
-      const uint64_t aid = adapter_ids[s];
-      if (aid == 0) {
-        all_registered = false;
-        break;
-      }
-      auto slot_cpu = storage.build_indices_cpu({aid});
-      const int64_t slot = slot_cpu.data_ptr<int64_t>()[0];
-      if (slot < 0) {
-        all_registered = false;
-        break;
-      }
-      for (int32_t t = 0; t < slen; ++t) idx_host[off + t] = slot;
-      off += slen;
-    }
-    if (!all_registered) break;
-    auto indices =
-        torch::from_blob(idx_host.data(), {total_tokens}, torch::kInt64)
-            .clone()
-            .to(input.device());
+    // Per-token (bucket_id, slot) via device lookup. int_id=0 or
+    // unregistered → -1 sentinel in both tables.
+    auto per_tok_slot =
+        storage.slot_lookup_dev().index_select(0, *ctx->adapter_ids_per_token);
+    auto per_tok_bucket = storage.bucket_lookup_dev().index_select(
+        0, *ctx->adapter_ids_per_token);
 
-    // TP shard B_stacked along dim=1 (H_out_full → out_local). Formula
-    // mirrors the fast_path slice (line ~172 above) with the extra
-    // leading N dim shifted (0 → 1). num_shards >= 1 for a valid shard
-    // by construction (register_adapter refuses zero-sized B).
+    // Any -1 in slot → the batch contains a base or unregistered adapter
+    // token, which the sprint γ+1 kernel path does not handle (per-seq
+    // fallback below handles it correctly). Bail to keep semantics safe.
+    auto has_neg = (per_tok_slot < 0).any().to(torch::kCPU).item<bool>();
+    if (has_neg) break;
+
+    LOG_EVERY_N(INFO, 100) << "[AscendC LoRA slow_path multishape] enter aids="
+                           << adapter_ids.size()
+                           << " layer=" << ctx->layer_index
+                           << " q_buckets=" << qb.num_buckets()
+                           << " k_buckets=" << kb.num_buckets()
+                           << " v_buckets=" << vb.num_buckets();
+
+    // TP shard helper: slice B_stacked along dim=1 (H_out_full → out_local).
     auto shard_B = [&](const torch::Tensor& B_full, int64_t out_local) {
       if (tp_world_size_ <= 1 || B_full.size(1) <= out_local) return B_full;
       const int64_t num_shards = B_full.size(1) / out_local;
@@ -357,35 +314,80 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
       const int64_t start = shard_idx * out_local;
       return B_full.slice(1, start, start + out_local);
     };
-    // Patch B: per-proj kernel launch (skip invalid proj). Buf fp32 per spec.
+
+    // Dispatch one proj (q / k / v) across all its rank buckets. tokens
+    // are partitioned by per_tok_bucket == b; each partition launches its
+    // own bgmv_shrink + bgmv_expand, results scatter back into y via
+    // index_add along dim=0.
+    //
+    // buf is fp32; kernel signature requires fp32 [B, R] accumulator.
     const auto buf_options =
         torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
-    if (qv.valid) {
-      auto qB = shard_B(qv.B_stacked, q_size_local_);
-      auto buf_q = torch::zeros({total_tokens, R}, buf_options);
-      xllm::bgmv_shrink(
-          input, qv.A_stacked, indices, buf_q, static_cast<double>(qv.scaling));
-      xllm::bgmv_expand(buf_q, qB, indices, y, /*offset=*/0, q_size_local_);
-    }
-    if (kv.valid) {
-      auto kB = shard_B(kv.B_stacked, kv_size_local_);
-      auto buf_k = torch::zeros({total_tokens, R}, buf_options);
-      xllm::bgmv_shrink(
-          input, kv.A_stacked, indices, buf_k, static_cast<double>(kv.scaling));
-      xllm::bgmv_expand(buf_k, kB, indices, y, q_size_local_, kv_size_local_);
-    }
-    if (vv.valid) {
-      auto vB = shard_B(vv.B_stacked, kv_size_local_);
-      auto buf_v = torch::zeros({total_tokens, R}, buf_options);
-      xllm::bgmv_shrink(
-          input, vv.A_stacked, indices, buf_v, static_cast<double>(vv.scaling));
-      xllm::bgmv_expand(buf_v,
-                        vB,
-                        indices,
-                        y,
-                        q_size_local_ + kv_size_local_,
-                        kv_size_local_);
-    }
+    auto dispatch_proj = [&](const AscendCLoRAStorage::BucketedStackedView& bv,
+                             int64_t out_local,
+                             int64_t y_slice_offset,
+                             int64_t y_slice_size,
+                             float scaling_hint,
+                             const char* proj_name) {
+      (void)proj_name;
+      (void)scaling_hint;
+      for (int b = 0; b < bv.num_buckets(); ++b) {
+        const auto& view = bv.buckets[b];
+        if (!view.valid) continue;
+        const int64_t R = view.A_stacked.size(1);
+        if (R > 64) continue;  // kernel rank ceiling
+        if (view.A_stacked.size(2) != input.size(1)) continue;
+
+        // Mask of tokens whose bucket == b.
+        auto mask = (per_tok_bucket == static_cast<int64_t>(b));
+        auto sub_token_ids = torch::nonzero(mask).squeeze(-1);
+        if (sub_token_ids.numel() == 0) continue;
+
+        auto sub_input = input.index_select(0, sub_token_ids);
+        auto sub_slot = per_tok_slot.index_select(0, sub_token_ids);
+        const int64_t sub_B = sub_input.size(0);
+
+        auto sub_buf = torch::zeros({sub_B, R}, buf_options);
+        auto B_shard = shard_B(view.B_stacked, out_local);
+        // Sub-y-partial holds the LoRA delta for these tokens on the
+        // proj's out shard. Full-batch y remains untouched; we scatter
+        // into y.slice(1, offset, offset+size) below.
+        auto sub_y = torch::zeros({sub_B, out_local}, input.options());
+        xllm::bgmv_shrink(sub_input,
+                          view.A_stacked,
+                          sub_slot,
+                          sub_buf,
+                          static_cast<double>(view.scaling));
+        xllm::bgmv_expand(sub_buf,
+                          B_shard,
+                          sub_slot,
+                          sub_y,
+                          /*slice_offset=*/0,
+                          out_local);
+        // Scatter sub_y back into y at (sub_token_ids, [y_slice_offset,
+        // y_slice_offset+y_slice_size)). We add to preserve any existing
+        // contribution (e.g. base output already computed by base_->forward).
+        auto y_slice_view =
+            y.slice(1, y_slice_offset, y_slice_offset + y_slice_size);
+        y_slice_view.index_add_(0, sub_token_ids, sub_y);
+      }
+    };
+
+    dispatch_proj(qb,
+                  q_size_local_,
+                  /*y_offset=*/0,
+                  q_size_local_,
+                  /*scaling=*/1.0f,
+                  "q_proj");
+    dispatch_proj(
+        kb, kv_size_local_, q_size_local_, kv_size_local_, 1.0f, "k_proj");
+    dispatch_proj(vb,
+                  kv_size_local_,
+                  q_size_local_ + kv_size_local_,
+                  kv_size_local_,
+                  1.0f,
+                  "v_proj");
+
     return y;
   } while (false);
 #endif  // USE_NPU

@@ -2,41 +2,39 @@
  * Copyright (c) 2026 xllm authors.
  * SPDX-License-Identifier: Apache-2.0
  *
- * AscendCLoRAStorage — singleton holding N=8 pre-stacked adapter slabs
- * for AscendC bgmv/sgmv kernels. Populated via LoRARuntime install/unload
- * callbacks so per-forward path has zero organize overhead.
+ * AscendCLoRAStorage — multi-rank multi-adapter storage (sprint γ+1).
  *
- * Storage layout per (layer, proj):
- *   A_stacked:  [N, R, H_in]   fp16 device
- *   B_stacked:  [N, H_out, R]  fp16 device
- *   scaling:    float          (shared per adapter, we currently assume
- *                               all N adapters share same scaling — if not,
- *                               fold into A weight)
+ * DESIGN NOTE (sprint γ+1 v1):
+ *   Adapters in practice have a single rank across all layer/proj registers
+ *   (adapter_config.json has one "r" value). hidden_in is a model property,
+ *   also constant across all (layer, proj) for a given adapter. hidden_out
+ *   varies per proj (q_proj vs v_proj etc.) but is the same across all
+ *   adapters at the same (layer, proj). Therefore we bucket ONLY by rank:
+ *   adapters with the same rank share a slot number globally; each
+ *   (layer, proj) then holds its own StackedView with slab-shape derived
+ *   from that (layer, proj)'s natural hidden_in/hidden_out. Different-
+ *   rank adapters live in different buckets.
  *
- * int_id → slot mapping: int_id_to_slot_[int_id] gives 0..N-1 index used
- * to build per-token 'indices' tensor at forward time.
+ *   Slot occupancy is bucket-local: each rank bucket has kNMaxActive=8
+ *   slots. An adapter takes one slot in exactly one bucket (its rank)
+ *   and reuses that slot across all its (layer, proj) registers.
  *
- * Adding a 9th adapter when N slots occupied → returns false (caller
- * falls back to per-seq loop and logs a warning).
+ * Storage layout per (layer, proj, rank):
+ *   A_stacked [N=8, R, H_in]  bfloat16 device
+ *   B_stacked [N=8, H_out, R] bfloat16 device
  *
- * Amend (Fix Y + Fix Z, 2026-08-27):
- *   Y: shared per-rank buf pool (Q/K/V fp32 accumulators) pre-alloc on
- *      first install; forward hot path calls buf_q()/k()/v() + slice +
- *      zero_() — mutex-free view op, no HBM alloc churn.
- *   Z: std::mutex → std::shared_mutex; build_indices_cpu takes shared
- *      lock so concurrent forward readers do not serialize. int_id map
- *      pre-reserved to prevent rehash under concurrent readers.
+ * int_id → AdapterLocation:
+ *   {bucket_id (= rank_bucket), slot in that bucket, rank}
  *
- * Amend (Fix W, 2026-08-28):
- *   W: device-side slot lookup table (slot_lookup_dev_) populated at
- *      register time. Forward hot path replaces build_indices_cpu + .to()
- *      with slot_lookup_dev_.index_select(0, adapter_ids_per_token) —
- *      pure device op, no host→device sync memcpy. Required for
- *      compatibility with --enable_graph=true (CANN forbids sync memcpy
- *      inside graph capture; see 07-06 memory + 08-28 3-fallback bench
- *      root cause). Unregister does NOT invalidate the device slot;
- *      forward-path aid==0 host guard already blocks base-mixed batches
- *      from entering the device lookup path.
+ * Forward path (wrapper):
+ *   1. Token t → int_id[t] → (slot, bucket_id) via device lookup tables.
+ *   2. Group tokens by bucket_id.
+ *   3. Per bucket, launch bgmv_shrink/expand on that bucket's slab.
+ *   4. Scatter results back to y.
+ *
+ * Historical: sprint γ' assumed all adapters at (layer, proj) share the
+ * same rank slab. Crashed pod when 2nd adapter had different rank. See
+ * project-xllm-v010-r11-binpack-2026-08-31 for the crash story.
  */
 #pragma once
 
@@ -50,21 +48,44 @@
 
 namespace xllm {
 
+// Rank is the sole shape discriminator for bucketing. hidden_in / hidden_out
+// are derived per (layer, proj) at slab-allocation time.
+struct RankBucketKey {
+  int64_t rank = 0;
+
+  bool operator==(const RankBucketKey& o) const noexcept {
+    return rank == o.rank;
+  }
+};
+
+struct RankBucketKeyHash {
+  size_t operator()(const RankBucketKey& k) const noexcept {
+    return std::hash<int64_t>()(k.rank);
+  }
+};
+
+// Where a registered int_id lives. bucket_id is per-rank (assigned in
+// registration order per storage-global bucket table). slot is bucket-local
+// (0..kNMaxActive-1). rank is stored for shape verification and unregister.
+struct AdapterLocation {
+  int32_t bucket_id = -1;
+  int32_t slot = -1;
+  int64_t rank = 0;
+};
+
 class AscendCLoRAStorage {
  public:
   static constexpr int kNMaxActive = 8;
-  static constexpr int kBufMaxR = 64;
-  // Fix W: device slot lookup table upper bound. int_id assigned by
-  // LoRARegistry starts at 1 and increments; production SaaS scenarios
-  // typically stay <100 (see xllm-fastlibra memory). 1024 gives 10x safety
-  // margin at 8 KB per rank cost — negligible.
+  // Cap on distinct ranks (buckets). Beyond this, register falls through
+  // to baseline slow_path. Prod expects <= 4 distinct ranks.
+  static constexpr int kMaxBuckets = 8;
   static constexpr int64_t kMaxIntId = 1024;
 
   static AscendCLoRAStorage& instance();
 
-  // Register adapter's (layer, proj) A/B into a fixed slot. Returns
-  // slot index (0..N-1) on success, -1 if all N slots taken.
-  // idempotent for same int_id (returns previously-assigned slot).
+  // Register adapter tensors for (layer, proj) into a rank-bucket slot.
+  // Returns slot on success, -1 on failure (bucket full, bucket cap hit,
+  // shape inconsistency, etc.). Idempotent for same int_id + same rank.
   int register_adapter(uint64_t int_id,
                        int layer_idx,
                        const std::string& proj,
@@ -72,7 +93,8 @@ class AscendCLoRAStorage {
                        const torch::Tensor& B,
                        float scaling);
 
-  // Remove int_id from all (layer, proj) storage; slot becomes reusable.
+  // Remove int_id: free the slot in its rank bucket and zero the slab
+  // entries across all (layer, proj) that stored this adapter.
   void unregister_adapter(uint64_t int_id);
 
   struct StackedView {
@@ -80,81 +102,63 @@ class AscendCLoRAStorage {
     torch::Tensor B_stacked;  // [N, H_out, R]
     float scaling = 1.0f;
     bool valid = false;
-    // Incremented on every register/unregister that touches this (layer,proj).
-    // Callers may cache StackedView across forwards and revalidate cheaply by
-    // comparing version. Not yet used (all ops synchronous today) but keeps a
-    // hook for future async prefetch without breaking API.
     int64_t version = 0;
   };
 
-  // Fetch pre-stacked slabs for (layer, proj). Returns valid=false if
-  // no adapter registered for this key.
-  StackedView get_stacked(int layer_idx, const std::string& proj) const;
+  // Per (layer, proj) holds one StackedView per rank bucket. bucket_of_rank
+  // maps a rank value to its bucket_id (parallel to buckets vector).
+  struct BucketedStackedView {
+    std::vector<StackedView> buckets;     // indexed by bucket_id
+    std::vector<int64_t> rank_of_bucket;  // parallel to buckets
 
-  // Look up slot indices for a batch of adapter ids. Returns int32 tensor
-  // [batch_tokens] on CPU (caller .npu() before kernel launch).
-  // For int_id=0 (base) or int_id not in storage, returns -1 (kernel
-  // should mask or caller pre-filters).
-  // NOTE: This is the legacy host-side path. slow_path prefers Fix W
-  // slot_lookup_dev() which is graph-capture safe.
-  torch::Tensor build_indices_cpu(
-      const std::vector<uint64_t>& int_ids_per_token) const;
+    int num_buckets() const { return static_cast<int>(buckets.size()); }
+  };
 
-  // slot count currently in use
+  // Fetch all rank buckets for a (layer, proj). Empty view if nothing
+  // registered.
+  BucketedStackedView get_bucketed(int layer_idx,
+                                   const std::string& proj) const;
+
   int active_count() const;
 
-  // Fix Y: shared buf pool for slow_path Q/K/V fp32 accumulators. Grow-only,
-  // pre-allocated on the first install. Forward hot path calls buf_q()/k()/v()
-  // and does slice + zero_() — mutex-free view op on a device tensor.
-  //
-  // Buf shape: [buf_max_t_, kBufMaxR] fp32. Slot Q/K/V get independent tensors.
-  // Slice narrowing to (total_tokens, R) at forward time is a zero-copy view.
-  //
-  // Thread safety: buf_{q,k,v}_shared_ is set only inside register_adapter
-  // (under unique_lock). Once set, the tensor handle is const and safe to read
-  // from concurrent forward readers without lock. slice/zero_() operate on the
-  // device tensor via ATen, which is thread-safe for read/write on different
-  // slices per-forward.
-  const torch::Tensor& buf_q() const { return buf_q_shared_; }
-  const torch::Tensor& buf_k() const { return buf_k_shared_; }
-  const torch::Tensor& buf_v() const { return buf_v_shared_; }
-  // Commit C: MoE column (gate/up) + row (down/o) independent bufs to avoid
-  // race with QKV bufs under xllm layer_synchronizer multi-stream forward.
-  const torch::Tensor& buf_gate() const { return buf_gate_shared_; }
-  const torch::Tensor& buf_up() const { return buf_up_shared_; }
-  const torch::Tensor& buf_down() const { return buf_down_shared_; }
-  int64_t buf_max_t() const { return buf_max_t_; }
-
-  // Fix W: device-side slot lookup table. Shape [kMaxIntId] int64, populated
-  // at register time (install-path, graph-capture safe). Forward slow_path
-  // does `slot_lookup_dev().index_select(0, adapter_ids_per_token)` — pure
-  // device op, no host→device sync memcpy.
-  //
-  // Thread safety: allocated + written only inside register_adapter under
-  // unique_lock. Forward readers only take the tensor handle (const ref);
-  // index_select is a pure functional op producing a new tensor. Unregister
-  // does NOT invalidate the device slot (see class comment for rationale).
+  // Device-side lookup tables (Fix W generalized).
+  //   slot_lookup_dev_   [kMaxIntId] int64 → slot in the bucket (0..N-1)
+  //   bucket_lookup_dev_ [kMaxIntId] int64 → bucket_id (rank bucket)
+  // Both indexed by int_id. int_id=0 or unregistered → -1 (sentinel).
   const torch::Tensor& slot_lookup_dev() const { return slot_lookup_dev_; }
+  const torch::Tensor& bucket_lookup_dev() const { return bucket_lookup_dev_; }
+
+  // Return the rank associated with a bucket_id (host-side, for wrapper
+  // when it needs to allocate per-bucket buf tensors).
+  int64_t bucket_rank(int32_t bucket_id) const;
 
  private:
-  AscendCLoRAStorage() {
-    // Fix Z: reserve to prevent rehash on register while concurrent readers
-    // hold shared_lock. 8 slots * 4 = 32 buckets safety margin.
-    int_id_to_slot_.reserve(kNMaxActive * 4);
-  }
+  AscendCLoRAStorage() { int_id_to_location_.reserve(kMaxIntId); }
 
-  // Fix Y helper: allocate/grow shared buf pool if the requested max_t
-  // exceeds current capacity. Must be called under unique_lock (only from
-  // register_adapter which already holds the write lock).
-  void ensure_bufs_ready_locked(torch::Device device, int64_t max_t);
+  void update_lookup_locked(uint64_t int_id,
+                            int32_t bucket_id,
+                            int32_t slot,
+                            torch::Device device);
+  void clear_lookup_locked(uint64_t int_id);
 
-  // Fix W helper: allocate slot_lookup_dev_ on first call (init to -1),
-  // then write slot at position int_id. Must be called under unique_lock.
-  // int_id >= kMaxIntId is silently ignored — caller checks range or
-  // storage stays consistent with legacy int_id_to_slot_ map (host).
-  void update_slot_lookup_locked(uint64_t int_id,
-                                 int32_t slot,
-                                 torch::Device device);
+  // Find or create a global rank bucket. Returns bucket_id or -1 if
+  // kMaxBuckets is exhausted.
+  int find_or_create_rank_bucket_locked(int64_t rank);
+
+  // Find the first unused slot in the given rank bucket. Scans
+  // int_id_to_location_ for entries matching bucket_id. O(kMaxIntId).
+  int find_free_slot_in_bucket_locked(int32_t bucket_id) const;
+
+  // Ensure the (layer, proj, bucket_id) slab is allocated with the given
+  // A/B tensor shape. If slab exists but shape mismatches, log and
+  // return false (register_adapter will refuse the registration).
+  bool ensure_slab_allocated_locked(int layer_idx,
+                                    const std::string& proj,
+                                    int32_t bucket_id,
+                                    int64_t rank,
+                                    const torch::Tensor& A,
+                                    const torch::Tensor& B,
+                                    float scaling);
 
   using KeyType = std::pair<int, std::string>;
   struct KeyHash {
@@ -164,27 +168,15 @@ class AscendCLoRAStorage {
     }
   };
 
-  // int_id -> slot idx
-  std::unordered_map<uint64_t, int32_t> int_id_to_slot_;
-  // (layer, proj) -> stacked storage
-  std::unordered_map<KeyType, StackedView, KeyHash> storage_;
+  std::unordered_map<uint64_t, AdapterLocation> int_id_to_location_;
+  std::unordered_map<KeyType, BucketedStackedView, KeyHash> storage_;
 
-  // Fix Y: shared buf pool (Q/K/V fp32 accumulators), pre-alloc grow-only.
-  torch::Tensor buf_q_shared_;
-  torch::Tensor buf_k_shared_;
-  torch::Tensor buf_v_shared_;
-  // Commit C: MoE bufs
-  torch::Tensor buf_gate_shared_;
-  torch::Tensor buf_up_shared_;
-  torch::Tensor buf_down_shared_;
-  int64_t buf_max_t_ = 0;
+  // Global rank bucket table (rank_of_bucket_[bucket_id] = rank).
+  std::vector<int64_t> rank_of_bucket_;
 
-  // Fix W: device-side slot lookup table [kMaxIntId] int64, init -1.
   torch::Tensor slot_lookup_dev_;
+  torch::Tensor bucket_lookup_dev_;
 
-  // Fix Z: shared_mutex replaces std::mutex. Writers (register/unregister)
-  // take unique_lock; readers (get_stacked/build_indices_cpu/active_count)
-  // take shared_lock so concurrent forward paths do not serialize.
   mutable std::shared_mutex mu_;
 };
 

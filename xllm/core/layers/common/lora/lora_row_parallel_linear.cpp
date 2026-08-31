@@ -200,159 +200,89 @@ torch::Tensor LoRARowParallelLinearImpl::forward(torch::Tensor input) {
   // batch; fused issues 1. Interleaved base + adapter seqs are still the
   // main cost driver; adapter-affinity batching at the gateway helps.
 #if defined(USE_NPU)
-  // Commit C (2026-08-28) - AscendC LoRA slow_path for row parallel (down/o).
-  // Replaces per-seq for-loop with 1 batched bgmv (single proj_name_). Reuses
-  // storage buf_down (independent from QKV bufs) + slot_lookup_dev.
-  // Note: Row parallel shards A along dim=2 (input hidden) via tp_rank.
+  // Sprint γ+1 (2026-09-01): multi-rank multi-adapter row-parallel dispatch.
+  // Iterates rank buckets and launches one bgmv_shrink+expand per bucket.
+  //
+  // Row A_stacked [N, R, H_in_full] is TP-sharded on dim=2 per tp_rank.
+  // B_stacked [N, H_out, R] is not sharded.
   do {
-    if (std::getenv("DISABLE_ASCENDC_SPRINT_GAMMA") != nullptr)
-      break;  // FIX_F5B: comprehensive sprint gamma disable
+    if (std::getenv("DISABLE_ASCENDC_SPRINT_GAMMA") != nullptr) break;
     static bool first_attempt_row = true;
     if (first_attempt_row) {
       first_attempt_row = false;
-      LOG(INFO) << "[AscendC Row slow_path] first attempt (env checked) proj="
-                << proj_name_;
+      LOG(INFO) << "[AscendC Row multishape] first attempt proj=" << proj_name_;
     }
-    static std::atomic<int64_t> row_enter_reached{0};
-    static std::atomic<int64_t> row_aids_size_le_1{0};
-    static std::atomic<int64_t> row_defined_break{0};
-    static std::atomic<int64_t> row_numel_break{0};
-    static std::atomic<int64_t> row_buf_break{0};
-    static std::atomic<int64_t> row_kernel_launch{0};
-    row_enter_reached.fetch_add(1);
-    LOG_EVERY_N(ERROR, 500) << "[Row_STAT] enter=" << row_enter_reached.load()
-                            << " aids_le_1=" << row_aids_size_le_1.load()
-                            << " defined_break=" << row_defined_break.load()
-                            << " numel_break=" << row_numel_break.load()
-                            << " buf_break=" << row_buf_break.load()
-                            << " kernel_launch=" << row_kernel_launch.load();
-    LOG_FIRST_N(ERROR, 20)
-        << "[AscendC Row guard_diag P1]"
-        << " env=" << (std::getenv("USE_ASCENDC_LORA") ? "set" : "unset")
-        << " aids_size=" << adapter_ids.size()
-        << " device_npu=" << input.device().is_privateuseone()
-        << " proj=" << proj_name_ << " layer=" << ctx->layer_index
-        << " input_hidden=" << input.size(1)
-        << " total_tokens=" << input.size(0);
     if (std::getenv("USE_ASCENDC_LORA") == nullptr) break;
-    if (adapter_ids.size() <= 1) {
-      row_aids_size_le_1.fetch_add(1);
-      break;
-    }
+    if (adapter_ids.size() <= 1) break;
     if (!input.device().is_privateuseone()) break;
 
     auto& storage = AscendCLoRAStorage::instance();
-    auto view = storage.get_stacked(ctx->layer_index, proj_name_);
-    LOG_FIRST_N(ERROR, 20) << "[AscendC Row guard_diag P2]"
-                           << " layer=" << ctx->layer_index
-                           << " proj=" << proj_name_
-                           << " view_valid=" << view.valid;
-    if (!view.valid) break;
-
-    const int64_t R = view.A_stacked.size(1);
-    const int64_t A_hin_early = view.A_stacked.size(2);
-    const int64_t in_local_early = static_cast<int64_t>(in_features_local_);
-    LOG_FIRST_N(ERROR, 20) << "[AscendC Row guard_diag P3]"
-                           << " layer=" << ctx->layer_index
-                           << " proj=" << proj_name_ << " R=" << R
-                           << " view_dim=" << view.A_stacked.dim()
-                           << " view_R=" << view.A_stacked.size(1)
-                           << " A_hin=" << A_hin_early
-                           << " in_local=" << in_local_early
-                           << " tp_world_size=" << tp_world_size_
-                           << " input_hidden=" << input.size(1);
-    if (R > 64) break;
-    if (view.A_stacked.dim() != 3) break;
-    if (view.A_stacked.size(1) != R) break;
-    // Row A shape: [N, R, H_in_full]. TP shards A along dim=2 by tp_rank.
-    // A_local width should match input.size(1) (already TP-sharded input).
-    const int64_t A_hin = view.A_stacked.size(2);
-    const int64_t in_local = static_cast<int64_t>(in_features_local_);
-    if (tp_world_size_ > 1 && A_hin > in_local) {
-      // A pre-shard: caller will slice per-rank below
-    } else if (A_hin != input.size(1)) {
+    auto bv = storage.get_bucketed(ctx->layer_index, proj_name_);
+    if (bv.num_buckets() == 0) break;
+    if (!storage.slot_lookup_dev().defined() ||
+        !storage.bucket_lookup_dev().defined()) {
       break;
     }
-
-    bool all_registered = true;
-    for (size_t s = 0; s < adapter_ids.size(); ++s) {
-      if (adapter_ids[s] == 0) {
-        all_registered = false;
-        break;
-      }
-    }
-    LOG_FIRST_N(ERROR, 20)
-        << "[AscendC Row guard_diag P4]"
-        << " layer=" << ctx->layer_index << " proj=" << proj_name_
-        << " all_reg=" << all_registered
-        << " aids_pt_ptr=" << (ctx->adapter_ids_per_token ? "ok" : "null")
-        << " aids_pt_def="
-        << (ctx->adapter_ids_per_token && ctx->adapter_ids_per_token->defined()
-                ? "def"
-                : "undef")
-        << " slot_lookup_def="
-        << (storage.slot_lookup_dev().defined() ? "def" : "undef")
-        << " aids_pt_numel="
-        << (ctx->adapter_ids_per_token && ctx->adapter_ids_per_token->defined()
-                ? ctx->adapter_ids_per_token->numel()
-                : -1)
-        << " total_tokens=" << input.size(0)
-        << " buf_down=" << (storage.buf_down().defined() ? "def" : "undef")
-        << " buf_max_t=" << storage.buf_max_t();
-    if (!all_registered) break;
-
     if (ctx->adapter_ids_per_token == nullptr ||
-        !ctx->adapter_ids_per_token->defined() ||
-        !storage.slot_lookup_dev().defined()) {
-      row_defined_break.fetch_add(1);
+        !ctx->adapter_ids_per_token->defined()) {
       break;
     }
+    if (ctx->adapter_ids_per_token->numel() != input.size(0)) break;
 
-    const int64_t total_tokens = input.size(0);
-    if (ctx->adapter_ids_per_token->numel() != total_tokens) {
-      row_numel_break.fetch_add(1);
-      break;
-    }
-    if (!storage.buf_down().defined()) {
-      row_buf_break.fetch_add(1);
-      break;
-    }
-    if (storage.buf_max_t() < total_tokens) {
-      row_buf_break.fetch_add(1);
-      break;
-    }
-
-    LOG_EVERY_N(INFO, 100) << "[AscendC Row slow_path] enter, aids="
-                           << adapter_ids.size()
-                           << " layer=" << ctx->layer_index
-                           << " proj=" << proj_name_ << " R=" << R;
-
-    row_kernel_launch.fetch_add(1);
-    auto indices =
+    auto per_tok_slot =
         storage.slot_lookup_dev().index_select(0, *ctx->adapter_ids_per_token);
+    auto per_tok_bucket = storage.bucket_lookup_dev().index_select(
+        0, *ctx->adapter_ids_per_token);
+    if ((per_tok_slot < 0).any().to(torch::kCPU).item<bool>()) break;
 
-    // TP shard A along dim=2 (H_in_full -> in_features_local)
-    torch::Tensor A_stacked_local = view.A_stacked;
-    if (tp_world_size_ > 1 && A_hin > in_local) {
-      const int64_t num_shards = A_hin / in_local;
-      if (num_shards <= 0) break;
-      const int64_t shard_idx = static_cast<int64_t>(tp_rank_) * num_shards /
-                                static_cast<int64_t>(tp_world_size_);
-      const int64_t start = shard_idx * in_local;
-      A_stacked_local = view.A_stacked.slice(2, start, start + in_local);
+    LOG_EVERY_N(INFO, 100) << "[AscendC Row multishape] enter proj="
+                           << proj_name_ << " aids=" << adapter_ids.size()
+                           << " layer=" << ctx->layer_index
+                           << " buckets=" << bv.num_buckets();
+
+    const auto buf_options =
+        torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
+
+    for (int b = 0; b < bv.num_buckets(); ++b) {
+      const auto& view = bv.buckets[b];
+      if (!view.valid) continue;
+      const int64_t R = view.A_stacked.size(1);
+      if (R > 64) continue;
+
+      // TP shard A along dim=2 (H_in_full → in_features_local)
+      const int64_t A_hin = view.A_stacked.size(2);
+      const int64_t in_local = static_cast<int64_t>(in_features_local_);
+      torch::Tensor A_stacked_local = view.A_stacked;
+      if (tp_world_size_ > 1 && A_hin > in_local) {
+        const int64_t num_shards = A_hin / in_local;
+        if (num_shards <= 0) continue;
+        const int64_t shard_idx = static_cast<int64_t>(tp_rank_) * num_shards /
+                                  static_cast<int64_t>(tp_world_size_);
+        const int64_t start = shard_idx * in_local;
+        A_stacked_local = view.A_stacked.slice(2, start, start + in_local);
+      } else if (A_hin != input.size(1)) {
+        continue;
+      }
+
+      auto mask = (per_tok_bucket == static_cast<int64_t>(b));
+      auto sub_token_ids = torch::nonzero(mask).squeeze(-1);
+      if (sub_token_ids.numel() == 0) continue;
+
+      auto sub_input = input.index_select(0, sub_token_ids);
+      auto sub_slot = per_tok_slot.index_select(0, sub_token_ids);
+      const int64_t sub_B = sub_input.size(0);
+      const int64_t out_size = view.B_stacked.size(1);
+
+      auto sub_buf = torch::zeros({sub_B, R}, buf_options);
+      auto sub_y = torch::zeros({sub_B, out_size}, input.options());
+      xllm::bgmv_shrink(sub_input,
+                        A_stacked_local,
+                        sub_slot,
+                        sub_buf,
+                        static_cast<double>(view.scaling));
+      xllm::bgmv_expand(sub_buf, view.B_stacked, sub_slot, sub_y, 0, out_size);
+      y.index_add_(0, sub_token_ids, sub_y);
     }
-
-    // B: [N, H_out, R]. Row parallel: B is full output (no TP shard on B).
-    const int64_t out_size = view.B_stacked.size(1);
-
-    auto buf_d =
-        storage.buf_down().slice(0, 0, total_tokens).slice(1, 0, R).zero_();
-    xllm::bgmv_shrink(input,
-                      A_stacked_local,
-                      indices,
-                      buf_d,
-                      static_cast<double>(view.scaling));
-    xllm::bgmv_expand(buf_d, view.B_stacked, indices, y, 0, out_size);
     return y;
   } while (false);
 #endif  // USE_NPU

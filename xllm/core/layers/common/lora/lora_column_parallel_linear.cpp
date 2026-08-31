@@ -143,128 +143,49 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
   }
 
 #if defined(USE_NPU)
-  // Commit C (2026-08-28) - AscendC LoRA slow_path for fused gate_up column
-  // parallel (MoE). Replaces per-seq for-loop with 2 batched bgmv (gate+up
-  // independent kernel pair, concat via offset). Reuses storage buf_gate /
-  // buf_up (independent from QKV bufs) + slot_lookup_dev (Fix W device
-  // indices, graph-capture safe).
+  // Sprint γ+1 (2026-09-01): multi-rank multi-adapter dispatch. Replaces
+  // sprint γ' single-slab do-while. Buckets tokens by rank via
+  // bucket_lookup_dev and launches one bgmv_shrink+expand per bucket.
+  //
+  // Fused gate_up column parallel (MoE): each bucket runs 2 kernels
+  // (gate + up), independent scaling per bucket's slab metadata.
   do {
-    if (std::getenv("DISABLE_ASCENDC_SPRINT_GAMMA") != nullptr)
-      break;  // FIX_F5B: comprehensive sprint gamma disable
+    if (std::getenv("DISABLE_ASCENDC_SPRINT_GAMMA") != nullptr) break;
     static bool first_attempt_col = true;
     if (first_attempt_col) {
       first_attempt_col = false;
-      LOG(INFO) << "[AscendC Column slow_path] first attempt (env checked)";
+      LOG(INFO) << "[AscendC Column multishape] first attempt";
     }
-    static std::atomic<int64_t> col_enter_reached{0};
-    static std::atomic<int64_t> col_aids_size_le_1{0};
-    static std::atomic<int64_t> col_defined_break{0};
-    static std::atomic<int64_t> col_numel_break{0};
-    static std::atomic<int64_t> col_buf_break{0};
-    static std::atomic<int64_t> col_kernel_launch{0};
-    col_enter_reached.fetch_add(1);
-    LOG_EVERY_N(ERROR, 500)
-        << "[Column_STAT] enter=" << col_enter_reached.load()
-        << " aids_le_1=" << col_aids_size_le_1.load()
-        << " defined_break=" << col_defined_break.load()
-        << " numel_break=" << col_numel_break.load()
-        << " buf_break=" << col_buf_break.load()
-        << " kernel_launch=" << col_kernel_launch.load();
-    LOG_FIRST_N(ERROR, 20)
-        << "[AscendC Column guard_diag P1]"
-        << " env=" << (std::getenv("USE_ASCENDC_LORA") ? "set" : "unset")
-        << " aids_size=" << adapter_ids.size()
-        << " device_npu=" << input.device().is_privateuseone()
-        << " fused_gate_up=" << is_fused_gate_up_
-        << " layer=" << ctx->layer_index << " input_hidden=" << input.size(1)
-        << " total_tokens=" << input.size(0);
     if (std::getenv("USE_ASCENDC_LORA") == nullptr) break;
-    if (adapter_ids.size() <= 1) {
-      col_aids_size_le_1.fetch_add(1);
-      break;
-    }
+    if (adapter_ids.size() <= 1) break;
     if (!input.device().is_privateuseone()) break;
     if (!is_fused_gate_up_) break;
 
     auto& storage = AscendCLoRAStorage::instance();
-    auto gate_view = storage.get_stacked(ctx->layer_index, "gate_proj");
-    auto up_view = storage.get_stacked(ctx->layer_index, "up_proj");
-    LOG_FIRST_N(ERROR, 20) << "[AscendC Column guard_diag P2]"
-                           << " layer=" << ctx->layer_index
-                           << " gate_valid=" << gate_view.valid
-                           << " up_valid=" << up_view.valid;
-    if (!gate_view.valid || !up_view.valid) break;
-
-    const int64_t R = gate_view.A_stacked.size(1);
-    LOG_FIRST_N(ERROR, 20) << "[AscendC Column guard_diag P3]"
-                           << " layer=" << ctx->layer_index << " R=" << R
-                           << " gate_dim=" << gate_view.A_stacked.dim()
-                           << " up_dim=" << up_view.A_stacked.dim()
-                           << " gate_R=" << gate_view.A_stacked.size(1)
-                           << " up_R=" << up_view.A_stacked.size(1)
-                           << " gate_A_hidden=" << gate_view.A_stacked.size(2)
-                           << " input_hidden=" << input.size(1);
-    if (R > 64) break;
-    if (gate_view.A_stacked.dim() != 3 || up_view.A_stacked.dim() != 3) break;
-    if (gate_view.A_stacked.size(1) != R || up_view.A_stacked.size(1) != R)
+    auto gate_b = storage.get_bucketed(ctx->layer_index, "gate_proj");
+    auto up_b = storage.get_bucketed(ctx->layer_index, "up_proj");
+    if (gate_b.num_buckets() == 0 && up_b.num_buckets() == 0) break;
+    if (!storage.slot_lookup_dev().defined() ||
+        !storage.bucket_lookup_dev().defined()) {
       break;
-    if (gate_view.A_stacked.size(2) != input.size(1)) break;
-
-    bool all_registered = true;
-    for (size_t s = 0; s < adapter_ids.size(); ++s) {
-      if (adapter_ids[s] == 0) {
-        all_registered = false;
-        break;
-      }
     }
-    LOG_FIRST_N(ERROR, 20)
-        << "[AscendC Column guard_diag P4]"
-        << " layer=" << ctx->layer_index << " all_reg=" << all_registered
-        << " aids_pt_ptr=" << (ctx->adapter_ids_per_token ? "ok" : "null")
-        << " aids_pt_def="
-        << (ctx->adapter_ids_per_token && ctx->adapter_ids_per_token->defined()
-                ? "def"
-                : "undef")
-        << " slot_lookup_def="
-        << (storage.slot_lookup_dev().defined() ? "def" : "undef")
-        << " aids_pt_numel="
-        << (ctx->adapter_ids_per_token && ctx->adapter_ids_per_token->defined()
-                ? ctx->adapter_ids_per_token->numel()
-                : -1)
-        << " total_tokens=" << input.size(0)
-        << " buf_gate=" << (storage.buf_gate().defined() ? "def" : "undef")
-        << " buf_up=" << (storage.buf_up().defined() ? "def" : "undef")
-        << " buf_max_t=" << storage.buf_max_t();
-    if (!all_registered) break;
-
     if (ctx->adapter_ids_per_token == nullptr ||
-        !ctx->adapter_ids_per_token->defined() ||
-        !storage.slot_lookup_dev().defined()) {
-      col_defined_break.fetch_add(1);
+        !ctx->adapter_ids_per_token->defined()) {
       break;
     }
+    if (ctx->adapter_ids_per_token->numel() != input.size(0)) break;
 
-    const int64_t total_tokens = input.size(0);
-    if (ctx->adapter_ids_per_token->numel() != total_tokens) {
-      col_numel_break.fetch_add(1);
-      break;
-    }
-    if (!storage.buf_gate().defined() || !storage.buf_up().defined()) {
-      col_buf_break.fetch_add(1);
-      break;
-    }
-    if (storage.buf_max_t() < total_tokens) {
-      col_buf_break.fetch_add(1);
-      break;
-    }
-
-    LOG_EVERY_N(INFO, 100) << "[AscendC Column slow_path] enter, aids="
-                           << adapter_ids.size()
-                           << " layer=" << ctx->layer_index << " R=" << R;
-
-    col_kernel_launch.fetch_add(1);
-    auto indices =
+    auto per_tok_slot =
         storage.slot_lookup_dev().index_select(0, *ctx->adapter_ids_per_token);
+    auto per_tok_bucket = storage.bucket_lookup_dev().index_select(
+        0, *ctx->adapter_ids_per_token);
+    if ((per_tok_slot < 0).any().to(torch::kCPU).item<bool>()) break;
+
+    LOG_EVERY_N(INFO, 100) << "[AscendC Column multishape] enter aids="
+                           << adapter_ids.size()
+                           << " layer=" << ctx->layer_index
+                           << " gate_buckets=" << gate_b.num_buckets()
+                           << " up_buckets=" << up_b.num_buckets();
 
     auto shard_B_col = [&](const torch::Tensor& B_full) {
       if (tp_world_size_ <= 1 || B_full.size(1) <= inter_size_local_)
@@ -275,27 +196,64 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
       const int64_t start = shard_idx * inter_size_local_;
       return B_full.slice(1, start, start + inter_size_local_);
     };
-    auto gateB = shard_B_col(gate_view.B_stacked);
-    auto upB = shard_B_col(up_view.B_stacked);
 
-    auto buf_g =
-        storage.buf_gate().slice(0, 0, total_tokens).slice(1, 0, R).zero_();
-    auto buf_u =
-        storage.buf_up().slice(0, 0, total_tokens).slice(1, 0, R).zero_();
-    xllm::bgmv_shrink(input,
-                      gate_view.A_stacked,
-                      indices,
-                      buf_g,
-                      static_cast<double>(gate_view.scaling));
-    xllm::bgmv_shrink(input,
-                      up_view.A_stacked,
-                      indices,
-                      buf_u,
-                      static_cast<double>(up_view.scaling));
+    const auto buf_options =
+        torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
 
-    xllm::bgmv_expand(buf_g, gateB, indices, y, 0, inter_size_local_);
-    xllm::bgmv_expand(
-        buf_u, upB, indices, y, inter_size_local_, inter_size_local_);
+    // Iterate buckets present in EITHER gate or up (they should have
+    // parallel bucket_id since same adapter registers both). Use the
+    // shared bucket_id space.
+    const int max_buckets = std::max(gate_b.num_buckets(), up_b.num_buckets());
+    for (int b = 0; b < max_buckets; ++b) {
+      bool gate_valid = (b < gate_b.num_buckets()) && gate_b.buckets[b].valid;
+      bool up_valid = (b < up_b.num_buckets()) && up_b.buckets[b].valid;
+      if (!gate_valid && !up_valid) continue;
+
+      const int64_t R = gate_valid ? gate_b.buckets[b].A_stacked.size(1)
+                                   : up_b.buckets[b].A_stacked.size(1);
+      if (R > 64) continue;
+      if (gate_valid && gate_b.buckets[b].A_stacked.size(2) != input.size(1))
+        continue;
+      if (up_valid && up_b.buckets[b].A_stacked.size(2) != input.size(1))
+        continue;
+
+      auto mask = (per_tok_bucket == static_cast<int64_t>(b));
+      auto sub_token_ids = torch::nonzero(mask).squeeze(-1);
+      if (sub_token_ids.numel() == 0) continue;
+
+      auto sub_input = input.index_select(0, sub_token_ids);
+      auto sub_slot = per_tok_slot.index_select(0, sub_token_ids);
+      const int64_t sub_B = sub_input.size(0);
+
+      if (gate_valid) {
+        const auto& gate_view = gate_b.buckets[b];
+        auto sub_buf = torch::zeros({sub_B, R}, buf_options);
+        auto gateB = shard_B_col(gate_view.B_stacked);
+        auto sub_y = torch::zeros({sub_B, inter_size_local_}, input.options());
+        xllm::bgmv_shrink(sub_input,
+                          gate_view.A_stacked,
+                          sub_slot,
+                          sub_buf,
+                          static_cast<double>(gate_view.scaling));
+        xllm::bgmv_expand(
+            sub_buf, gateB, sub_slot, sub_y, 0, inter_size_local_);
+        y.slice(1, 0, inter_size_local_).index_add_(0, sub_token_ids, sub_y);
+      }
+      if (up_valid) {
+        const auto& up_view = up_b.buckets[b];
+        auto sub_buf = torch::zeros({sub_B, R}, buf_options);
+        auto upB = shard_B_col(up_view.B_stacked);
+        auto sub_y = torch::zeros({sub_B, inter_size_local_}, input.options());
+        xllm::bgmv_shrink(sub_input,
+                          up_view.A_stacked,
+                          sub_slot,
+                          sub_buf,
+                          static_cast<double>(up_view.scaling));
+        xllm::bgmv_expand(sub_buf, upB, sub_slot, sub_y, 0, inter_size_local_);
+        y.slice(1, inter_size_local_, 2 * inter_size_local_)
+            .index_add_(0, sub_token_ids, sub_y);
+      }
+    }
     return y;
   } while (false);
 #endif  // USE_NPU
