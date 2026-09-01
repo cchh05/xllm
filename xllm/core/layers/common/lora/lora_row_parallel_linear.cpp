@@ -325,7 +325,8 @@ torch::Tensor LoRARowParallelLinearImpl::forward(torch::Tensor input) {
     }
     delta = (delta * pd->scaling).to(y.dtype());
 
-    y.slice(0, tok_off, tok_off + seq_len).add_(delta);
+    auto y_view_row = y.slice(0, tok_off, tok_off + seq_len);
+    y_view_row.copy_(y_view_row + delta);
     tok_off += seq_len;
   }
   if (wrapper_owns_reduction_ && pg != nullptr) {

@@ -445,7 +445,8 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
     auto v_delta = make_delta(v_pd, kv_size_local_);
     auto qkv_delta = torch::cat({q_delta, k_delta, v_delta}, /*dim=*/-1);
 
-    y.slice(0, tok_off, tok_off + seq_len).add_(qkv_delta);
+    auto y_view = y.slice(0, tok_off, tok_off + seq_len);
+    y_view.copy_(y_view + qkv_delta);
     tok_off += seq_len;
   }
   return y;
