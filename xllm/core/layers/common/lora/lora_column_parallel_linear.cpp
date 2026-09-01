@@ -301,7 +301,8 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
       auto gate_delta = make_delta(gate_pd);
       auto up_delta = make_delta(up_pd);
       auto fused_delta = torch::cat({gate_delta, up_delta}, /*dim=*/-1);
-      y.slice(0, tok_off, tok_off + seq_len).add_(fused_delta);
+      auto y_view_fused = y.slice(0, tok_off, tok_off + seq_len);
+      y_view_fused.copy_(y_view_fused + fused_delta);
     } else {
       // Single proj (future use — reserved). Not applicable to Qwen for now.
       const auto* pd =
@@ -320,7 +321,8 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
       }
       auto delta = torch::matmul(tmp, B_local.transpose(0, 1));
       delta = (delta * pd->scaling).to(y.dtype());
-      y.slice(0, tok_off, tok_off + seq_len).add_(delta);
+      auto y_view_col = y.slice(0, tok_off, tok_off + seq_len);
+      y_view_col.copy_(y_view_col + delta);
     }
     tok_off += seq_len;
   }
