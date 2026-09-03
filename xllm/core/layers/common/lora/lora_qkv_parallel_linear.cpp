@@ -295,8 +295,6 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
     // Any -1 in slot → the batch contains a base or unregistered adapter
     // token, which the sprint γ+1 kernel path does not handle (per-seq
     // fallback below handles it correctly). Bail to keep semantics safe.
-    auto has_neg = (per_tok_slot < 0).any().to(torch::kCPU).item<bool>();
-    if (has_neg) break;
 
     LOG_EVERY_N(INFO, 100) << "[AscendC LoRA slow_path multishape] enter aids="
                            << adapter_ids.size()

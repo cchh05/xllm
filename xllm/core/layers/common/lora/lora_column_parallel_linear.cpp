@@ -179,7 +179,6 @@ torch::Tensor LoRAColumnParallelLinearImpl::forward(torch::Tensor input) {
         storage.slot_lookup_dev().index_select(0, *ctx->adapter_ids_per_token);
     auto per_tok_bucket = storage.bucket_lookup_dev().index_select(
         0, *ctx->adapter_ids_per_token);
-    if ((per_tok_slot < 0).any().to(torch::kCPU).item<bool>()) break;
 
     LOG_EVERY_N(INFO, 100) << "[AscendC Column multishape] enter aids="
                            << adapter_ids.size()
