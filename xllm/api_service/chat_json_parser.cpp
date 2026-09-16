@@ -69,6 +69,45 @@ Status normalize_tool_choice(nlohmann::json* json, bool* modified) {
   return Status();
 }
 
+// Consume top-level "system_prompt" (string) by prepending it as a system-role
+// message. Existing messages[0] with role=="system" wins: system_prompt is
+// dropped so callers can pin an explicit system message and evaluation harness
+// defaults do not silently override it.
+void normalize_system_prompt(nlohmann::json* json, bool* modified) {
+  if (!json->contains("system_prompt")) {
+    return;
+  }
+  nlohmann::json system_prompt = std::move((*json)["system_prompt"]);
+  json->erase("system_prompt");
+  *modified = true;
+
+  if (!system_prompt.is_string()) {
+    return;
+  }
+  const std::string& prompt_text = system_prompt.get_ref<const std::string&>();
+  if (prompt_text.empty()) {
+    return;
+  }
+
+  if (!json->contains("messages") || !(*json)["messages"].is_array()) {
+    (*json)["messages"] = nlohmann::json::array();
+  }
+  nlohmann::json& messages = (*json)["messages"];
+
+  const bool has_leading_system =
+      !messages.empty() && messages.front().is_object() &&
+      messages.front().contains("role") &&
+      messages.front()["role"].is_string() &&
+      messages.front()["role"].get_ref<const std::string&>() == "system";
+  if (has_leading_system) {
+    return;
+  }
+
+  nlohmann::json system_message = {{"role", "system"},
+                                   {"content", prompt_text}};
+  messages.insert(messages.begin(), std::move(system_message));
+}
+
 }  // namespace
 
 const ChatJsonParser& ChatJsonParser::get(ServingMode mode) {
@@ -94,6 +133,7 @@ std::pair<Status, std::string> VlmChatJsonParser::preprocess(
     if (!status.ok()) {
       return {status, ""};
     }
+    normalize_system_prompt(&json, &modified);
 
     if (!json.contains("messages") || !json["messages"].is_array()) {
       return modified ? std::make_pair(Status(), json.dump())
@@ -139,6 +179,7 @@ std::pair<Status, std::string> LlmChatJsonParser::preprocess(
     if (!status.ok()) {
       return {status, ""};
     }
+    normalize_system_prompt(&json, &modified);
 
     if (!json.contains("messages") || !json["messages"].is_array()) {
       return modified ? std::make_pair(Status(), json.dump())

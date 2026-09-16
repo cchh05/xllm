@@ -542,4 +542,119 @@ TEST_F(PreprocessChatJsonTest, AnthropicIgnoreEosParsedAfterRemap) {
   EXPECT_EQ(request.messages(0).content_string(), "Hello");
 }
 
+// =============================================================================
+// system_prompt normalization tests (OpenAI-compatible /v1/chat/completions)
+// =============================================================================
+
+TEST_F(PreprocessChatJsonTest, SystemPromptPrependedForLlm) {
+  std::string input = R"({
+    "system_prompt": "You are a helpful assistant.",
+    "messages": [{"role": "user", "content": "Hi"}]
+  })";
+  std::string expected = R"({
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "Hi"}
+    ]
+  })";
+  LlmChatJsonParser parser;
+  expect_success(input, parser, expected);
+}
+
+TEST_F(PreprocessChatJsonTest, SystemPromptPrependedForVlm) {
+  std::string input = R"({
+    "system_prompt": "You are a helpful assistant.",
+    "messages": [{"role": "user", "content": "Hi"}]
+  })";
+  std::string expected = R"({
+    "messages": [
+      {"role": "system",
+       "content": [{"type": "text", "text": "You are a helpful assistant."}]},
+      {"role": "user",
+       "content": [{"type": "text", "text": "Hi"}]}
+    ]
+  })";
+  VlmChatJsonParser parser;
+  expect_success(input, parser, expected);
+}
+
+TEST_F(PreprocessChatJsonTest, ExplicitSystemMessageWinsOverSystemPrompt) {
+  std::string input = R"({
+    "system_prompt": "default fallback",
+    "messages": [
+      {"role": "system", "content": "explicit system"},
+      {"role": "user", "content": "Hi"}
+    ]
+  })";
+  std::string expected = R"({
+    "messages": [
+      {"role": "system", "content": "explicit system"},
+      {"role": "user", "content": "Hi"}
+    ]
+  })";
+  LlmChatJsonParser parser;
+  expect_success(input, parser, expected);
+}
+
+TEST_F(PreprocessChatJsonTest, EmptySystemPromptDropped) {
+  std::string input = R"({
+    "system_prompt": "",
+    "messages": [{"role": "user", "content": "Hi"}]
+  })";
+  std::string expected = R"({
+    "messages": [{"role": "user", "content": "Hi"}]
+  })";
+  LlmChatJsonParser parser;
+  expect_success(input, parser, expected);
+}
+
+TEST_F(PreprocessChatJsonTest, NonStringSystemPromptDropped) {
+  std::string input = R"({
+    "system_prompt": 42,
+    "messages": [{"role": "user", "content": "Hi"}]
+  })";
+  std::string expected = R"({
+    "messages": [{"role": "user", "content": "Hi"}]
+  })";
+  LlmChatJsonParser parser;
+  expect_success(input, parser, expected);
+}
+
+TEST_F(PreprocessChatJsonTest, SystemPromptCreatesMessagesWhenMissing) {
+  std::string input = R"({
+    "system_prompt": "You are a helpful assistant."
+  })";
+  std::string expected = R"({
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."}
+    ]
+  })";
+  LlmChatJsonParser parser;
+  expect_success(input, parser, expected);
+}
+
+TEST_F(PreprocessChatJsonTest, SystemPromptParsedIntoChatRequestProto) {
+  std::string input = R"({
+    "model": "changjing5",
+    "system_prompt": "You are a helpful assistant.",
+    "messages": [{"role": "user", "content": "Hi"}]
+  })";
+  LlmChatJsonParser parser;
+  auto [status, processed] = parser.preprocess(input);
+  ASSERT_TRUE(status.ok()) << status.message();
+
+  proto::ChatRequest request;
+  google::protobuf::util::JsonParseOptions options;
+  options.ignore_unknown_fields = true;
+  auto parse_status =
+      google::protobuf::util::JsonStringToMessage(processed, &request, options);
+  ASSERT_TRUE(parse_status.ok()) << parse_status.ToString();
+
+  ASSERT_EQ(request.messages_size(), 2);
+  EXPECT_EQ(request.messages(0).role(), "system");
+  EXPECT_EQ(request.messages(0).content(), "You are a helpful assistant.");
+  EXPECT_EQ(request.messages(1).role(), "user");
+  EXPECT_EQ(request.messages(1).content(), "Hi");
+}
+
 }  // namespace xllm
