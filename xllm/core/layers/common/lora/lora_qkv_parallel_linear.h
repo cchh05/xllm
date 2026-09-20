@@ -132,9 +132,19 @@ class LoRAQKVParallelLinearImpl : public torch::nn::Module {
   int64_t tp_rank_ = 0;
   int64_t tp_world_size_ = 1;
 
+  // Local head geometry needed to reorder q_delta from per-head interleaved
+  // layout [q0,g0,q1,g1,...] to the grouped [Q|G] layout that matches the
+  // base's reordered qkv output (see qwen3_next_attention.cpp
+  // load_state_dict reorder). When q_has_gate_ is true, num_heads_local_
+  // counts the fused lane (attn_heads_local * 2), so real attention heads
+  // on this rank is num_heads_local_ / 2.
+  int64_t head_size_ = 0;
+  int64_t num_heads_local_ = 0;
+
   // True for Qwen3-Next-style attn_output_gate: q_size_local includes the
   // fused gate lane, and the PEFT adapter's B_q is expected at fused width.
-  // Currently informational — sizing already uses fused num_heads.
+  // When set, forward() reorders q_delta from per-head interleaved to
+  // grouped [Q|G] layout before adding to base qkv output.
   bool q_has_gate_ = false;
 };
 TORCH_MODULE(LoRAQKVParallelLinear);
