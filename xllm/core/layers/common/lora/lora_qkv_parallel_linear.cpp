@@ -18,6 +18,8 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <string_view>
+
 #include "framework/lora/lora_context.h"
 #include "framework/lora/lora_runtime.h"
 
@@ -59,6 +61,8 @@ LoRAQKVParallelLinearImpl::LoRAQKVParallelLinearImpl(
   q_size_local_ = num_heads * head_size;
   kv_size_local_ = num_kv_heads * head_size;
   out_size_local_ = q_size_local_ + 2 * kv_size_local_;
+  head_size_ = head_size;
+  num_heads_local_ = num_heads;  // fused (attn*2) when q_has_gate=true
   q_has_gate_ = q_has_gate;
 
   // Base linear owns the vanilla forward + weight loading path. NOT
@@ -81,6 +85,39 @@ LoRAQKVParallelLinearImpl::LoRAQKVParallelLinearImpl(
 
 torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
   auto y = base_->forward(input);
+
+  // Reorder helper for the Qwen3-Next attn_output_gate case.
+  //
+  // Root cause: base's qkv_proj weight is written on disk in per-head
+  // interleaved layout [q0,g0,q1,g1,...,q31,g31], and
+  // qwen3_next_attention.cpp load_state_dict() rewrites it in-place to the
+  // grouped layout [q0,q1,...,q31,g0,g1,...,g31] so the forward output is
+  // [Q_grouped | G_grouped | K | V]. The PEFT adapter's B_q is trained on
+  // the same on-disk interleaved layout, but xllm's LoRA install path
+  // never applies the equivalent reorder — so the delta added into the
+  // fused q lane lands in per-head interleaved slots while base already
+  // put Q_grouped there. Every LoRA delta value gets applied to the wrong
+  // half of the head, silently corrupting all of q_proj's fine-tune
+  // signal. Fix: reorder q_delta from interleaved to grouped just before
+  // it is concatenated with k/v.
+  //
+  // Input: [T, num_heads_local * 2 * head_size] laid out as
+  //          per-head [(q_head0, g_head0), (q_head1, g_head1), ...]
+  // Output: [T, num_heads_local * 2 * head_size] laid out as
+  //          [q_head0, q_head1, ..., g_head0, g_head1, ...]
+  //
+  // Only fires when q_has_gate_ is true; otherwise returns tensor as is.
+  auto reorder_q_delta_if_gated = [&](torch::Tensor q_delta) -> torch::Tensor {
+    if (!q_has_gate_) return q_delta;
+    const int64_t T = q_delta.size(0);
+    const int64_t attn_heads_local = num_heads_local_ / 2;
+    auto qg_3d = q_delta.view({T, attn_heads_local, 2, head_size_});
+    auto q_part = qg_3d.slice(2, 0, 1).contiguous().view(
+        {T, attn_heads_local * head_size_});
+    auto g_part = qg_3d.slice(2, 1, 2).contiguous().view(
+        {T, attn_heads_local * head_size_});
+    return torch::cat({q_part, g_part}, /*dim=*/-1);
+  };
 
   // Legacy hardcoded path (Spike Day 5b). Kept behind lora_active_ so
   // unit tests still work without a LoRARuntime. Real production path
@@ -196,7 +233,8 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
         auto d = torch::matmul(tmp, B_local.transpose(0, 1));
         return (d * pd->scaling).to(input.dtype());
       };
-      auto q_delta = shrink_expand(q_pd, q_size_local_);
+      auto q_delta = reorder_q_delta_if_gated(
+          shrink_expand(q_pd, q_size_local_));
       auto k_delta = shrink_expand(k_pd, kv_size_local_);
       auto v_delta = shrink_expand(v_pd, kv_size_local_);
       auto qkv_delta = torch::cat({q_delta, k_delta, v_delta}, /*dim=*/-1);
@@ -327,8 +365,10 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
                              int64_t y_slice_size,
                              float scaling_hint,
                              const char* proj_name) {
-      (void)proj_name;
       (void)scaling_hint;
+      const bool needs_gate_reorder =
+          q_has_gate_ && proj_name != nullptr &&
+          std::string_view(proj_name) == "q_proj";
       for (int b = 0; b < bv.num_buckets(); ++b) {
         const auto& view = bv.buckets[b];
         if (!view.valid) continue;
@@ -362,6 +402,13 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
                           sub_y,
                           /*slice_offset=*/0,
                           out_local);
+        // Qwen3-Next attn_output_gate: sub_y from adapter's B_q is in
+        // per-head interleaved layout [q0,g0,q1,g1,...] but base's qkv
+        // output slot is [Q_grouped | G_grouped]. Reorder before scatter
+        // so the delta lands in the correct half of each head.
+        if (needs_gate_reorder) {
+          sub_y = reorder_q_delta_if_gated(sub_y);
+        }
         // Scatter sub_y back into y at (sub_token_ids, [y_slice_offset,
         // y_slice_offset+y_slice_size)). We add to preserve any existing
         // contribution (e.g. base output already computed by base_->forward).
@@ -438,7 +485,7 @@ torch::Tensor LoRAQKVParallelLinearImpl::forward(torch::Tensor input) {
       auto d = torch::matmul(tmp, B_local.transpose(0, 1));
       return (d * pd->scaling).to(x_seq.dtype());
     };
-    auto q_delta = make_delta(q_pd, q_size_local_);
+    auto q_delta = reorder_q_delta_if_gated(make_delta(q_pd, q_size_local_));
     auto k_delta = make_delta(k_pd, kv_size_local_);
     auto v_delta = make_delta(v_pd, kv_size_local_);
     auto qkv_delta = torch::cat({q_delta, k_delta, v_delta}, /*dim=*/-1);
