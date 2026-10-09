@@ -165,6 +165,7 @@ class AclGraph {
   std::shared_ptr<AclGraphTaskUpdateContext> graph_task_context_;
   std::optional<c10_npu::NPUStream> update_stream_;
   std::atomic<bool> replay_inputs_prepared_{false};
+  bool first_hybrid_replay_after_capture_ = false;
   std::optional<StaticGraphTaskSignature> static_graph_task_signature_;
   std::optional<std::array<const void*, 11>>
       spec_verify_input_addresses_at_capture_;
