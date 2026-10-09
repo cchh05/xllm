@@ -140,9 +140,10 @@ void SamplingParameters::init(
   do_sample.reserve(sample_idxes.size());
   for (const auto idx : sample_idxes) {
     const auto* p = req_sampling_params[idx];
-    // need to do sample if any of following is true
-    const bool sample = p->do_sample || p->temperature != 0.0 ||
-                        p->top_p != 1.0 || p->top_k > 0;
+    // Greedy iff temperature == 0 (or an explicit do_sample flag). top_k /
+    // top_p are argmax-invariant filters and must not flip a temperature == 0
+    // request into multinomial sampling.
+    const bool sample = p->do_sample || p->temperature != 0.0;
     do_sample.push_back(sample ? 1 : 0);
   }
   this->sample_idxes = torch::tensor(sample_idxes, int_tensor_options);
