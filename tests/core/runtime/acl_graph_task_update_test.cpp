@@ -19,10 +19,13 @@ limitations under the License.
 #include <torch/torch.h>
 #include <torch_npu/torch_npu.h>
 
+#include <algorithm>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <vector>
 
+#include "core/common/constants.h"
 #include "core/framework/batch/batch.h"
 #include "core/framework/block/block.h"
 #include "core/framework/block/block_manager_impl.h"
@@ -91,7 +94,10 @@ constexpr int64_t kHiddenSize = 2048;
 constexpr int64_t kMaxSeqLen = 256;
 constexpr int64_t kVocabSize = 1000;
 constexpr int64_t kNumBlocks = 100;
-constexpr int64_t kBlockSize = 4;
+constexpr int64_t kBlockSize = 128;
+constexpr int64_t kAttentionNumHeads = 8;
+constexpr int64_t kAttentionNumKvHeads = 1;
+constexpr int64_t kAttentionHeadDim = 256;
 
 constexpr torch::ScalarType kDtype = torch::kFloat16;
 
@@ -135,6 +141,11 @@ class HybridConv1dMockLM final : public CausalLM {
     auto graph_context = params.graph.acl_graph_task_update_context;
     const bool register_graph_task =
         graph_context != nullptr && graph_context->capturing;
+    if (register_graph_task) {
+      ++capture_forward_count_;
+      captured_linear_state_ids_ = params.embedding.linear_state_ids;
+      captured_linear_state_validity_ = params.linear_state_validity_mask;
+    }
 
     for (auto& kv_cache : kv_caches) {
       if (kv_cache.empty() || !kv_cache.get_conv_cache().defined()) {
@@ -222,6 +233,54 @@ class HybridConv1dMockLM final : public CausalLM {
       break;
     }
 
+    for (auto& kv_cache : kv_caches) {
+      if (!enable_mock_ssm_transition_ || kv_cache.empty() ||
+          !kv_cache.get_ssm_cache().defined() ||
+          !params.embedding.linear_state_indices.defined()) {
+        continue;
+      }
+
+      torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
+      const int64_t num_sequences =
+          params.embedding.linear_state_indices.numel();
+      CHECK_EQ(params.attention.host.q_seq_lens.size(),
+               static_cast<size_t>(num_sequences));
+      torch::Tensor state_indices =
+          params.embedding.linear_state_indices.to(torch::kLong);
+      torch::Tensor old_state = ssm_cache.index_select(0, state_indices);
+      torch::Tensor old_state_signal = old_state.flatten(1).select(1, 0);
+      torch::Tensor transition_hidden;
+      if (params.is_spec_verify) {
+        CHECK_EQ(num_sequences, 1)
+            << "The stateful spec-verify test uses one sequence.";
+        CHECK_EQ(params.num_accepted_tokens_host.size(), 1);
+        const int64_t accepted_tokens = params.num_accepted_tokens_host.front();
+        CHECK_GT(accepted_tokens, 0);
+        CHECK_LE(accepted_tokens, hidden.size(0));
+        hidden = hidden + old_state_signal.expand({hidden.size(0)})
+                              .unsqueeze(1)
+                              .to(hidden.scalar_type());
+        transition_hidden =
+            hidden.select(/*dim=*/0, accepted_tokens - 1).unsqueeze(/*dim=*/0);
+      } else {
+        CHECK_EQ(hidden.size(0), num_sequences)
+            << "The stateful decode test requires one token per sequence.";
+        hidden =
+            hidden + old_state_signal.unsqueeze(1).to(hidden.scalar_type());
+        transition_hidden = hidden;
+      }
+
+      torch::Tensor transition_values = transition_hidden.mean(/*dim=*/1)
+                                            .to(ssm_cache.scalar_type())
+                                            .view({num_sequences, 1, 1, 1})
+                                            .expand({num_sequences,
+                                                     ssm_cache.size(1),
+                                                     ssm_cache.size(2),
+                                                     ssm_cache.size(3)});
+      ssm_cache.index_add_(0, state_indices, transition_values);
+      break;
+    }
+
     hidden = linear_->forward(hidden);
 
     return ModelOutput(hidden);
@@ -242,6 +301,14 @@ class HybridConv1dMockLM final : public CausalLM {
 
   void load_model(std::unique_ptr<ModelLoader> loader) override {}
   torch::Device device() const override { return device_; }
+  void enable_mock_ssm_transition() { enable_mock_ssm_transition_ = true; }
+  int32_t capture_forward_count() const { return capture_forward_count_; }
+  const std::vector<int32_t>& captured_linear_state_ids() const {
+    return captured_linear_state_ids_;
+  }
+  const LinearStateValidityMask& captured_linear_state_validity() const {
+    return captured_linear_state_validity_;
+  }
   void prepare_expert_weight(int32_t, const std::vector<int32_t>&) override {}
   void update_expert_weight(int32_t) override {}
   layer::NpuLmHead get_npu_lm_head() override {
@@ -260,6 +327,10 @@ class HybridConv1dMockLM final : public CausalLM {
   torch::Tensor conv_weight_;
   torch::Tensor token_embedding_table_;
   torch::Tensor pos_embedding_table_;
+  bool enable_mock_ssm_transition_ = false;
+  int32_t capture_forward_count_ = 0;
+  std::vector<int32_t> captured_linear_state_ids_;
+  LinearStateValidityMask captured_linear_state_validity_;
 };
 
 class AclGraphTaskUpdateTest : public ::testing::Test {
@@ -273,6 +344,9 @@ class AclGraphTaskUpdateTest : public ::testing::Test {
     model_args_.max_position_embeddings(kMaxSeqLen);
     model_args_.vocab_size(kVocabSize);
     model_args_.n_layers(2);
+    model_args_.n_heads(kAttentionNumHeads);
+    model_args_.n_kv_heads(kAttentionNumKvHeads);
+    model_args_.head_dim(kAttentionHeadDim);
     model_args_.layer_types({"linear_attention", "full_attention"});
 
     device_ = std::make_unique<torch::Device>("npu:0");
@@ -328,9 +402,10 @@ class AclGraphTaskUpdateTest : public ::testing::Test {
     kv_caches.emplace_back(
         LinearAttentionKVCacheTensors{conv_cache, ssm_cache});
 
-    auto k_cache = torch::randn({kNumBlocks, kBlockSize * kHiddenSize},
-                                torch::dtype(kDtype).device(*device_));
-    auto v_cache = k_cache.clone();
+    auto k_cache = torch::zeros(
+        {kNumBlocks, kBlockSize, kAttentionNumKvHeads, kAttentionHeadDim},
+        torch::dtype(torch::kBFloat16).device(*device_));
+    auto v_cache = torch::zeros_like(k_cache);
     kv_caches.emplace_back(KVCacheTensors{k_cache, v_cache});
     return kv_caches;
   }
@@ -404,6 +479,194 @@ class AclGraphTaskUpdateTest : public ::testing::Test {
     return batch;
   }
 
+  void expect_capture_state_and_single_transition(
+      bool double_buffer,
+      bool spec_verify,
+      const std::function<void(npu::AclGraphExecutorImpl&,
+                               const SpecVerifyGraphTaskSignal&)>&
+          before_first_run = {},
+      int32_t accepted_tokens = 1) {
+    ExecutionConfig::get_instance().enable_graph_double_buffer(double_buffer);
+    model_ = std::make_unique<HybridConv1dMockLM>(model_args_, *device_);
+    model_->enable_mock_ssm_transition();
+    const int32_t num_sequences = spec_verify ? 1 : 3;
+    constexpr int32_t kNumSpecTokens = 4;
+    auto batch = create_decode_batch(/*batch_size=*/num_sequences);
+    auto input = batch->prepare_forward_input(
+        options_.num_decoding_tokens(), 0, model_args_);
+    input = input.to(*device_, kDtype);
+    if (spec_verify) {
+      setup_spec_verify_input(input, num_sequences, kNumSpecTokens);
+      input.input_params.graph.input_tokens_override = input.token_ids;
+      input.input_params.graph.spec_verify_source_addresses_stable = true;
+      input.input_params.num_accepted_tokens_host = {accepted_tokens};
+      input.input_params.num_accepted_tokens =
+          torch::tensor(input.input_params.num_accepted_tokens_host,
+                        torch::dtype(torch::kInt32).device(*device_));
+    } else {
+      populate_query_start_loc(input.input_params);
+    }
+
+    const auto original_ids = input.input_params.embedding.linear_state_ids;
+    const auto original_validity =
+        input.input_params.linear_state_validity_mask;
+    torch::Tensor original_device_ids =
+        input.input_params.embedding.linear_state_indices.clone();
+    ASSERT_EQ(original_ids.size(), static_cast<size_t>(num_sequences));
+    ASSERT_NE(original_ids.front(), kPaddingLinearStateId);
+
+    auto kv_initial = create_hybrid_kv_caches();
+    torch::manual_seed(20260911);
+    kv_initial[0].get_conv_cache().copy_(
+        torch::randn_like(kv_initial[0].get_conv_cache()));
+    kv_initial[0].get_ssm_cache().copy_(
+        torch::randn_like(kv_initial[0].get_ssm_cache()));
+    auto kv_eager = clone_kv_caches(kv_initial);
+    auto kv_graph = clone_kv_caches(kv_initial);
+    torch::Tensor initial_conv = kv_initial[0].get_conv_cache().clone();
+    torch::Tensor initial_ssm = kv_initial[0].get_ssm_cache().clone();
+
+    auto eager_out = model_->forward(
+        input.token_ids, input.positions, kv_eager, input.input_params);
+    auto graph_exec = std::make_unique<npu::AclGraphExecutorImpl>(
+        model_.get(), model_args_, *device_, options_);
+    EXPECT_EQ(graph_exec->graph_slot_count_for_test(), double_buffer ? 2 : 1);
+    std::optional<SpecVerifyGraphTaskSignal> static_signal;
+    if (spec_verify) {
+      const auto& expanded = input.input_params.graph.expanded_kv_seq_lens_vec;
+      ASSERT_FALSE(expanded.empty());
+      static_signal = SpecVerifyGraphTaskSignal{
+          .linear_state_id = original_ids.front(),
+          .num_accepted_tokens =
+              input.input_params.num_accepted_tokens_host.front(),
+          .spec_width = kNumSpecTokens,
+          .block_table_width =
+              input.input_params.attention.device.block_tables.size(1),
+          .max_kv_seq_len = expanded[kNumSpecTokens - 1],
+      };
+      if (before_first_run) {
+        before_first_run(*graph_exec, static_signal.value());
+      }
+    }
+    auto graph_out = graph_exec->run(
+        input.token_ids, input.positions, kv_graph, input.input_params);
+
+    EXPECT_EQ(input.input_params.embedding.linear_state_ids, original_ids);
+    EXPECT_EQ(input.input_params.linear_state_validity_mask, original_validity);
+    EXPECT_TRUE(torch::equal(input.input_params.embedding.linear_state_indices,
+                             original_device_ids));
+    ASSERT_EQ(model_->capture_forward_count(), 1);
+    // Mirrors AclGraphExecutorImpl::get_bucket_num_tokens(): pads decode
+    // batches into the 1/2/4/8...-multiples-of-16 buckets the graph was
+    // captured with; the padding rows use the reserved linear-state slot.
+    const int64_t decode_bucket = num_sequences <= 1   ? 1
+                                  : num_sequences <= 2 ? 2
+                                  : num_sequences <= 4 ? 4
+                                  : num_sequences <= 8
+                                      ? 8
+                                      : ((num_sequences + 15) / 16) * 16;
+    const int64_t captured_rows = spec_verify ? num_sequences : decode_bucket;
+    ASSERT_EQ(model_->captured_linear_state_ids().size(),
+              static_cast<size_t>(captured_rows));
+    ASSERT_EQ(model_->captured_linear_state_validity().size(),
+              static_cast<size_t>(captured_rows));
+    EXPECT_EQ(model_->captured_linear_state_ids(),
+              std::vector<int32_t>(captured_rows, kPaddingLinearStateId));
+    EXPECT_EQ(model_->captured_linear_state_validity(),
+              LinearStateValidityMask(captured_rows, 0));
+
+    for (int64_t slot = 1; slot < kNumBlocks; ++slot) {
+      const bool active =
+          std::find(original_ids.begin(), original_ids.end(), slot) !=
+          original_ids.end();
+      if (active) {
+        EXPECT_FALSE(torch::equal(kv_eager[0].get_conv_cache()[slot],
+                                  initial_conv[slot]));
+        EXPECT_FALSE(
+            torch::equal(kv_eager[0].get_ssm_cache()[slot], initial_ssm[slot]));
+        EXPECT_TRUE(torch::equal(kv_graph[0].get_conv_cache()[slot],
+                                 kv_eager[0].get_conv_cache()[slot]));
+        EXPECT_TRUE(torch::equal(kv_graph[0].get_ssm_cache()[slot],
+                                 kv_eager[0].get_ssm_cache()[slot]));
+      } else {
+        EXPECT_TRUE(torch::equal(kv_graph[0].get_conv_cache()[slot],
+                                 initial_conv[slot]));
+        EXPECT_TRUE(
+            torch::equal(kv_graph[0].get_ssm_cache()[slot], initial_ssm[slot]));
+      }
+    }
+    EXPECT_TRUE(torch::allclose(eager_out.hidden_states.to(torch::kFloat32),
+                                graph_out.hidden_states.to(torch::kFloat32),
+                                /*rtol=*/1e-2,
+                                /*atol=*/1e-2));
+
+    if (static_signal.has_value()) {
+      EXPECT_TRUE(graph_exec->prepare_static_mtp_graph_tasks(
+          static_signal.value(), Stream(c10_npu::getCurrentNPUStream())));
+    }
+
+    auto kv_eager_next = clone_kv_caches(kv_eager);
+    auto next_input = input;
+    next_input.input_params.graph.spec_verify_static_graph_tasks_prepared =
+        static_signal.has_value();
+    next_input.token_ids.add_(1);
+    next_input.positions.add_(1);
+    auto eager_next = model_->forward(next_input.token_ids,
+                                      next_input.positions,
+                                      kv_eager_next,
+                                      next_input.input_params);
+    auto graph_next = graph_exec->run(next_input.token_ids,
+                                      next_input.positions,
+                                      kv_graph,
+                                      next_input.input_params);
+    EXPECT_TRUE(torch::allclose(eager_next.hidden_states.to(torch::kFloat32),
+                                graph_next.hidden_states.to(torch::kFloat32),
+                                /*rtol=*/1e-2,
+                                /*atol=*/1e-2));
+    for (int32_t slot : original_ids) {
+      EXPECT_TRUE(torch::equal(kv_graph[0].get_conv_cache()[slot],
+                               kv_eager_next[0].get_conv_cache()[slot]));
+      EXPECT_TRUE(torch::equal(kv_graph[0].get_ssm_cache()[slot],
+                               kv_eager_next[0].get_ssm_cache()[slot]));
+    }
+
+    if (double_buffer) {
+      ASSERT_EQ(model_->capture_forward_count(), 2)
+          << "The second run must lazily capture the second graph slot";
+      auto kv_eager_prepared = clone_kv_caches(kv_eager_next);
+      auto prepared_input = next_input;
+      prepared_input.token_ids.add_(1);
+      prepared_input.positions.add_(1);
+      graph_exec->prepare_graph_input(prepared_input.token_ids,
+                                      prepared_input.positions,
+                                      kv_graph,
+                                      prepared_input.input_params);
+      auto eager_prepared = model_->forward(prepared_input.token_ids,
+                                            prepared_input.positions,
+                                            kv_eager_prepared,
+                                            prepared_input.input_params);
+      auto graph_prepared = graph_exec->run(prepared_input.token_ids,
+                                            prepared_input.positions,
+                                            kv_graph,
+                                            prepared_input.input_params);
+      EXPECT_EQ(model_->capture_forward_count(), 2)
+          << "The prepared third run must replay the first graph slot";
+      EXPECT_TRUE(
+          torch::allclose(eager_prepared.hidden_states.to(torch::kFloat32),
+                          graph_prepared.hidden_states.to(torch::kFloat32),
+                          /*rtol=*/1e-2,
+                          /*atol=*/1e-2));
+      for (int32_t slot : original_ids) {
+        EXPECT_TRUE(torch::equal(kv_graph[0].get_conv_cache()[slot],
+                                 kv_eager_prepared[0].get_conv_cache()[slot]));
+        EXPECT_TRUE(torch::equal(kv_graph[0].get_ssm_cache()[slot],
+                                 kv_eager_prepared[0].get_ssm_cache()[slot]));
+      }
+    } else {
+      EXPECT_EQ(model_->capture_forward_count(), 1);
+    }
+  }
+
   void setup_spec_verify_input(ForwardInput& fi,
                                int32_t num_sequences,
                                int32_t num_spec_tokens) {
@@ -464,6 +727,32 @@ class AclGraphTaskUpdateTest : public ::testing::Test {
     }
     fi.input_params.graph.expanded_block_tables = expanded_bt;
 
+    // Mirror the MTP worker: every spec-verify token writes its own KV cache
+    // slot. Decode batches carry one slot per sequence, so expand them to
+    // per-token slots through the block table, then let rebuild_device_buffer
+    // push the expanded host vector to the device.
+    torch::Tensor host_block_tables =
+        fi.input_params.attention.device.block_tables.to(torch::kCPU)
+            .contiguous();
+    auto host_block_table_accessor = host_block_tables.accessor<int32_t, 2>();
+    std::vector<int32_t> expanded_cache_slots;
+    expanded_cache_slots.reserve(static_cast<size_t>(total_tokens));
+    for (int32_t s = 0; s < num_sequences; ++s) {
+      const int32_t kv_len =
+          fi.input_params.attention.host.kv_seq_lens[static_cast<size_t>(s)];
+      for (int32_t t = 0; t < num_spec_tokens; ++t) {
+        const int32_t position = kv_len + t;
+        const int32_t logical_block = position / kBlockSize;
+        const int32_t block_offset = position % kBlockSize;
+        const int32_t physical_block =
+            host_block_table_accessor[s][logical_block];
+        expanded_cache_slots.emplace_back(physical_block * kBlockSize +
+                                          block_offset);
+      }
+    }
+    fi.input_params.attention.host.new_cache_slots =
+        std::move(expanded_cache_slots);
+
     std::vector<int32_t> q_cu_vec;
     q_cu_vec.reserve(static_cast<size_t>(num_sequences + 1));
     q_cu_vec.push_back(0);
@@ -490,6 +779,35 @@ class AclGraphTaskUpdateTest : public ::testing::Test {
   std::vector<Sequence> sequences_;
   IncrementalDecoder fake_decoder_ = IncrementalDecoder("", 1, false, false);
 };
+
+TEST_F(AclGraphTaskUpdateTest,
+       LazyDecodeCaptureUsesSlotZeroThenTransitionsLiveSlotsOnce) {
+  expect_capture_state_and_single_transition(/*double_buffer=*/false,
+                                             /*spec_verify=*/false);
+}
+
+TEST_F(AclGraphTaskUpdateTest,
+       LazyMtpCaptureDefersStaticSignatureAtAcceptedBoundaries) {
+  for (int32_t accepted_tokens : {1, 4}) {
+    SCOPED_TRACE("accepted_tokens=" + std::to_string(accepted_tokens));
+    reset_sequences();
+    expect_capture_state_and_single_transition(
+        /*double_buffer=*/false,
+        /*spec_verify=*/true,
+        [&](npu::AclGraphExecutorImpl& graph_exec,
+            const SpecVerifyGraphTaskSignal& signal) {
+          EXPECT_FALSE(graph_exec.prepare_static_mtp_graph_tasks(
+              signal, Stream(c10_npu::getCurrentNPUStream())));
+        },
+        accepted_tokens);
+  }
+}
+
+TEST_F(AclGraphTaskUpdateTest,
+       DoubleBufferedLazyDecodeCapturePreservesUnrelatedSlots) {
+  expect_capture_state_and_single_transition(/*double_buffer=*/true,
+                                             /*spec_verify=*/false);
+}
 
 TEST_F(AclGraphTaskUpdateTest, CaptureReplayVsEagerDecodeBranch) {
   auto batch = create_decode_batch(/*batch_size=*/2);

@@ -54,6 +54,24 @@ constexpr uint64_t kStaticGraphTaskHashSeed = 0x6a09e667f3bcc909ull;
 constexpr size_t kMaxStaticMtpGraphVariantsPerSlot = 16;
 constexpr uint64_t kMlaGraphKeyMask = 1ull << 62;
 constexpr uint64_t kMlaGraphKeyPayloadMask = (1ull << 62) - 1;
+
+void reset_capture_linear_state_to_padding(ModelInputParams& params) {
+  if (params.embedding.linear_state_ids.empty()) {
+    return;
+  }
+  std::fill(params.embedding.linear_state_ids.begin(),
+            params.embedding.linear_state_ids.end(),
+            kPaddingLinearStateId);
+  CHECK(params.embedding.linear_state_indices.defined())
+      << "ACL graph capture requires persistent linear-state indices.";
+  CHECK_EQ(params.embedding.linear_state_indices.numel(),
+           static_cast<int64_t>(params.embedding.linear_state_ids.size()))
+      << "ACL graph capture linear-state host/device sizes must match.";
+  params.embedding.linear_state_indices.fill_(kPaddingLinearStateId);
+  params.linear_state_validity_mask.assign(
+      params.embedding.linear_state_ids.size(), 0);
+}
+
 bool uses_static_mtp_graph_task_variant(const ModelInputParams& params,
                                         uint32_t bucket_num_tokens,
                                         int64_t block_size) {
@@ -251,6 +269,8 @@ bool AclGraph::capture(CausalLM* model,
                        uint32_t bucket_num_tokens) {
   // Save bucket num_tokens for this graph instance
   num_tokens_ = bucket_num_tokens;
+  const bool capture_static_graph_tasks = uses_static_mtp_graph_task_variant(
+      params, bucket_num_tokens, options.block_size());
 
   // Get actual num_tokens from tokens tensor
   // const uint32_t actual_num_tokens = tokens.size(0);
@@ -301,6 +321,9 @@ bool AclGraph::capture(CausalLM* model,
   CHECK(graph_params.has_value())
       << "update() should return ModelInputParams when "
          "return_capture_params=true";
+  if (model->is_hybrid_linear_attention()) {
+    reset_capture_linear_state_to_padding(graph_params.value());
+  }
   const auto spec_verify_attention_plan =
       persistent_param_.paged_attention_plan_descriptor(
           actual_num_tokens, params.meta.q_max_seq_len);
@@ -361,8 +384,6 @@ bool AclGraph::capture(CausalLM* model,
     graph_task_context_->begin_capture();
     graph_params->graph.acl_graph_task_update_context = graph_task_context_;
   }
-  const bool capture_static_graph_tasks = uses_static_mtp_graph_task_variant(
-      graph_params.value(), num_tokens_, options.block_size());
   // Synchronize stream to ensure all data is copied to graph persistent buffers
   aclrtSynchronizeStream(stream);
 
@@ -442,15 +463,15 @@ bool AclGraph::capture(CausalLM* model,
           c10_npu::getDefaultNPUStream(tensor_options.device().index()));
     }
   }
-  // Synchronize and test replay to verify graph capture
+  // Capture only touches the reserved padding state. Wait until it no longer
+  // reads persistent inputs, then replay once with the real request so that the
+  // request has exactly one committed recurrent-state transition.
   aclrtSynchronizeStream(graph_stream_);
-  aclrtSynchronizeStream(stream);
-  graph_.replay();
-  update_graph_tasks(graph_params.value());
+  first_hybrid_replay_after_capture_ = model->is_hybrid_linear_attention();
+  replay(model, tokens, positions, kv_cache, params);
   if (capture_static_graph_tasks) {
-    capture_static_graph_task_signature(graph_params.value());
+    capture_static_graph_task_signature(params);
   }
-  make_current_stream_wait_for_graph(stream);
   return true;
 }
 
@@ -532,11 +553,12 @@ bool AclGraph::static_graph_task_signature_matches(
 void AclGraph::capture_static_graph_task_signature(
     const ModelInputParams& params) {
   static_graph_task_signature_ = make_static_graph_task_signature(params);
-  CHECK(static_graph_task_signature_.has_value());
-  LOG(INFO) << "Captured static MTP graph-task signature: linear_state_id="
-            << static_graph_task_signature_->linear_state_id
-            << ", accepted_tokens="
-            << static_graph_task_signature_->num_accepted_tokens;
+  if (static_graph_task_signature_.has_value()) {
+    LOG(INFO) << "Configured static MTP graph-task signature: linear_state_id="
+              << static_graph_task_signature_->linear_state_id
+              << ", accepted_tokens="
+              << static_graph_task_signature_->num_accepted_tokens;
+  }
 }
 
 AclGraph::~AclGraph() {
@@ -711,12 +733,16 @@ ModelOutput AclGraph::replay(CausalLM* model,
   // Get current NPU stream from libtorch NPU API
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
-  if (graph_paged_attention_tiling_data_.defined()) {
-    // The producer stream has refreshed inputs that include the final draft
-    // token. Make graph replay wait for those updates on device; a host
-    // synchronize here would recreate the bubble we remove.
+  // The producer stream has refreshed inputs that include the final draft
+  // token. Make graph replay wait for those updates on device; a host
+  // synchronize here would recreate the bubble we remove. Hybrid dirty
+  // capture adds one more dependency only for the first replay that replaces
+  // the reserved slot-0 inputs with the real request.
+  if (graph_paged_attention_tiling_data_.defined() ||
+      first_hybrid_replay_after_capture_) {
     make_graph_wait_for_current_stream(stream);
   }
+  first_hybrid_replay_after_capture_ = false;
   const bool use_static_graph_tasks =
       graph_params.has_value() &&
       static_graph_task_signature_matches(graph_params.value());
@@ -735,9 +761,9 @@ ModelOutput AclGraph::replay(CausalLM* model,
   if (model->is_hybrid_linear_attention()) {
     CHECK(graph_params.has_value())
         << "update() should return ModelInputParams for graph task update";
-    if (use_static_graph_tasks) {
-      // This graph variant's task-ready event was recorded before replay.
-    } else {
+    // The first replay after dirty capture dynamically replaces slot-0 host
+    // parameters. Later matching MTP replays may use the existing ready signal.
+    if (!use_static_graph_tasks || !static_graph_tasks_prepared) {
       update_graph_tasks(graph_params.value());
     }
   }
